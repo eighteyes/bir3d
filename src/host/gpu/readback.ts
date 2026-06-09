@@ -13,16 +13,15 @@ export class RingIndex {
 export class ReadbackRing {
   private readonly ring: RingIndex;
   private readonly staging: GPUBuffer[];
-  private readonly mapped: (Float32Array | null)[];
   private readonly inflight: boolean[];
   private latest: Float32Array | null = null;
 
+  /** `byteLength` must EXACTLY match the src buffer size; reconstruct the ring if the layout changes. */
   constructor(private device: GPUDevice, private byteLength: number, size = 3) {
     this.ring = new RingIndex(size);
     this.staging = Array.from({ length: size }, () =>
       device.createBuffer({ size: byteLength, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ })
     );
-    this.mapped = Array.from({ length: size }, () => null);
     this.inflight = Array.from({ length: size }, () => false);
   }
 
@@ -32,12 +31,19 @@ export class ReadbackRing {
     if (!this.inflight[slot]) {
       encoder.copyBufferToBuffer(src, 0, this.staging[slot]!, 0, this.byteLength);
       this.inflight[slot] = true;
-      // fire-and-forget: resolves a few frames later
-      this.staging[slot]!.mapAsync(GPUMapMode.READ).then(() => {
-        this.latest = new Float32Array(this.staging[slot]!.getMappedRange().slice(0));
-        this.staging[slot]!.unmap();
-        this.inflight[slot] = false;
-      });
+      // fire-and-forget: resolves a few frames later. Maps may resolve out of order under load;
+      // `latest` is intentionally last-writer-wins — fine for the stale-aggregate contract.
+      this.staging[slot]!.mapAsync(GPUMapMode.READ)
+        .then(() => {
+          this.latest = new Float32Array(this.staging[slot]!.getMappedRange().slice(0));
+          this.staging[slot]!.unmap();
+          this.inflight[slot] = false;
+        })
+        .catch((err: unknown) => {
+          // device lost / validation error — release the slot so the ring doesn't starve
+          this.inflight[slot] = false;
+          console.error(`ReadbackRing slot ${slot} map failed:`, err);
+        });
     }
     this.ring.advance();
   }
