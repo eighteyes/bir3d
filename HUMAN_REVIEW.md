@@ -2,7 +2,7 @@
 
 ## Plan 3 — GPU fluid spike (final gate, §8.1)
 **Date:** 2026-06-09
-**Commit:** fb6cce7
+**Commit:** 4354316
 **Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
 
 ### What was done
