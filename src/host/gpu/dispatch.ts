@@ -15,13 +15,14 @@ export function encodeComputePass(
   pipeline: GPUComputePipeline,
   bindings: GPUBuffer[],
   workItems: number,
-  workgroupSize = 64
+  workgroupSize = 64,
+  timestampWrites?: GPUComputePassTimestampWrites
 ): void {
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
     entries: bindings.map((buffer, binding) => ({ binding, resource: { buffer } })),
   });
-  const pass = encoder.beginComputePass();
+  const pass = encoder.beginComputePass(timestampWrites ? { timestampWrites } : undefined);
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup);
   pass.dispatchWorkgroups(Math.ceil(workItems / workgroupSize));

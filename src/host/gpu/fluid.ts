@@ -10,6 +10,7 @@
 
 import { makeComputePipeline, encodeComputePass } from "./dispatch";
 import { PingPong } from "./pingpong";
+import type { PassTimer } from "./passtimer";
 
 // Params uniform layout (std140-friendly, 48 bytes, 16-byte aligned). Field order MUST match
 // the `struct Params` declared in every fluid WGSL kernel.
@@ -62,6 +63,11 @@ export class GpuFluid {
   private paramsF32 = new Float32Array(this.paramsHost);
 
   private force: ForceParams = { ...ZERO_FORCE };
+
+  // Transient timer for the current step() call (null when untimed). Set at the top of step()
+  // and cleared at the end so the private pass() chokepoint can tag every pass by stage without
+  // threading the timer through every helper signature.
+  private timer: PassTimer | null = null;
 
   // Pipelines.
   private pForces: GPUComputePipeline;
@@ -142,22 +148,28 @@ export class GpuFluid {
     this.device.queue.writeBuffer(this.params, 0, this.paramsHost);
   }
 
-  private pass(encoder: GPUCommandEncoder, pipeline: GPUComputePipeline, bindings: GPUBuffer[]): void {
-    encodeComputePass(this.device, encoder, pipeline, bindings, this.cells);
+  private pass(
+    encoder: GPUCommandEncoder,
+    pipeline: GPUComputePipeline,
+    bindings: GPUBuffer[],
+    stage: string
+  ): void {
+    const ts = this.timer?.timestampWrites(stage);
+    encodeComputePass(this.device, encoder, pipeline, bindings, this.cells, 64, ts);
   }
 
   /** set_bnd on velocity: velx on u, vely on v — each two-pass (edges then corners). */
   private setBndVel(encoder: GPUCommandEncoder): void {
-    this.pass(encoder, this.pVelxEdges, [this.params, this.u.current]);
-    this.pass(encoder, this.pVelxCorners, [this.params, this.u.current]);
-    this.pass(encoder, this.pVelyEdges, [this.params, this.v.current]);
-    this.pass(encoder, this.pVelyCorners, [this.params, this.v.current]);
+    this.pass(encoder, this.pVelxEdges, [this.params, this.u.current], "set_bnd");
+    this.pass(encoder, this.pVelxCorners, [this.params, this.u.current], "set_bnd");
+    this.pass(encoder, this.pVelyEdges, [this.params, this.v.current], "set_bnd");
+    this.pass(encoder, this.pVelyCorners, [this.params, this.v.current], "set_bnd");
   }
 
   /** set_bnd(Scalar) on an arbitrary field buffer — two-pass. */
   private setBndScalar(encoder: GPUCommandEncoder, field: GPUBuffer): void {
-    this.pass(encoder, this.pScalarEdges, [this.params, field]);
-    this.pass(encoder, this.pScalarCorners, [this.params, field]);
+    this.pass(encoder, this.pScalarEdges, [this.params, field], "set_bnd");
+    this.pass(encoder, this.pScalarCorners, [this.params, field], "set_bnd");
   }
 
   /**
@@ -166,7 +178,7 @@ export class GpuFluid {
    */
   private project(encoder: GPUCommandEncoder, iters: number): void {
     // div = divergence(u, v).
-    this.pass(encoder, this.pDivergence, [this.params, this.u.current, this.v.current, this.div]);
+    this.pass(encoder, this.pDivergence, [this.params, this.u.current, this.v.current, this.div], "divergence");
 
     // Zero pressure guess (both ping-pong halves).
     encoder.clearBuffer(this.p.current);
@@ -174,14 +186,19 @@ export class GpuFluid {
 
     for (let it = 0; it < iters; it++) {
       // p_next = jacobi(p, div); reads prev, writes next.
-      this.pass(encoder, this.pJacobi, [this.params, this.p.current, this.div, this.p.next]);
+      this.pass(encoder, this.pJacobi, [this.params, this.p.current, this.div, this.p.next], "jacobi");
       this.p.swap();
       // set_bnd(Scalar) on the freshly written pressure (now current).
       this.setBndScalar(encoder, this.p.current);
     }
 
     // u,v -= grad(p) using the final pressure (p.current).
-    this.pass(encoder, this.pSubtractGrad, [this.params, this.p.current, this.u.current, this.v.current]);
+    this.pass(
+      encoder,
+      this.pSubtractGrad,
+      [this.params, this.p.current, this.u.current, this.v.current],
+      "subtract_grad"
+    );
     this.setBndVel(encoder);
   }
 
@@ -190,9 +207,9 @@ export class GpuFluid {
     const u0 = this.u.current;
     const v0 = this.v.current;
     // advect u: src=u0, vel=(u0,v0) -> u.next.
-    this.pass(encoder, this.pAdvect, [this.params, u0, u0, v0, this.u.next]);
+    this.pass(encoder, this.pAdvect, [this.params, u0, u0, v0, this.u.next], "advect");
     // advect v: src=v0, vel=(u0,v0) -> v.next. Both read the SAME pre-advection velocity.
-    this.pass(encoder, this.pAdvect, [this.params, v0, u0, v0, this.v.next]);
+    this.pass(encoder, this.pAdvect, [this.params, v0, u0, v0, this.v.next], "advect");
     this.u.swap();
     this.v.swap();
   }
@@ -201,12 +218,18 @@ export class GpuFluid {
    * Record one Stam fluid step into the caller's encoder (one submit/frame; no readback).
    * Sequence (spec-locked): add-forces -> set_bnd(vel) -> project -> set_bnd(vel) ->
    * self-advect u,v -> set_bnd(vel) -> project -> advect dye -> set_bnd(scalar, dye).
+   *
+   * @param timer optional PassTimer; when supplied, every recorded pass is wrapped with a
+   *   begin/end timestamp tagged by stage (advect/divergence/jacobi/subtract_grad/set_bnd).
+   *   The caller must reset(timer) before step and resolve(encoder)+readStages() after submit.
+   *   Untimed (the default) for production callers — zero overhead.
    */
-  step(encoder: GPUCommandEncoder, dt: number, iters: number): void {
+  step(encoder: GPUCommandEncoder, dt: number, iters: number, timer: PassTimer | null = null): void {
+    this.timer = timer;
     this.uploadParams(dt);
 
     // add-forces + dye injection (interior, in place).
-    this.pass(encoder, this.pForces, [this.params, this.u.current, this.v.current, this.dye.current]);
+    this.pass(encoder, this.pForces, [this.params, this.u.current, this.v.current, this.dye.current], "forces");
     this.setBndVel(encoder);
 
     // project the post-force field.
@@ -222,9 +245,11 @@ export class GpuFluid {
 
     // advect the dye through the (now divergence-free) velocity, then scalar boundaries.
     const dye0 = this.dye.current;
-    this.pass(encoder, this.pAdvect, [this.params, dye0, this.u.current, this.v.current, this.dye.next]);
+    this.pass(encoder, this.pAdvect, [this.params, dye0, this.u.current, this.v.current, this.dye.next], "advect");
     this.dye.swap();
     this.setBndScalar(encoder, this.dye.current);
+
+    this.timer = null;
   }
 
   /** Release all GPU buffers. */

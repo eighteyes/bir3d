@@ -1,0 +1,213 @@
+{
+  "task": "Plan 3 Task 4 — fluid budget spike (§8.1)",
+  "generatedAt": "2026-06-09T22:39:18.707Z",
+  "machine": {
+    "adapterLabel": "apple / metal-3",
+    "platformRow": "m-series",
+    "hasTimestampQuery": true
+  },
+  "method": {
+    "warmupFrames": 40,
+    "steadyFrames": 80,
+    "dt": 0.1,
+    "reportedStatistic": "median over steady window",
+    "perStageMs": "SUM of all passes tagged that stage (stages interleaved/repeated)",
+    "totalMs": "max(end) − min(begin) over the frame's timed passes (one GPU timeline). UPPER bound: folds in inter-pass gaps, the 4 clearBuffer ops, and the per-pass timestampWrites barrier that production (uninstrumented) does NOT pay — so a config near the band edge that reads OVER here may still fit in production. Cross-checked by wallClockMedianMs.",
+    "wallClockMedianMs": "uninstrumented re-run, performance.now() around submit→onSubmittedWorkDone (no timestampWrites, no querySet). Tracks the instrumented TOTAL when faithful; the honest production-cost estimate sits between sumOfStagesMs (lower) and totalMedianMs (upper).",
+    "interPassOverheadMs": "totalMedianMs − sumOfStagesMs: the architecture is pass-count-bound, not compute-bound (this gap, not the kernel math, dominates). Includes clearBuffer + dispatch fixed cost.",
+    "residualMetric": "max|0.5(u[i+1,j]-u[i-1,j]) + 0.5(v[i,j+1]-v[i,j-1])| over interior (oracle max_abs_div)",
+    "stages": [
+      "forces",
+      "set_bnd",
+      "divergence",
+      "jacobi",
+      "subtract_grad",
+      "advect"
+    ]
+  },
+  "subBudget": {
+    "row": "m-series",
+    "loMs": 3.5,
+    "hiMs": 6,
+    "classification": "PASS ≤ lo, MARGINAL in [lo,hi] (fits only at the budget's edge), OVER > hi. Conservative reading: the budget RANGE is the marginal zone, not slack PASS headroom.",
+    "note": "Compared vs the §3 fluid SUB-budget, NOT the 16.6ms whole frame. Fluid IN ISOLATION: on M-series unified memory the concurrent Plan-4 render shares the bus, so an isolated PASS is necessarily optimistic. Per-layer ms × N_layers gives the 2.5D total."
+  },
+  "sweep": [
+    {
+      "grid": 128,
+      "iters": 10,
+      "passesPerFrame": 90,
+      "steadyFrames": 80,
+      "perStageMedianMs": {
+        "forces": 0.004875,
+        "set_bnd": 0.280292,
+        "divergence": 0.00925,
+        "jacobi": 0.09391300000000001,
+        "subtract_grad": 0.0103955,
+        "advect": 0.0163755
+      },
+      "jacobiTotalMs": 0.09391300000000001,
+      "totalMedianMs": 1.5679485,
+      "sumOfStagesMs": 0.41533549999999997,
+      "interPassOverheadMs": 1.152613,
+      "residualMaxDiv": 17.10664176940918,
+      "wallClockMedianMs": 0.699999988079071,
+      "verdict": "PASS",
+      "perLayerMs": 1.5679485
+    },
+    {
+      "grid": 128,
+      "iters": 20,
+      "passesPerFrame": 150,
+      "steadyFrames": 80,
+      "perStageMedianMs": {
+        "forces": 0.005125,
+        "set_bnd": 0.47263199999999994,
+        "divergence": 0.009895999999999999,
+        "jacobi": 0.19047750000000002,
+        "subtract_grad": 0.0104565,
+        "advect": 0.0169155
+      },
+      "jacobiTotalMs": 0.19047750000000002,
+      "totalMedianMs": 2.6875625000000003,
+      "sumOfStagesMs": 0.7056489999999997,
+      "interPassOverheadMs": 1.9819135000000005,
+      "residualMaxDiv": 9.742649793624878,
+      "wallClockMedianMs": 1,
+      "verdict": "PASS",
+      "perLayerMs": 2.6875625000000003
+    },
+    {
+      "grid": 128,
+      "iters": 40,
+      "passesPerFrame": 270,
+      "steadyFrames": 80,
+      "perStageMedianMs": {
+        "forces": 0.005166,
+        "set_bnd": 0.8344644999999997,
+        "divergence": 0.009667,
+        "jacobi": 0.38076349999999987,
+        "subtract_grad": 0.0108335,
+        "advect": 0.0167905
+      },
+      "jacobiTotalMs": 0.38076349999999987,
+      "totalMedianMs": 4.847550999999999,
+      "sumOfStagesMs": 1.2582045,
+      "interPassOverheadMs": 3.5893464999999996,
+      "residualMaxDiv": 5.385247826576233,
+      "wallClockMedianMs": 1.5,
+      "verdict": "MARGINAL",
+      "perLayerMs": 4.847550999999999
+    },
+    {
+      "grid": 128,
+      "iters": 80,
+      "passesPerFrame": 510,
+      "steadyFrames": 80,
+      "perStageMedianMs": {
+        "forces": 0.005791,
+        "set_bnd": 1.6838849999999994,
+        "divergence": 0.010583,
+        "jacobi": 0.8149179999999996,
+        "subtract_grad": 0.0128325,
+        "advect": 0.0183955
+      },
+      "jacobiTotalMs": 0.8149179999999996,
+      "totalMedianMs": 11.0669355,
+      "sumOfStagesMs": 2.547238499999998,
+      "interPassOverheadMs": 8.519697,
+      "residualMaxDiv": 2.902918219566345,
+      "wallClockMedianMs": 3.099999964237213,
+      "verdict": "OVER",
+      "perLayerMs": 11.0669355
+    },
+    {
+      "grid": 256,
+      "iters": 10,
+      "passesPerFrame": 90,
+      "steadyFrames": 80,
+      "perStageMedianMs": {
+        "forces": 0.008542,
+        "set_bnd": 0.48343250000000004,
+        "divergence": 0.017542000000000002,
+        "jacobi": 0.17997799999999997,
+        "subtract_grad": 0.020959,
+        "advect": 0.0326455
+      },
+      "jacobiTotalMs": 0.17997799999999997,
+      "totalMedianMs": 1.7686185,
+      "sumOfStagesMs": 0.7433624999999999,
+      "interPassOverheadMs": 1.0252560000000002,
+      "residualMaxDiv": 34.42306995391846,
+      "wallClockMedianMs": 1,
+      "verdict": "PASS",
+      "perLayerMs": 1.7686185
+    },
+    {
+      "grid": 256,
+      "iters": 20,
+      "passesPerFrame": 150,
+      "steadyFrames": 80,
+      "perStageMedianMs": {
+        "forces": 0.008541,
+        "set_bnd": 0.7949225000000001,
+        "divergence": 0.0175825,
+        "jacobi": 0.35995600000000005,
+        "subtract_grad": 0.020583,
+        "advect": 0.03254
+      },
+      "jacobiTotalMs": 0.35995600000000005,
+      "totalMedianMs": 2.9420175,
+      "sumOfStagesMs": 1.2340455000000004,
+      "interPassOverheadMs": 1.7079719999999996,
+      "residualMaxDiv": 18.172060012817383,
+      "wallClockMedianMs": 1.5,
+      "verdict": "PASS",
+      "perLayerMs": 2.9420175
+    },
+    {
+      "grid": 256,
+      "iters": 40,
+      "passesPerFrame": 270,
+      "steadyFrames": 80,
+      "perStageMedianMs": {
+        "forces": 0.009,
+        "set_bnd": 1.4990640000000002,
+        "divergence": 0.019478000000000002,
+        "jacobi": 0.756343,
+        "subtract_grad": 0.0250835,
+        "advect": 0.035375000000000004
+      },
+      "jacobiTotalMs": 0.756343,
+      "totalMedianMs": 6.6416485000000005,
+      "sumOfStagesMs": 2.3452115,
+      "interPassOverheadMs": 4.296437000000001,
+      "residualMaxDiv": 10.05927848815918,
+      "wallClockMedianMs": 2.600000023841858,
+      "verdict": "OVER",
+      "perLayerMs": 6.6416485000000005
+    },
+    {
+      "grid": 256,
+      "iters": 80,
+      "passesPerFrame": 510,
+      "steadyFrames": 80,
+      "perStageMedianMs": {
+        "forces": 0.008667,
+        "set_bnd": 2.6900429999999975,
+        "divergence": 0.018125000000000002,
+        "jacobi": 1.4533504999999995,
+        "subtract_grad": 0.022749,
+        "advect": 0.0331665
+      },
+      "jacobiTotalMs": 1.4533504999999995,
+      "totalMedianMs": 9.925495,
+      "sumOfStagesMs": 4.2270025,
+      "interPassOverheadMs": 5.6984924999999995,
+      "residualMaxDiv": 5.652297258377075,
+      "wallClockMedianMs": 4.900000035762787,
+      "verdict": "OVER",
+      "perLayerMs": 9.925495
+    }
+  ]
+}
