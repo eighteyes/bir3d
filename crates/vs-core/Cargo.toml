@@ -2,3 +2,8 @@
 name = "vs-core"
 version = "0.0.0"
 edition = "2021"
+
+# vs-core is the engine's WASM "brain" (blueprint §1). cdylib produces the wasm module;
+# rlib keeps `cargo test` and native consumption working.
+[lib]
+crate-type = ["cdylib", "rlib"]
