@@ -1,0 +1,29 @@
+# === Rust / WASM ===
+target/
+**/target/
+pkg/
+*.wasm
+
+# === Node / JS / TS ===
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# === Env / secrets ===
+.env
+.env.local
+
+# === OS / editor ===
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# === Logs ===
+*.log
+
+# === Agent runtime scaffolding (blueprint under .ai/plan stays tracked) ===
+.ai/canopy/
+.ai/tmp/
+.ai/work-orders/
