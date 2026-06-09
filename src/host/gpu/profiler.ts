@@ -1,7 +1,9 @@
 // profiler.ts — per-pass GPU timing via timestamp-query. The instrument the perf-LOD
 // controller (blueprint §7.3) and the fluid feasibility spike (§8.1) are built on.
 // Responsibilities: allocate a querySet + resolve buffer; wrap a compute pass with begin/end
-// timestamps; resolve to milliseconds. Degrades to NaN when timestamp-query is unsupported.
+// timestamps; resolve to milliseconds. Degrades to NaN when `enabled` is false — the caller
+// passes `hasTimestampQuery` as the enabled flag (constructing enabled on a device without the
+// feature is a validation error).
 
 export class GpuProfiler {
   private querySet?: GPUQuerySet;
@@ -9,7 +11,7 @@ export class GpuProfiler {
   private readBuf?: GPUBuffer;
   readonly enabled: boolean;
 
-  constructor(private device: GPUDevice, enabled: boolean) {
+  constructor(device: GPUDevice, enabled: boolean) {
     this.enabled = enabled;
     if (!enabled) return;
     this.querySet = device.createQuerySet({ type: "timestamp", count: 2 });
