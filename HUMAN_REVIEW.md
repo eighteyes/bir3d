@@ -1,5 +1,45 @@
 # Human Review Steps
 
+## ReadbackRing submit-while-mapped fix
+**Date:** 2026-06-09
+**Commit:** f36a84c
+**Session:** readback-ring-fix-submit-while-mapped
+
+### What was done
+- Rewrote `src/host/gpu/readback.ts`: extracted `mapAsync` call out of `enqueue` into new `afterSubmit()` method
+- `enqueue()` now ONLY records `copyBufferToBuffer` and stores `pendingMap` slot — no map
+- `afterSubmit()` must be called after `device.queue.submit()` — then kicks the non-awaited map
+- Added `ReadbackRing copies src to CPU across batched frames` test to `tests/gpu/smoke.spec.ts`
+
+### Pre-conditions
+```
+cd /Users/god/projects/ai-jank/vector-system
+```
+
+### Verify: unit tests still pass
+```
+npm run test -- readback-ring
+```
+Expected: 1 test passes.
+
+### Verify: GPU/Playwright tests (all 5)
+```
+npm run test:gpu
+```
+Expected: 5 tests pass. New test "ReadbackRing copies src to CPU across batched frames" returns `[10,20,30,40]` with zero page errors.
+
+### Verify: TypeScript clean
+```
+npx tsc --noEmit
+```
+Expected: no output (exit 0).
+
+### Watch for
+- Any `pageerror` in browser console containing "used in submit while mapped" — means regression
+- `ring.read()` returning non-null within 10 frames in the GPU test
+
+
+
 ## Task 6 — Frame Loop + Bootstrap + Live ms Overlay
 **Date:** 2026-06-09
 **Commit:** 2f1bb8b

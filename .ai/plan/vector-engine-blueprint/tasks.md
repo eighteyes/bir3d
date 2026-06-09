@@ -11,7 +11,7 @@ Detail for each task (files, TDD steps, complete code) lives in [plan.md](file:/
 - [x] Task 4 — Async readback ring (never awaited in-frame) — commits 04f7411 + e7cd125 (.catch + cleanup per review)
 - [x] Task 5 — GPU timestamp profiler (per-pass ms instrument)
 - [x] Task 6 — Frame loop + bootstrap + live ms overlay (frameloop.ts, main.ts; device.lost handler; sampled profiling every 30 frames)
-- [ ] Task 7 — Foundation run/verify notes
+- [x] Task 7 — Foundation run/verify notes — satisfied by HUMAN_REVIEW.md (root, per review rule); commit d8cd66d also fixed tsc-shadow hygiene (noEmit)
 
 ## Roadmap — subsequent plans (each its own working/testable increment)
 
