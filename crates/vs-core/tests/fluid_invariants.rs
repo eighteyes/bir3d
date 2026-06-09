@@ -8,8 +8,12 @@
 //   - (c) symmetric IC + symmetric forces stay mirror-symmetric, on a non-trivial field.
 //   - (d) kappa=0 => Fluid25D layers evolve bit-identically to standalone Fluid2D,
 //         with distinct per-layer ICs so cross-talk would contaminate.
-//   - (e) kappa>0 => the vertical sum of a passively-mixed scalar is conserved, and the
-//         mixing actually changes the field (it is not a no-op).
+//   - (e) kappa>0 => the vertical sum of a passively-mixed scalar is conserved, the
+//         mixing actually changes the field (it is not a no-op), and it diffuses (the
+//         cross-layer spread strictly shrinks) rather than anti-diffuses.
+//   - (f) Fluid2D::step actually transports: a transverse velocity feature carried by a
+//         uniform divergence-free flow translates by the backtrace displacement, pinning
+//         advection's presence, dt scaling, and direction in the assembled step.
 
 use vs_core::fluid::grid::Grid2D;
 use vs_core::fluid::project::divergence;
@@ -269,12 +273,18 @@ fn kappa_zero_matches_standalone_layers() {
     }
 }
 
-/// (e) kappa > 0 conserves the vertical sum of a passively-mixed scalar, AND the mixing
-/// actually changes the field (it is not a silent no-op).
+/// (e) kappa > 0 conserves the vertical sum of a passively-mixed scalar, the mixing
+/// actually changes the field (not a silent no-op), AND it DIFFUSES rather than
+/// anti-diffuses (the cross-layer spread strictly shrinks).
 ///
 /// Velocities and forces are zero, so the only thing that moves `s` is vertical mixing.
 /// The vertical Laplacian with Neumann (no-flux) ends conserves sum_l s[l] at each cell.
-/// f32 telescoping leaves ~eps drift, so the assertion is a relative tolerance.
+/// f32 telescoping leaves ~eps drift, so the conservation assertion is a relative
+/// tolerance. Conservation alone is even in the sign of the coefficient (it holds for
+/// `+=` and `-=` alike, since sum_l lap[l] = 0 by telescoping regardless of sign), so a
+/// directional check is required: diffusion REDUCES the per-cell vertical spread
+/// (max_l s[l] - min_l s[l]); anti-diffusion (wrong sign) GROWS it. The strict-shrink
+/// assertion distinguishes the two and kills a sign-flipped coupling.
 #[test]
 fn kappa_positive_conserves_vertical_sum() {
     let (w, h) = (10usize, 10usize);
@@ -307,6 +317,22 @@ fn kappa_positive_conserves_vertical_sum() {
             }
         }
         sums
+    };
+    // Per-cell vertical spread (max_l - min_l) BEFORE mixing. Computed here because
+    // `Fluid25D::new` takes ownership of `layers`.
+    let spread_before: Vec<f32> = {
+        let len = (w + 2) * (h + 2);
+        let mut spread = vec![0.0f32; len];
+        for k in 0..len {
+            let mut lo = f32::INFINITY;
+            let mut hi = f32::NEG_INFINITY;
+            for f in layers.iter() {
+                lo = lo.min(f.s.data[k]);
+                hi = hi.max(f.s.data[k]);
+            }
+            spread[k] = hi - lo;
+        }
+        spread
     };
     // Snapshot layer 0 to later prove mixing actually changed something.
     let s0_before = layers[0].s.clone();
@@ -349,4 +375,102 @@ fn kappa_positive_conserves_vertical_sum() {
         }
     }
     assert!(max_change > 1e-2, "vertical mixing did not change the scalar (max change = {max_change})");
+
+    // Directional: diffusion strictly SHRINKS the per-cell vertical spread; a
+    // sign-flipped (anti-diffusion) coupling would grow it. A strict shrink at every
+    // interior cell kills the wrong-sign mutant while staying true under correct `+=`.
+    let g = &stack.layers[0].s;
+    for j in 1..=h {
+        for i in 1..=w {
+            let k = g.idx(i, j);
+            let mut lo = f32::INFINITY;
+            let mut hi = f32::NEG_INFINITY;
+            for f in stack.layers.iter() {
+                lo = lo.min(f.s.data[k]);
+                hi = hi.max(f.s.data[k]);
+            }
+            let spread_after = hi - lo;
+            assert!(
+                spread_after < spread_before[k] * 0.99,
+                "vertical spread did not shrink at ({i},{j}): before={}, after={spread_after} \
+                 (diffusion must reduce cross-layer spread; wrong sign grows it)",
+                spread_before[k]
+            );
+        }
+    }
+}
+
+/// (f) Fluid2D::step actually TRANSPORTS: advection moves a velocity feature downstream.
+///
+/// Transport and tracer are decoupled to keep projection a no-op and avoid nonlinear
+/// self-advection of the carrier:
+///   - u = c everywhere (the uniform carrier flow),
+///   - v(i,j) = bump(i): a Gaussian in column i, CONSTANT across rows j (the feature),
+///   - zero force.
+/// The central-difference divergence is `0.5*(u(i+1)-u(i-1)) + 0.5*(v(i,j+1)-v(i,j-1))
+/// = 0 + 0` exactly (u uniform; v independent of j), so the field is divergence-free and
+/// project() is a no-op. Self-advection gives `v_new(i,j) = v_old(i - dt*c, j)` (the
+/// j - dt*v perturbation in the y-arg is irrelevant since v_old is constant in j), so the
+/// v-bump translates by dt*c per step while u stays uniform.
+///
+/// Asserts the SIGNED x-centroid of v moved into [0.5, 1.5] * (n_steps*dt*c): the lower
+/// bound pins advection's PRESENCE and DIRECTION (a no-advect step freezes the centroid
+/// and fails it); the upper bound pins dt SCALING. The bound is loose on purpose — the
+/// set_bnd(VelY) sign-flip at the top/bottom border rows injects a sub-cell, x-symmetric
+/// divergence that project() then corrects, so the centroid does not match n*dt*c
+/// exactly; the loose two-sided bound cleanly separates "moved several cells" from
+/// "moved ~0". The bump is kept clear of the x-walls so the Stam clamp does not eat it.
+#[test]
+fn step_advects_a_velocity_feature_downstream() {
+    let (w, h) = (40usize, 12usize);
+    let iters = 40usize;
+    let dt = 0.5f32;
+    let c = 2.0f32; // uniform carrier flow in +x
+    let n_steps = 4usize;
+    let cx0 = 8.0f32; // initial bump column, well clear of the x-walls
+    let sigma = 2.0f32;
+
+    let mut f = Fluid2D::new(w, h, iters);
+    // u = c everywhere (interior); v = Gaussian in i, constant across j.
+    let bump = |i: usize| {
+        let dx = i as f32 - cx0;
+        (-(dx * dx) / (2.0 * sigma * sigma)).exp()
+    };
+    for j in 1..=h {
+        for i in 1..=w {
+            f.u.set(i, j, c);
+            f.v.set(i, j, bump(i));
+        }
+    }
+
+    // x-centroid of the v feature over interior cells (|v| weighting).
+    let x_centroid = |g: &Grid2D| -> f32 {
+        let mut num = 0.0f32;
+        let mut den = 0.0f32;
+        for j in 1..=h {
+            for i in 1..=w {
+                let mag = g.at(i, j).abs();
+                num += i as f32 * mag;
+                den += mag;
+            }
+        }
+        num / den
+    };
+
+    let centroid_before = x_centroid(&f.v);
+    let zero = Grid2D::new(w, h);
+    for _ in 0..n_steps {
+        f.step(dt, &zero, &zero);
+    }
+    let centroid_after = x_centroid(&f.v);
+
+    let displacement = centroid_after - centroid_before;
+    let expected = n_steps as f32 * dt * c; // 4*0.5*2 = 4 cells downstream
+    assert!(
+        displacement >= 0.5 * expected && displacement <= 1.5 * expected,
+        "feature displacement {displacement} not in [{}, {}] (expected ~{expected}); \
+         a no-advect step leaves it at ~0 and fails the lower bound",
+        0.5 * expected,
+        1.5 * expected
+    );
 }
