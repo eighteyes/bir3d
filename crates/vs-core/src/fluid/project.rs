@@ -2,6 +2,8 @@
 // Makes a velocity field (approximately) divergence-free via a pressure solve.
 // Responsibilities:
 //   - divergence(u,v): central-difference divergence of the velocity field (h=1).
+//   - jacobi_sweep(p_next,p,div): one compact 5-point Jacobi pressure update (interior).
+//   - subtract_grad(u,v,p): subtract the central-difference pressure gradient (interior).
 //   - project(u,v,iters): solve Laplacian(p)=div by Jacobi ping-pong (two buffers,
 //     read prev / write next / swap; set_bnd(Scalar,p) each sweep), then subtract
 //     grad(p) from u,v and apply set_bnd(VelX,u)/set_bnd(VelY,v).
@@ -27,6 +29,41 @@ pub fn divergence(u: &Grid2D, v: &Grid2D) -> Grid2D {
     div
 }
 
+/// One compact 5-point Jacobi pressure sweep: for every interior cell,
+/// `p_next(i,j) = 0.25*(p(i-1,j)+p(i+1,j)+p(i,j-1)+p(i,j+1) - div(i,j))`.
+/// Reads `p` and `div`, writes `p_next` (interior only; the border is the caller's
+/// concern via `set_bnd(Scalar, ..)`). This is the single iteration the Plan 3 GPU
+/// `jacobi.wgsl` kernel reproduces, so it is exposed standalone for the GPU oracle.
+pub fn jacobi_sweep(p_next: &mut Grid2D, p: &Grid2D, div: &Grid2D) {
+    let w = p.w;
+    let h = p.h;
+    for j in 1..=h {
+        for i in 1..=w {
+            let sum = p.at(i - 1, j) + p.at(i + 1, j) + p.at(i, j - 1) + p.at(i, j + 1);
+            p_next.set(i, j, 0.25 * (sum - div.at(i, j)));
+        }
+    }
+}
+
+/// Subtract the central-difference pressure gradient from `(u, v)` at every interior
+/// cell (`h = 1`): `u -= 0.5*(p(i+1,j)-p(i-1,j))`, `v -= 0.5*(p(i,j+1)-p(i,j-1))`.
+/// Interior only; the caller re-applies `set_bnd(VelX,u)/set_bnd(VelY,v)`. Exposed
+/// standalone so the Plan 3 GPU `subtract_grad.wgsl` kernel has a 1:1 oracle.
+pub fn subtract_grad(u: &mut Grid2D, v: &mut Grid2D, p: &Grid2D) {
+    let w = u.w;
+    let h = u.h;
+    for j in 1..=h {
+        for i in 1..=w {
+            let gx = 0.5 * (p.at(i + 1, j) - p.at(i - 1, j));
+            let gy = 0.5 * (p.at(i, j + 1) - p.at(i, j - 1));
+            let nu = u.at(i, j) - gx;
+            let nv = v.at(i, j) - gy;
+            u.set(i, j, nu);
+            v.set(i, j, nv);
+        }
+    }
+}
+
 /// Project `(u, v)` onto its (discretely) divergence-free part.
 ///
 /// Solves the Poisson problem `Laplacian(p) = div(u,v)` (5-point compact stencil,
@@ -50,27 +87,13 @@ pub fn project(u: &mut Grid2D, v: &mut Grid2D, iters: usize) {
     let mut p_next = Grid2D::new(w, h);
 
     for _ in 0..iters {
-        for j in 1..=h {
-            for i in 1..=w {
-                let sum = p.at(i - 1, j) + p.at(i + 1, j) + p.at(i, j - 1) + p.at(i, j + 1);
-                p_next.set(i, j, 0.25 * (sum - div.at(i, j)));
-            }
-        }
+        jacobi_sweep(&mut p_next, &p, &div);
         set_bnd(Bnd::Scalar, &mut p_next);
         std::mem::swap(&mut p, &mut p_next);
     }
 
     // Subtract the pressure gradient to remove the divergent component.
-    for j in 1..=h {
-        for i in 1..=w {
-            let gx = 0.5 * (p.at(i + 1, j) - p.at(i - 1, j));
-            let gy = 0.5 * (p.at(i, j + 1) - p.at(i, j - 1));
-            let nu = u.at(i, j) - gx;
-            let nv = v.at(i, j) - gy;
-            u.set(i, j, nu);
-            v.set(i, j, nv);
-        }
-    }
+    subtract_grad(u, v, &p);
     set_bnd(Bnd::VelX, u);
     set_bnd(Bnd::VelY, v);
 }
