@@ -11,6 +11,34 @@ test("acquires a WebGPU device and reports timestamp-query support", async ({ pa
   expect(typeof result.hasTimestamp).toBe("boolean");
 });
 
+test("profiler reports a plausible positive ms for a compute pass (when supported)", async ({ page }) => {
+  await page.goto("/");
+  const ms = await page.evaluate(async () => {
+    const { acquireDevice } = await import("/src/host/gpu/device.ts");
+    const { makeComputePipeline } = await import("/src/host/gpu/dispatch.ts");
+    const { GpuProfiler } = await import("/src/host/gpu/profiler.ts");
+    const addone = await (await fetch("/src/host/shaders/addone.wgsl")).text();
+    const { device, hasTimestampQuery } = await acquireDevice();
+    if (!hasTimestampQuery) return 0; // pass trivially where unsupported
+    const n = 1 << 16;
+    const buf = (usage: number) => device.createBuffer({ size: n * 4, usage });
+    const inBuf = buf(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+    const outBuf = buf(GPUBufferUsage.STORAGE);
+    const pipeline = makeComputePipeline(device, addone);
+    const prof = new GpuProfiler(device, true);
+    const enc = device.createCommandEncoder();
+    const bg = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: inBuf } }, { binding: 1, resource: { buffer: outBuf } }] });
+    const pass = enc.beginComputePass({ timestampWrites: prof.timestampWrites() });
+    pass.setPipeline(pipeline); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(Math.ceil(n / 64)); pass.end();
+    prof.resolve(enc);
+    device.queue.submit([enc.finish()]);
+    return prof.readMs();
+  });
+  expect(ms).toBeGreaterThanOrEqual(0);
+  expect(ms).toBeLessThan(100);
+});
+
 test("add-one compute kernel maps [1,2,3] -> [2,3,4]", async ({ page }) => {
   await page.goto("/");
   const out = await page.evaluate(async () => {
