@@ -68,7 +68,17 @@ Moving-window 2.5D = N stacked layers; per-layer ms × N_layers (the coupling pa
 	256²	40	10.0	25.93	10.06	OVER
 	256²	80	19.2	52.21	5.65	OVER
 
-**Reading the realistic operating point.** A usable moving-window grid is 256²; a fluid that visibly converges needs ≥20 iters (at 10 iters residual is 34, the field barely projects). At **256²/20 the honest wall-clock 2.5D projection is 7.2ms — OVER the 6ms ceiling**, and the instrumented ceiling is 15.7ms. Only the degenerate corners survive (128²/10 PASS but a tiny window with residual 17; 256²/10 MARGINAL but residual 34 = effectively unprojected). **At no operating point that is both usefully sized AND usefully converged does 2.5D×4 clear the band on wall-clock.**
+**Reading the realistic operating point (sequential-loop model).** A usable moving-window grid is 256²; a fluid that visibly converges needs ≥20 iters (at 10 iters residual is 34, the field barely projects). At 256²/20 the sequential-loop wall-clock 2.5D projection is 7.2ms — OVER the 6ms ceiling. **BUT a sequential per-layer loop is the wrong implementation — see the correction below; this ×4 number does NOT establish a verdict on the architecture.**
+
+---
+
+## CORRECTION — the ×4 projection models an anti-pattern, not the architecture
+
+The ×4 figure assumes 2.5D runs as a **sequential per-layer loop** (4× the passes). But this spike's own root cause is that the workload is **pass-count-bound with trivial compute** — so the GPU is badly underutilized at these grids, and the grid-scaling data proves it: **128²→256² is 4× the cells but only 1.31× total ms** (4.94→6.48) and **1.87× sum-of-stages** (1.26→2.35) — strongly sublinear.
+
+The implication missed above: **4 layers belong in ONE batched dispatch set** (a `(W+2)×(H+2)×L` grid), not a 4-iteration loop. Batched, the pass *count* stays at single-layer levels, so the dominant cost (pass overhead) is **amortized, not multiplied**, and only the cheap, sublinear compute grows. By the measured scaling (4× cells ≈ 1.3–1.9× time), batched 2.5D ≈ single-layer × ~1.5 → **256²/20 ≈ 2.5–3.4ms wall = PASS**, not the ×4 = 7.2ms OVER.
+
+**So 2.5D feasibility is UNRESOLVED, not failed.** What this spike actually falsified is the *sequential-loop* implementation, not the moving-window 2.5D architecture. Batching the layers is the **same root-cause lever** as in-kernel boundary (both cut/amortize pass overhead). The honest next step is to batch 4 layers into the existing dispatches and read the real number.
 
 ---
 
@@ -82,14 +92,16 @@ Moving-window 2.5D = N stacked layers; per-layer ms × N_layers (the coupling pa
 
 ## Architecture recommendation
 
-**Moving-window 2.5D × 4 layers does NOT comfortably survive the §3 M-series sub-budget as currently built.** Single-layer PASSES on wall-clock; the 2.5D stack at a useful operating point (256², ≥20 iters) projects to ~7ms wall-clock — OVER the 6ms ceiling before the isolation penalty is even applied. The spike's own data identifies WHY and the specific lever:
+**Moving-window 2.5D feasibility is UNRESOLVED — NOT failed.** Single-layer PASSES comfortably on wall-clock (≤2.5ms at ≤40 iters). The only thing this spike falsified is the **sequential-loop** 2.5D implementation (×4 passes → ~7ms). Because the workload is pass-count-bound with sublinear compute (4× cells = 1.3–1.9× time), the architecture must batch the layers into one dispatch set, where the ×4 cost does not apply. The spike's own data identifies the bottleneck and TWO co-first levers:
 
 - **Root cause: pass-count-bound, `set_bnd`-dominated.** The kernel math is cheap (sum-of-stages ~2ms at 256²/40); inter-pass overhead and `set_bnd` dominate. The carried-forward flags filed textures / in-kernel boundary as deferred "bandwidth" optimizations — **the spike disproves that framing.** The bottleneck is pass count, not bandwidth.
 
-- **Recommended first lever (justified by this data): fold the boundary into the kernels (in-kernel `set_bnd`).** `set_bnd` is the largest single stage AND each application is a separate two-pass dispatch — collapsing it into the divergence/jacobi/advect kernels removes the most passes for the least code-shape risk. This is now an EARNED optimization, not a speculative one. Do this before adding layers.
+- **Co-first lever A — batch the layers into one dispatch set** (a `(W+2)×(H+2)×L` grid, not a per-layer loop). This is the decisive experiment: it keeps the pass count at single-layer levels so the dominant pass-overhead amortizes, and by the measured sublinear scaling it should land 2.5D×4 around 2.5–3.4ms wall (PASS). Build it and read the real number BEFORE concluding anything about 2.5D.
 
-- **If pass-count reduction is insufficient, descope the 2.5D ambition**, in cheap-to-reverse order: (a) fewer layers (N=2–3 instead of 4); (b) coarser moving-window grid (192² or 128² instead of 256²); (c) accept a higher residual / fewer Jacobi iters (visual-quality tradeoff, gated on the Plan-4 look). Each is independently dial-able.
+- **Co-first lever B — fold the boundary into the kernels (in-kernel `set_bnd`).** `set_bnd` is the largest single stage AND each application is a separate two-pass dispatch — collapsing it into the divergence/jacobi/advect kernels removes the most passes for the least code-shape risk. EARNED, not speculative. (Note: the carried-forward "textures = bandwidth optimization" framing is DISPROVEN — the bottleneck is pass count, not bandwidth.)
+
+- **Third resort, only if A+B are insufficient: descope the 2.5D ambition**, in cheap-to-reverse order: (a) fewer layers (N=2–3); (b) coarser moving-window grid (192²/128²); (c) higher residual / fewer Jacobi iters (visual-quality tradeoff, gated on the Plan-4 look). Each is independently dial-able.
 
 - **Re-measure in concert, not isolation.** The decisive number is fluid + Plan-4 render on the shared M-series bus. This spike sets the isolated floor; the real gate is the concurrent total, which this spike cannot produce. Treat any 2.5D "fits" claim as provisional until measured alongside the render.
 
-**Bottom line:** the GPU port is faithful (correctness gate green) and single-layer fluid is cheap; the moving-window 2.5D architecture is MARGINAL-to-OVER on honest wall-clock and needs in-kernel-boundary pass reduction (first) or layer/grid/residual descope (fallback) to land — and even then must be re-validated concurrently with the render before it can be called PASS.
+**Bottom line:** the GPU port is faithful (correctness gate green) and single-layer fluid is cheap (PASS). The moving-window 2.5D verdict is **UNRESOLVED**: the ×4 "OVER" figure measures a sequential-loop anti-pattern, not the architecture. Next step is the decisive experiment — **batch the 4 layers into one dispatch set + fold in-kernel boundary, then read the real number** (projected ~2.5–3.4ms wall = PASS). Only if that fails do layer/grid/residual descope apply. And whatever the isolated number, it must be re-validated concurrently with the Plan-4 render on the shared bus before any final "fits" claim.
