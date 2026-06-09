@@ -23,6 +23,14 @@ dist/
 # === Logs ===
 *.log
 
+# === TypeScript compiled output (tsc -b emits .js alongside .ts) ===
+src/**/*.js
+tests/**/*.js
+
+# === Playwright output ===
+test-results/
+playwright-report/
+
 # === Agent runtime scaffolding (blueprint under .ai/plan stays tracked) ===
 .ai/canopy/
 .ai/tmp/
