@@ -1,5 +1,7 @@
 //! vs-core — Vector System engine core (orchestration brain; stubbed in the foundation increment).
 
+pub mod fluid;
+
 /// Engine ABI version. Bumped when the WASM↔JS command-descriptor layout changes.
 pub fn abi_version() -> u32 { 1 }
 
