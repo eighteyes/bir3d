@@ -1,5 +1,39 @@
 # Human Review Steps
 
+## Fluid live debug viz (Plan 3 — Task 5)
+**Date:** 2026-06-09
+**Commit:** ad7e484
+**Session:** plan3-task5-fluid-viz
+
+### What was done
+- `src/host/shaders/fluid/visualize.wgsl`: fullscreen-triangle render pipeline; fragment samples the bordered dye storage buffer, neon-green ramp on dark, luminance clamped to a brightness ceiling (§7.2).
+- `src/host/fluid-main.ts`: FrameLoop driving `GpuFluid.step` + a render pass; rotating host-side jet/dye source (deterministic from frame index) for a visible swirl; per-frame render bind-group rebuild from `fluid.dyeField`; cadence-sampled warm-median overlay (adapter/grid/iters/ms/§3-verdict/cpu dt); non-blocking 1×1 center-pixel readback to `window.__centerPixel`; sets `window.__fluidBooted`.
+- `index-fluid.html`: canvas + overlay entry (served at `/index-fluid.html`); `dev:fluid` npm script.
+- `tests/gpu/fluid-viz.spec.ts`: boots, runs ~60 frames, asserts overlay fluid ms readout + non-blank center pixel + zero page errors.
+
+### Pre-conditions
+```
+cd /Users/god/projects/ai-jank/vector-system
+```
+
+### Verify: viz boot test passes
+```
+npx playwright test tests/gpu/fluid-viz.spec.ts
+```
+Expected: 1 test passes.
+
+### Verify: full GPU suite still green
+```
+npm run test:gpu
+```
+Expected: 17 tests pass, zero page errors.
+
+### Verify: see the swirl live (manual, eyes-on)
+```
+npm run dev:fluid
+```
+Expected: a browser opens `/index-fluid.html` showing a swirling neon-green dye plume on a dark canvas; the overlay reports adapter `apple / metal-3`, grid `128²`, iters `20`, a `fluid: <n> ms (last)` line, a `fluid warm-median: <n> ms` line with a `§3 sub-budget` PASS/MARGINAL/OVER verdict, per-stage ms, and `cpu dt`.
+
 ## ReadbackRing submit-while-mapped fix
 **Date:** 2026-06-09
 **Commit:** f36a84c
