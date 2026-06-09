@@ -15,7 +15,7 @@ test("add-one compute kernel maps [1,2,3] -> [2,3,4]", async ({ page }) => {
   await page.goto("/");
   const out = await page.evaluate(async () => {
     const { acquireDevice } = await import("/src/host/gpu/device.ts");
-    const { makeComputePipeline, runComputePass } = await import("/src/host/gpu/dispatch.ts");
+    const { makeComputePipeline, dispatchCompute } = await import("/src/host/gpu/dispatch.ts");
     const addone = await (await fetch("/src/host/shaders/addone.wgsl")).text();
     const { device } = await acquireDevice();
     const data = new Float32Array([1, 2, 3]);
@@ -23,7 +23,7 @@ test("add-one compute kernel maps [1,2,3] -> [2,3,4]", async ({ page }) => {
     device.queue.writeBuffer(inBuf, 0, data);
     const outBuf = device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
     const pipeline = makeComputePipeline(device, addone);
-    runComputePass(device, pipeline, [inBuf, outBuf], data.length);
+    dispatchCompute(device, pipeline, [inBuf, outBuf], data.length);
     const staging = device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const enc = device.createCommandEncoder();
     enc.copyBufferToBuffer(outBuf, 0, staging, 0, data.byteLength);
