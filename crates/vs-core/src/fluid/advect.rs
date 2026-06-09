@@ -132,6 +132,61 @@ mod tests {
         }
     }
 
+    /// (b3) Uniform velocity (0,2), dt=1 => integer shift of exactly 2 rows.
+    /// Mirrors (b1) onto the y/row axis. For cells whose backtrace stays interior
+    /// (j-shift >= 1) the result equals src.at(i, j-shift) exactly. A v sign error
+    /// (y = j + dt*v) pulls the wrong row and fails; ignoring v (y = j) leaves the
+    /// row unshifted and fails. This is the v-axis mutant killer.
+    #[test]
+    fn uniform_vertical_integer_shift_is_exact() {
+        let (w, h) = (4, 6);
+        let shift = 2usize;
+        let src = filled_full(w, h, |i, j| 10.0 * i as f32 + j as f32);
+        let u = Grid2D::new(w, h);
+        let v = uniform(w, h, shift as f32);
+        let mut dst = Grid2D::new(w, h);
+        advect(&mut dst, &src, &u, &v, 1.0);
+        for j in 1..=h {
+            for i in 1..=w {
+                if j >= shift + 1 {
+                    // Backtrace y = j - 2 stays interior; integer coord => exact tap.
+                    assert_eq!(
+                        dst.at(i, j),
+                        src.at(i, j - shift),
+                        "vertical integer shift must pull from upstream cell at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// (b4) Non-integer vertical shift: bilinear is EXACT on an affine field, so
+    /// advecting a linear field by 1.5 rows must match src.sample of the backtraced
+    /// coordinate to floating tolerance. Mirrors (b2) onto the y/row axis to pin the
+    /// v backtrace coordinate and v scale.
+    #[test]
+    fn noninteger_vertical_shift_matches_analytic_sample() {
+        let (w, h) = (4, 6);
+        let dt = 0.75f32;
+        let vel = 2.0f32; // shift = dt*vel = 1.5
+        let src = filled_full(w, h, |i, j| 10.0 * i as f32 + j as f32);
+        let u = Grid2D::new(w, h);
+        let v = uniform(w, h, vel);
+        let mut dst = Grid2D::new(w, h);
+        advect(&mut dst, &src, &u, &v, dt);
+        for j in 1..=h {
+            for i in 1..=w {
+                let expect = src.sample(i as f32, j as f32 - dt * vel);
+                assert!(
+                    (dst.at(i, j) - expect).abs() < 1e-5,
+                    "non-integer vertical shift at ({i},{j}): got {}, want {}",
+                    dst.at(i, j),
+                    expect
+                );
+            }
+        }
+    }
+
     /// (c) Left-right symmetric field under a mirror-symmetric velocity field
     /// stays symmetric. Mirror i -> w+1-i requires u ANTI-symmetric and v
     /// symmetric for the flow to be mirror-symmetric as a vector field; a
