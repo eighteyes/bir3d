@@ -1,5 +1,49 @@
 # Human Review Steps
 
+## Plan 3 — GPU fluid spike (final gate, §8.1)
+**Date:** 2026-06-09
+**Commit:** fb6cce7
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done
+- Final gate for the Plan 3 fluid GPU port: ran all GPU + Rust tests green, regenerated the budget findings with REAL apple/metal-3 numbers, and wrote the §8.1 verdict.
+- `.ai/plan/fluid-gpu-spike/SPIKE-FINDINGS.md`: measured fluid ms per stage at each grid/iter, dual ms reporting (instrumented `totalMedianMs` upper bound vs production-representative `wallClockMedianMs`), residual `max|div|`, PASS/MARGINAL/OVER vs the §3 M-series sub-budget (3.5–6ms), the 2.5D ×4-layer projection, the isolation-optimism caveat, and the architecture recommendation.
+- Verdict: single-layer fluid PASSES on wall-clock at every useful iter count; the moving-window 2.5D ×4 stack is MARGINAL-to-OVER on honest wall-clock at a usefully-sized + usefully-converged operating point (256², ≥20 iters → ~7ms wall-clock vs 6ms ceiling), before the concurrent-render isolation penalty. Bottleneck is pass-count (set_bnd-dominated), not bandwidth → recommend in-kernel boundary before adding layers, else descope layers/grid/iters.
+
+### Pre-conditions
+```
+cd /Users/god/projects/ai-jank/vector-system
+```
+
+### Verify: full GPU suite green (regenerates budget-findings.json)
+```
+npm run test:gpu
+```
+Expected: 17 tests pass on `apple / metal-3`, zero page errors. The budget spec writes `tests/fixtures/fluid/budget-findings.json`.
+
+### Verify: Rust oracle tests green
+```
+cargo test -p vs-core
+```
+Expected: 21 (lib) + 6 (fluid_invariants) = 27 passed, 0 failed.
+
+### Verify: read the measured numbers
+```
+jq -r '.machine.adapterLabel, (.sweep[] | "grid=\(.grid) iters=\(.iters) total=\(.totalMedianMs) wall=\(.wallClockMedianMs) residual=\(.residualMaxDiv) verdict=\(.verdict)")' tests/fixtures/fluid/budget-findings.json
+```
+Expected: adapter `apple / metal-3`; 8 sweep rows (128²/256² × 10/20/40/80 iters); totals ~1.6–13ms, wall ~0.8–4.8ms, residual ~3–34.
+
+### Verify: see the swirl live (manual, eyes-on)
+```
+npm run dev
+```
+Then open `/index-fluid.html` in the browser (or `npm run dev:fluid` to auto-open). Expected: a swirling neon-green dye plume on a dark canvas; overlay reports adapter `apple / metal-3`, grid, iters, per-stage warm-median ms, a `§3 sub-budget` PASS/MARGINAL/OVER verdict, and `cpu dt`.
+
+### Watch for
+- The JSON `verdict` field classifies `totalMedianMs` (instrumented UPPER bound, ×2–3 the production cost). Do NOT quote it as the architecture verdict without `wallClockMedianMs` alongside — SPIKE-FINDINGS.md tables both.
+- Every ms here is fluid IN ISOLATION. The decisive number is fluid + Plan-4 render on the shared M-series bus; any "2.5D fits" claim stays provisional until measured concurrently.
+- Residual `max|div|` (5–34) is deeply under-converged vs the oracle's 8000-iter near-zero; "acceptable residual" is a Plan-4 visual judgment, not a timing fact this spike can settle.
+
 ## Fluid live debug viz (Plan 3 — Task 5)
 **Date:** 2026-06-09
 **Commit:** ad7e484

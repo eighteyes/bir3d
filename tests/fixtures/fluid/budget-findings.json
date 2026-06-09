@@ -1,6 +1,6 @@
 {
   "task": "Plan 3 Task 4 — fluid budget spike (§8.1)",
-  "generatedAt": "2026-06-09T22:39:18.707Z",
+  "generatedAt": "2026-06-09T23:08:14.218Z",
   "machine": {
     "adapterLabel": "apple / metal-3",
     "platformRow": "m-series",
@@ -39,21 +39,21 @@
       "passesPerFrame": 90,
       "steadyFrames": 80,
       "perStageMedianMs": {
-        "forces": 0.004875,
-        "set_bnd": 0.280292,
-        "divergence": 0.00925,
-        "jacobi": 0.09391300000000001,
-        "subtract_grad": 0.0103955,
-        "advect": 0.0163755
+        "forces": 0.005332,
+        "set_bnd": 0.28453549999999994,
+        "divergence": 0.0097705,
+        "jacobi": 0.09495250000000002,
+        "subtract_grad": 0.0105835,
+        "advect": 0.0168325
       },
-      "jacobiTotalMs": 0.09391300000000001,
-      "totalMedianMs": 1.5679485,
-      "sumOfStagesMs": 0.41533549999999997,
-      "interPassOverheadMs": 1.152613,
+      "jacobiTotalMs": 0.09495250000000002,
+      "totalMedianMs": 1.5975515,
+      "sumOfStagesMs": 0.422058,
+      "interPassOverheadMs": 1.1754935,
       "residualMaxDiv": 17.10664176940918,
-      "wallClockMedianMs": 0.699999988079071,
+      "wallClockMedianMs": 0.7999999523162842,
       "verdict": "PASS",
-      "perLayerMs": 1.5679485
+      "perLayerMs": 1.5975515
     },
     {
       "grid": 128,
@@ -61,21 +61,21 @@
       "passesPerFrame": 150,
       "steadyFrames": 80,
       "perStageMedianMs": {
-        "forces": 0.005125,
-        "set_bnd": 0.47263199999999994,
-        "divergence": 0.009895999999999999,
-        "jacobi": 0.19047750000000002,
-        "subtract_grad": 0.0104565,
-        "advect": 0.0169155
+        "forces": 0.004916500000000001,
+        "set_bnd": 0.46590999999999966,
+        "divergence": 0.009666500000000001,
+        "jacobi": 0.1881855,
+        "subtract_grad": 0.0102925,
+        "advect": 0.016562
       },
-      "jacobiTotalMs": 0.19047750000000002,
-      "totalMedianMs": 2.6875625000000003,
-      "sumOfStagesMs": 0.7056489999999997,
-      "interPassOverheadMs": 1.9819135000000005,
+      "jacobiTotalMs": 0.1881855,
+      "totalMedianMs": 2.6098565000000002,
+      "sumOfStagesMs": 0.6955014999999997,
+      "interPassOverheadMs": 1.9143550000000005,
       "residualMaxDiv": 9.742649793624878,
       "wallClockMedianMs": 1,
       "verdict": "PASS",
-      "perLayerMs": 2.6875625000000003
+      "perLayerMs": 2.6098565000000002
     },
     {
       "grid": 128,
@@ -84,20 +84,20 @@
       "steadyFrames": 80,
       "perStageMedianMs": {
         "forces": 0.005166,
-        "set_bnd": 0.8344644999999997,
-        "divergence": 0.009667,
-        "jacobi": 0.38076349999999987,
-        "subtract_grad": 0.0108335,
-        "advect": 0.0167905
+        "set_bnd": 0.8332870000000001,
+        "divergence": 0.009624500000000001,
+        "jacobi": 0.38010049999999984,
+        "subtract_grad": 0.010707999999999999,
+        "advect": 0.016667
       },
-      "jacobiTotalMs": 0.38076349999999987,
-      "totalMedianMs": 4.847550999999999,
-      "sumOfStagesMs": 1.2582045,
-      "interPassOverheadMs": 3.5893464999999996,
+      "jacobiTotalMs": 0.38010049999999984,
+      "totalMedianMs": 4.942320499999999,
+      "sumOfStagesMs": 1.2552554999999996,
+      "interPassOverheadMs": 3.6870649999999996,
       "residualMaxDiv": 5.385247826576233,
-      "wallClockMedianMs": 1.5,
+      "wallClockMedianMs": 1.800000011920929,
       "verdict": "MARGINAL",
-      "perLayerMs": 4.847550999999999
+      "perLayerMs": 4.942320499999999
     },
     {
       "grid": 128,
@@ -105,21 +105,21 @@
       "passesPerFrame": 510,
       "steadyFrames": 80,
       "perStageMedianMs": {
-        "forces": 0.005791,
-        "set_bnd": 1.6838849999999994,
-        "divergence": 0.010583,
-        "jacobi": 0.8149179999999996,
-        "subtract_grad": 0.0128325,
-        "advect": 0.0183955
+        "forces": 0.0058335,
+        "set_bnd": 1.6801864999999991,
+        "divergence": 0.010562499999999999,
+        "jacobi": 0.8070519999999993,
+        "subtract_grad": 0.013375000000000001,
+        "advect": 0.0186255
       },
-      "jacobiTotalMs": 0.8149179999999996,
-      "totalMedianMs": 11.0669355,
-      "sumOfStagesMs": 2.547238499999998,
-      "interPassOverheadMs": 8.519697,
+      "jacobiTotalMs": 0.8070519999999993,
+      "totalMedianMs": 10.4579655,
+      "sumOfStagesMs": 2.547151499999999,
+      "interPassOverheadMs": 7.910814000000001,
       "residualMaxDiv": 2.902918219566345,
-      "wallClockMedianMs": 3.099999964237213,
+      "wallClockMedianMs": 2.5,
       "verdict": "OVER",
-      "perLayerMs": 11.0669355
+      "perLayerMs": 10.4579655
     },
     {
       "grid": 256,
@@ -128,20 +128,20 @@
       "steadyFrames": 80,
       "perStageMedianMs": {
         "forces": 0.008542,
-        "set_bnd": 0.48343250000000004,
-        "divergence": 0.017542000000000002,
-        "jacobi": 0.17997799999999997,
-        "subtract_grad": 0.020959,
-        "advect": 0.0326455
+        "set_bnd": 0.48377950000000003,
+        "divergence": 0.0175,
+        "jacobi": 0.17980849999999998,
+        "subtract_grad": 0.020958499999999998,
+        "advect": 0.032667
       },
-      "jacobiTotalMs": 0.17997799999999997,
-      "totalMedianMs": 1.7686185,
-      "sumOfStagesMs": 0.7433624999999999,
-      "interPassOverheadMs": 1.0252560000000002,
+      "jacobiTotalMs": 0.17980849999999998,
+      "totalMedianMs": 1.8009315,
+      "sumOfStagesMs": 0.7429705,
+      "interPassOverheadMs": 1.057961,
       "residualMaxDiv": 34.42306995391846,
-      "wallClockMedianMs": 1,
+      "wallClockMedianMs": 1.199999988079071,
       "verdict": "PASS",
-      "perLayerMs": 1.7686185
+      "perLayerMs": 1.8009315
     },
     {
       "grid": 256,
@@ -149,21 +149,21 @@
       "passesPerFrame": 150,
       "steadyFrames": 80,
       "perStageMedianMs": {
-        "forces": 0.008541,
-        "set_bnd": 0.7949225000000001,
-        "divergence": 0.0175825,
-        "jacobi": 0.35995600000000005,
-        "subtract_grad": 0.020583,
-        "advect": 0.03254
+        "forces": 0.00875,
+        "set_bnd": 0.8447800000000001,
+        "divergence": 0.019812999999999997,
+        "jacobi": 0.380078,
+        "subtract_grad": 0.021374999999999998,
+        "advect": 0.03425
       },
-      "jacobiTotalMs": 0.35995600000000005,
-      "totalMedianMs": 2.9420175,
-      "sumOfStagesMs": 1.2340455000000004,
-      "interPassOverheadMs": 1.7079719999999996,
+      "jacobiTotalMs": 0.380078,
+      "totalMedianMs": 3.9218775,
+      "sumOfStagesMs": 1.30844,
+      "interPassOverheadMs": 2.6134375,
       "residualMaxDiv": 18.172060012817383,
-      "wallClockMedianMs": 1.5,
-      "verdict": "PASS",
-      "perLayerMs": 2.9420175
+      "wallClockMedianMs": 1.7999999523162842,
+      "verdict": "MARGINAL",
+      "perLayerMs": 3.9218775
     },
     {
       "grid": 256,
@@ -171,21 +171,21 @@
       "passesPerFrame": 270,
       "steadyFrames": 80,
       "perStageMedianMs": {
-        "forces": 0.009,
-        "set_bnd": 1.4990640000000002,
-        "divergence": 0.019478000000000002,
-        "jacobi": 0.756343,
-        "subtract_grad": 0.0250835,
-        "advect": 0.035375000000000004
+        "forces": 0.008833500000000001,
+        "set_bnd": 1.4975674999999995,
+        "divergence": 0.019041000000000002,
+        "jacobi": 0.7482409999999999,
+        "subtract_grad": 0.025125,
+        "advect": 0.035415
       },
-      "jacobiTotalMs": 0.756343,
-      "totalMedianMs": 6.6416485000000005,
-      "sumOfStagesMs": 2.3452115,
-      "interPassOverheadMs": 4.296437000000001,
+      "jacobiTotalMs": 0.7482409999999999,
+      "totalMedianMs": 6.483005,
+      "sumOfStagesMs": 2.3490709999999995,
+      "interPassOverheadMs": 4.133934000000001,
       "residualMaxDiv": 10.05927848815918,
-      "wallClockMedianMs": 2.600000023841858,
+      "wallClockMedianMs": 2.5,
       "verdict": "OVER",
-      "perLayerMs": 6.6416485000000005
+      "perLayerMs": 6.483005
     },
     {
       "grid": 256,
@@ -193,21 +193,21 @@
       "passesPerFrame": 510,
       "steadyFrames": 80,
       "perStageMedianMs": {
-        "forces": 0.008667,
-        "set_bnd": 2.6900429999999975,
-        "divergence": 0.018125000000000002,
-        "jacobi": 1.4533504999999995,
-        "subtract_grad": 0.022749,
-        "advect": 0.0331665
+        "forces": 0.008917,
+        "set_bnd": 2.8504749999999985,
+        "divergence": 0.0192705,
+        "jacobi": 1.5292934999999996,
+        "subtract_grad": 0.026728500000000002,
+        "advect": 0.0356465
       },
-      "jacobiTotalMs": 1.4533504999999995,
-      "totalMedianMs": 9.925495,
-      "sumOfStagesMs": 4.2270025,
-      "interPassOverheadMs": 5.6984924999999995,
+      "jacobiTotalMs": 1.5292934999999996,
+      "totalMedianMs": 13.0533215,
+      "sumOfStagesMs": 4.476297000000001,
+      "interPassOverheadMs": 8.577024499999998,
       "residualMaxDiv": 5.652297258377075,
-      "wallClockMedianMs": 4.900000035762787,
+      "wallClockMedianMs": 4.800000011920929,
       "verdict": "OVER",
-      "perLayerMs": 9.925495
+      "perLayerMs": 13.0533215
     }
   ]
 }
