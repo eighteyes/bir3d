@@ -4,7 +4,7 @@ Detail for each task (files, TDD steps, complete code) lives in [plan.md](file:/
 
 ## Plan 1 — Engine Foundation (current)
 
-- [ ] Task 0 — Repo scaffold + tooling green (vite/vitest/playwright + cargo workspace; `npm run test` and `cargo test` pass)
+- [x] Task 0 — Repo scaffold + tooling green (vite/vitest/playwright + cargo workspace; `npm run test` and `cargo test` pass) — commits a10dd44 + crate-type fix
 - [ ] Task 1 — WebGPU device acquisition + timestamp-query detection
 - [ ] Task 2 — Ping-pong double-buffer convention
 - [ ] Task 3 — Add-one compute kernel + dispatch helper (pipeline proven end-to-end)
