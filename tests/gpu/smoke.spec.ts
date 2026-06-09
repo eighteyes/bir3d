@@ -39,6 +39,17 @@ test("profiler reports a plausible positive ms for a compute pass (when supporte
   expect(ms).toBeLessThan(100);
 });
 
+test("app boots, runs a frame loop, and shows a ms readout without errors", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await page.goto("/");
+  await page.waitForFunction(() => (window as any).__vsBooted === true, { timeout: 10000 });
+  await page.waitForTimeout(800); // let several frames + a sample run
+  const text = await page.locator("#overlay").innerText();
+  expect(text).toContain("gpu addone:");
+  expect(errors).toEqual([]);
+});
+
 test("add-one compute kernel maps [1,2,3] -> [2,3,4]", async ({ page }) => {
   await page.goto("/");
   const out = await page.evaluate(async () => {
