@@ -50,6 +50,37 @@ test("app boots, runs a frame loop, and shows a ms readout without errors", asyn
   expect(errors).toEqual([]);
 });
 
+test("ReadbackRing copies src to CPU across batched frames with no submit-while-mapped error", async ({ page }) => {
+  const errs: string[] = [];
+  page.on("pageerror", (e) => errs.push(e.message));
+  await page.goto("/");
+  const out = await page.evaluate(async () => {
+    const { acquireDevice } = await import("/src/host/gpu/device.ts");
+    const { ReadbackRing } = await import("/src/host/gpu/readback.ts");
+    const { device } = await acquireDevice();
+    const data = new Float32Array([10, 20, 30, 40]);
+    const src = device.createBuffer({
+      size: data.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(src, 0, data);
+    const ring = new ReadbackRing(device, data.byteLength, 3);
+    for (let i = 0; i < 10; i++) {
+      const enc = device.createCommandEncoder();
+      ring.enqueue(enc, src);           // record copy (pre-submit)
+      device.queue.submit([enc.finish()]); // submit — must NOT throw "used in submit while mapped"
+      ring.afterSubmit();               // kick map (post-submit)
+      await new Promise((r) => setTimeout(r, 8)); // let the async map resolve between frames
+      const got = ring.read();
+      if (got && Array.from(got).every((v, k) => v === data[k])) return Array.from(got);
+    }
+    const f = ring.read();
+    return f ? Array.from(f) : null;
+  });
+  expect(out).toEqual([10, 20, 30, 40]);
+  expect(errs).toEqual([]); // catches the submit-while-mapped pageerror if the bug regresses
+});
+
 test("add-one compute kernel maps [1,2,3] -> [2,3,4]", async ({ page }) => {
   await page.goto("/");
   const out = await page.evaluate(async () => {

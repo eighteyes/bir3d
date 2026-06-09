@@ -1,7 +1,12 @@
 // readback.ts — async GPU→CPU aggregate readback that NEVER blocks the frame.
-// Responsibilities: round-robin staging buffers (triple by default); kick mapAsync without
-// awaiting in-frame; hand the last RESOLVED result to the CPU (2–3 frames stale, by design).
-// RingIndex is split out so the index policy is unit-testable without a GPU.
+// Responsibilities: round-robin staging buffers (triple by default). The map MUST be kicked
+// AFTER the caller submits — a buffer that is map-pending at submit time is a validation error
+// that drops the whole command buffer. So the frame contract is two calls:
+//   1. enqueue(encoder, src)  — record the copy into the caller's encoder, reserve the slot
+//   2. <caller submits>
+//   3. afterSubmit()          — kick the non-awaited map for the slot copied this frame
+// read() hands back the last RESOLVED aggregate (2–3 frames stale, by design). One enqueue +
+// one afterSubmit per frame. RingIndex is split out so the index policy is unit-testable.
 
 export class RingIndex {
   private i = 0;
@@ -15,6 +20,7 @@ export class ReadbackRing {
   private readonly staging: GPUBuffer[];
   private readonly inflight: boolean[];
   private latest: Float32Array | null = null;
+  private pendingMap: number | null = null; // slot copied this frame, awaiting afterSubmit()
 
   /** `byteLength` must EXACTLY match the src buffer size; reconstruct the ring if the layout changes. */
   constructor(private device: GPUDevice, private byteLength: number, size = 3) {
@@ -25,27 +31,35 @@ export class ReadbackRing {
     this.inflight = Array.from({ length: size }, () => false);
   }
 
-  /** Encode the copy from `src` into this frame's slot, then kick a non-awaited map. */
+  /** Record the copy from `src` into this frame's slot. Does NOT map — call afterSubmit() post-submit. */
   enqueue(encoder: GPUCommandEncoder, src: GPUBuffer): void {
     const slot = this.ring.acquire();
     if (!this.inflight[slot]) {
       encoder.copyBufferToBuffer(src, 0, this.staging[slot]!, 0, this.byteLength);
       this.inflight[slot] = true;
-      // fire-and-forget: resolves a few frames later. Maps may resolve out of order under load;
-      // `latest` is intentionally last-writer-wins — fine for the stale-aggregate contract.
-      this.staging[slot]!.mapAsync(GPUMapMode.READ)
-        .then(() => {
-          this.latest = new Float32Array(this.staging[slot]!.getMappedRange().slice(0));
-          this.staging[slot]!.unmap();
-          this.inflight[slot] = false;
-        })
-        .catch((err: unknown) => {
-          // device lost / validation error — release the slot so the ring doesn't starve
-          this.inflight[slot] = false;
-          console.error(`ReadbackRing slot ${slot} map failed:`, err);
-        });
+      this.pendingMap = slot;
+    } else {
+      this.pendingMap = null; // slot still mapping from an earlier frame; skip this frame
     }
     this.ring.advance();
+  }
+
+  /** Call AFTER device.queue.submit(). Kicks the non-awaited map for the slot copied this frame. */
+  afterSubmit(): void {
+    const slot = this.pendingMap;
+    if (slot === null) return;
+    this.pendingMap = null;
+    this.staging[slot]!.mapAsync(GPUMapMode.READ)
+      .then(() => {
+        this.latest = new Float32Array(this.staging[slot]!.getMappedRange().slice(0));
+        this.staging[slot]!.unmap();
+        this.inflight[slot] = false;
+      })
+      .catch((err: unknown) => {
+        // device lost / validation error — release the slot so the ring doesn't starve
+        this.inflight[slot] = false;
+        console.error(`ReadbackRing slot ${slot} map failed:`, err);
+      });
   }
 
   /** Last resolved aggregate (or null until the first map resolves). Never blocks. */
