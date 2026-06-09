@@ -1,0 +1,12 @@
+<!doctype html>
+<html><head><meta charset="utf-8" /><title>Vector System — Fluid Debug Viz</title>
+<style>
+  body{margin:0;background:#05060a;color:#7fffd4;font:13px monospace}
+  #fluid{display:block;width:100vw;height:100vh}
+  #overlay{position:fixed;top:8px;left:8px;white-space:pre;text-shadow:0 0 4px #000;pointer-events:none}
+</style></head>
+<body>
+  <canvas id="fluid"></canvas>
+  <div id="overlay">booting…</div>
+  <script type="module" src="/src/host/fluid-main.ts"></script>
+</body></html>
