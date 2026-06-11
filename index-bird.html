@@ -1,0 +1,15 @@
+<!doctype html>
+<html><head><meta charset="utf-8" /><title>Vector System — Bird</title>
+<style>
+  body{margin:0;background:#05060a;color:#7fffd4;font:13px monospace;overflow:hidden}
+  #bird{display:block;width:100vw;height:100vh;cursor:crosshair}
+  #overlay{position:fixed;top:8px;left:8px;white-space:pre;text-shadow:0 0 4px #000;pointer-events:none}
+  #aim{position:fixed;height:2px;background:linear-gradient(90deg,#7fffd4,rgba(127,255,212,0));
+       transform-origin:0 50%;display:none;pointer-events:none;box-shadow:0 0 6px #7fffd4}
+</style></head>
+<body>
+  <canvas id="bird"></canvas>
+  <div id="aim"></div>
+  <div id="overlay">booting…</div>
+  <script type="module" src="/src/host/bird-main.ts"></script>
+</body></html>
