@@ -10,8 +10,8 @@
 const BASE_FREQ = 0.00285714; // ~1/350 per meter (mirrors WGSL)
 const LACUNARITY = 2.0;
 const GAIN = 0.5;
-const OCTAVES = 5;
-const RELIEF = 120.0;
+const OCTAVES = 3;
+const RELIEF = 220.0;
 
 export interface TerrainParams {
   n?: number;          // grid resolution (verts per side)
@@ -143,12 +143,15 @@ export class Terrain3D {
   sampleHeight(x: number, z: number): number {
     let freq = BASE_FREQ, amp = 1, sum = 0, norm = 0;
     for (let k = 0; k < OCTAVES; k++) {
-      sum += amp * this.valueNoise(x * freq, z * freq);
+      // ridged noise (mirror of WGSL fbm).
+      const n = this.valueNoise(x * freq, z * freq);
+      const r = 1 - Math.abs(2 * n - 1);
+      sum += amp * r;
       norm += amp;
       freq *= LACUNARITY;
       amp *= GAIN;
     }
-    return (sum / norm - 0.5) * RELIEF;
+    return (sum / norm) * RELIEF;
   }
 
   draw(

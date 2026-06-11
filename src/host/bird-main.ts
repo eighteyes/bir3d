@@ -53,15 +53,20 @@ async function boot() {
     n: 201,
     cellSize: 24,        // 201*24 ≈ 4.8km — many 350m ridges to a horizon
     fogColor: SKY,
-    fogDensity: 1 / 1800,
+    fogDensity: 1 / 900, // far ridges vanish before the grid edge (no hard seam)
   });
 
+  // Cruise the camera near crest height (~220m relief) looking nearly level so near crests
+  // silhouette the valleys behind them — the receding-ridgeline occlusion.
+  // Eye must sit INSIDE the relief band (crests reach ~220) so near crests rise above the
+  // sightline and occlude the terrain behind them — that is the layered-ridgeline effect.
   const cam = new ChaseCamera({
-    followDist: 120,
-    followHeight: 75,
-    lookAhead: 220,
+    followDist: 140,
+    followHeight: 28,    // eye ≈ cruise + 28 ≈ 168 — below the tallest crests
+    lookAhead: 420,      // long look-ahead → near-level pitch
     smooth: 0.12,
-    groundHeight: 55,
+    cruiseHeight: 140,   // inside the band; tallest crests rise ~50-80m above the eye
+    lookDrop: -15,       // look-target slightly ABOVE cruise → ~2-3° down (near level)
   });
 
   const resize = () => {

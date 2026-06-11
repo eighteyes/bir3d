@@ -14,8 +14,9 @@ export interface ChaseParams {
   followDist?: number;
   followHeight?: number;
   lookAhead?: number;
-  smooth?: number;       // 0..1 lerp factor per frame
-  groundHeight?: number; // min eye height above y=0 (kept above terrain relief)
+  smooth?: number;        // 0..1 lerp factor per frame
+  cruiseHeight?: number;  // target rides at this world y (≈ crest height) so the look stays level
+  lookDrop?: number;      // how far below cruise the look-target sits (sets the small downward pitch)
 }
 
 export class ChaseCamera {
@@ -28,7 +29,8 @@ export class ChaseCamera {
   followHeight: number;
   lookAhead: number;
   smooth: number;
-  groundHeight: number;
+  cruiseHeight: number;
+  lookDrop: number;
   speed = 55; // m/s forward auto-advance for the shot
 
   constructor(p: ChaseParams = {}) {
@@ -36,7 +38,9 @@ export class ChaseCamera {
     this.followHeight = p.followHeight ?? 70;
     this.lookAhead = p.lookAhead ?? 200;
     this.smooth = p.smooth ?? 0.12;
-    this.groundHeight = p.groundHeight ?? 45;
+    this.cruiseHeight = p.cruiseHeight ?? 200;
+    this.lookDrop = p.lookDrop ?? 60;
+    this.target = [0, this.cruiseHeight, 0];
   }
 
   // Walk the target forward over the terrain (this-task auto motion).
@@ -58,12 +62,11 @@ export class ChaseCamera {
     ];
     const goalLook: Vec3 = [
       this.target[0] + this.forward[0] * this.lookAhead,
-      this.target[1],
+      this.target[1] - this.lookDrop, // small downward pitch toward the ridge field
       this.target[2] + this.forward[2] * this.lookAhead,
     ];
     this.eye = lerp(this.eye, goalEye, this.smooth);
     this.lookTarget = lerp(this.lookTarget, goalLook, this.smooth);
-    if (this.eye[1] < this.groundHeight) this.eye[1] = this.groundHeight;
     void up;
   }
 

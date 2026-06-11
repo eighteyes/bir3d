@@ -28,8 +28,8 @@ struct VSOut {
 const BASE_FREQ : f32 = 0.00285714;  // ~1/350 per meter
 const LACUNARITY : f32 = 2.0;
 const GAIN : f32 = 0.5;
-const OCTAVES : i32 = 5;
-const RELIEF : f32 = 120.0;          // total relief target (meters)
+const OCTAVES : i32 = 3;             // large clean ridges (high octaves fragment the silhouette)
+const RELIEF : f32 = 220.0;          // total relief target (meters) — ridged crests
 
 fn hash2(p : vec2<f32>) -> f32 {
   return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
@@ -53,13 +53,16 @@ fn fbm(p : vec2<f32>) -> f32 {
   var sum = 0.0;
   var norm = 0.0;
   for (var k = 0; k < OCTAVES; k = k + 1) {
-    sum = sum + amp * valueNoise(p * freq);
+    // ridged noise: sharp crests + V-valleys (receding-ridgeline signature).
+    let n = valueNoise(p * freq);
+    let r = 1.0 - abs(2.0 * n - 1.0);
+    sum = sum + amp * r;
     norm = norm + amp;
     freq = freq * LACUNARITY;
     amp = amp * GAIN;
   }
-  // normalize to ~[0,1] then scale to relief, recenter so mean ~0.
-  return (sum / norm - 0.5) * RELIEF;
+  // ridged noise sits in [0,1]; scale to relief (crests up from y=0).
+  return (sum / norm) * RELIEF;
 }
 
 fn heightAt(xz : vec2<f32>) -> f32 {
@@ -101,8 +104,8 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
   // ridge-crest glow: steep slopes light up.
   let crest = smoothstep(0.18, 0.55, in.slope);
 
-  // height-tinted neon: low ground teal, high ground magenta.
-  let tint = mix(NEON_A, NEON_B, clamp(in.height / 80.0 + 0.5, 0.0, 1.0));
+  // height-tinted neon: low ground teal, high crests magenta.
+  let tint = mix(NEON_A, NEON_B, clamp(in.height / 220.0, 0.0, 1.0));
   let glow = tint * (contour * 1.0 + crest * 0.6);
 
   var color = SURFACE + glow;
