@@ -64,21 +64,23 @@ async function boot() {
 
   const birdShader = await fetch("/src/host/shaders/bird3d.wgsl").then((r) => r.text());
   const startH = terrain.sampleHeight(0, 0);
-  const bird = new Bird3D(device, birdShader, format, terrain, [0, startH + 90, 0]);
+  // start moderately low so near crests can cross in front of the bird (occlusion reads).
+  const bird = new Bird3D(device, birdShader, format, terrain, [0, startH + 55, 0]);
 
   // Chase cam follows the bird: behind + slightly above, looking ahead/slightly down.
   const cam = new ChaseCamera({
     followDist: 80,
-    followHeight: 26,
+    followHeight: 9,  // low eye → flat sightline so foreground crests cross above the bird (occlusion)
     lookAhead: 140,
     smooth: 0.14,
-    cruiseHeight: 0, // unused: target set explicitly to bird.pos each frame
-    lookDrop: 18,    // slight downward pitch so the ridge field fills the lower frame
+    cruiseHeight: 0,  // unused: target set explicitly to bird.pos each frame
+    lookDrop: 6,      // near-level pitch
   });
 
   // --- input: mouse-steer + flap ---
   const input: BirdInput = { yawRate: 0, pitchRate: 0, flap: false };
-  let mouseX = pxW / 2, mouseY = pxH / 2;
+  // normalized cursor offset from screen-center (-1..1); start centered (no steer before first move).
+  let mouseX = 0, mouseY = 0;
   let flapHeld = false;
   let flapTap = false;
 

@@ -275,11 +275,12 @@ export class Bird3D {
 // Local frame: +X right, +Y up, +Z forward (heading). Wings sweep back (-Z) toward the tips.
 function buildVMesh(): number[] {
   const verts: number[] = [];
-  const SPAN = 11;     // half-wingspan (m) → ~22m tip-to-tip, reads at followDist 140
-  const SWEEP = 6;     // how far back the tip sits (-Z)
-  const RIBBON = 1.6;  // ribbon half-width (m)
-  const BODY_LEN = 7;  // body spine length (m)
-  const BODY_W = 1.1;
+  const SPAN = 12;     // half-wingspan (m) → ~24m tip-to-tip, reads at followDist 80
+  const SWEEP = 5;     // how far back the tip sits (-Z)
+  const DIHEDRAL = 5;  // tip rise (m) at full span → static V even mid-flap
+  const RIBBON = 1.8;  // ribbon half-width (m)
+  const BODY_LEN = 8;  // body spine length (m)
+  const BODY_W = 1.2;
 
   // push a quad (two tris) as a ribbon between two centerline points pA,pB.
   // attr = (signed spanFrac, wingFlag, edgeFrac); edgeFrac 0/1 marks ribbon edges.
@@ -310,10 +311,10 @@ function buildVMesh(): number[] {
       const f = i / SEGS;
       const x = side * SPAN * f;
       const z = -SWEEP * f;           // sweep back toward tip
-      const y = 0;                    // flat in local space; shader flaps it
+      const y = DIHEDRAL * f;         // base dihedral rise → static V even mid-flap
       const cur: Vec3 = [x, y, z];
       const span = side * f;          // signed spanFrac -1..1
-      // ribbon runs along the wing axis; width axis ~ forward (Z) so it has area to glow.
+      // ribbon width axis = forward (Z): gives the swept wing a flat chord facing the camera.
       quad(prev, cur, RIBBON, [0, 0, 1], prevSpan, span, 1);
       prev = cur; prevSpan = span;
     }
