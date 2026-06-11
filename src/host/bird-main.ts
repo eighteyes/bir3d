@@ -69,12 +69,12 @@ async function boot() {
 
   // Chase cam follows the bird: behind + slightly above, looking ahead/slightly down.
   const cam = new ChaseCamera({
-    followDist: 80,
-    followHeight: 9,  // low eye → flat sightline so foreground crests cross above the bird (occlusion)
+    followDist: 110, // crest more often sits between camera and bird (occlusion); <140 keeps eye clear
+    followHeight: 9, // low eye → flat sightline so foreground crests cross above the bird (occlusion)
     lookAhead: 140,
     smooth: 0.14,
-    cruiseHeight: 0,  // unused: target set explicitly to bird.pos each frame
-    lookDrop: 6,      // near-level pitch
+    cruiseHeight: 0, // unused: target set explicitly to bird.pos each frame
+    lookDrop: 6,     // near-level pitch
   });
 
   // --- input: mouse-steer + flap ---
