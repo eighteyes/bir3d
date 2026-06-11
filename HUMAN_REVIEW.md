@@ -1,5 +1,38 @@
 # Human Review Steps
 
+## Bird sandbox flow (vertical slice) — final SHOW gate
+**Date:** 2026-06-10
+**Commit:** cba5feb
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done
+- Final SHOW-gate pass on the rough-but-playable Bird vertical slice: one bird gliding over the existing GPU fluid wind, top-down, toroidal world, deadzone-follow camera, neon chevron + ribbon trail, 4 swappable control schemes, live tuning overlay. Design: `.ai/explore/2026-06-10-bird-sandbox-flow.md`.
+- Booted `/index-bird.html` headless (WebGPU, Metal flags) and captured a fresh screenshot `.ai/tmp/bird-final.png`: canvas non-blank, bird present, zero page errors, all 4 schemes switch via keys 1-4, all 8 tuning sliders present.
+- No source changes this pass — verification + docs only. The deliverable bird files (committed earlier) are `src/host/shaders/bird/bird_update.wgsl`, `src/host/shaders/bird/scene.wgsl`, `src/host/gpu/bird.ts`, `src/host/bird-main.ts`, `index-bird.html`.
+
+### How to run it
+```
+cd /Users/god/projects/ai-jank/vector-system
+npm run dev
+```
+Then open http://localhost:5173/index-bird.html (vite may pick 5174 if 5173 is busy).
+- Keys `1`-`4` swap control schemes live (label shown top-left):
+  - `1` flick to impulse — drag-release on the canvas flings the bird in the drag direction.
+  - `2` hold toward cursor — hold the mouse and move it; the bird thrusts toward the cursor.
+  - `3` tap to bank — `ArrowLeft`/`ArrowRight` rotate the glide a notch; momentum carries.
+  - `4` flap forward — tap `Space` or click for an impulse along the bird's heading.
+- The tuning panel (top-right) sliders tune feel live: windCoupling, drag, flick str, thrust str, flap str, bank rate, cam deadzone, cam follow.
+
+### Verify: automated SHOW-gate driver (boot, non-blank, switcher, sliders, clean)
+```
+node .ai/tmp/bird-final.mjs
+```
+Expected: `RESULT` JSON with `switcherWorks:true`, `switchSeq:[2,3,4,1]`, `allSliders:true`, `nonBlank:true` (litFraction ~0.57, maxLum ~198), `pageErrors:[]`, `bootsClean:true`; exit 0. PNG written to `.ai/tmp/bird-final.png` (neon chevron + ribbon trail over the dim teal wind backdrop, scheme label top-left, 8-slider tuning panel top-right).
+
+### Watch for
+- The driver lives under `.ai/tmp` (gitignored) — it is a verification artifact, not a source deliverable. Re-run it after any change to `bird-main.ts`/`bird.ts` to confirm the switcher and sliders still wire up.
+- Known feel caveats (acceptable for a feel proto, not bugs): the fluid's `set_bnd` gives reflective walls, so the wind field is not truly periodic — there is a velocity discontinuity at the world seam even though the bird and camera wrap cleanly. Scheme-2 thrust direction reads `lastPos` (async readback), 1-2 frames stale, so it lags slightly at high cursor speed. Default thrust=90 makes scheme 2 hot; dial it with the thrust slider.
+
 ## Bird — control taste-test (schemes 2-4, switcher, tuning overlay)
 **Date:** 2026-06-10
 **Commit:** cba5feb
