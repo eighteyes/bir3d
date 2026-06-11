@@ -1,5 +1,52 @@
 # Human Review Steps
 
+## Bird — control taste-test (schemes 2-4, switcher, tuning overlay)
+**Date:** 2026-06-10
+**Commit:** cba5feb
+**Session:** bird-tastetest-tuning
+
+- Added control schemes 2-4 + live 1-4 switcher to the flyable bird; all map raw input → the `(impulse,turn)` intent for the scheme-agnostic GPU bird pass.
+- Scheme 2 hold-toward-cursor (held mouse → `thrust*dt` toward cursor each frame); 3 tap-to-bank (Arrow keys → one-shot turn ±bankRate); 4 flap-forward (Space/click → one-shot impulse along heading). Scheme 1 flick path unchanged.
+- Tuning overlay: live HTML range sliders (windCoupling, drag, flick/thrust/flap strength, bank rate, camera deadzone, follow stiffness) feed bird tuning + camera each frame.
+- This is a rough feel prototype: verified by booting + screenshotting, not by exhaustive tests.
+
+### Pre-conditions
+```
+cd /Users/god/projects/ai-jank/vector-system
+```
+```
+npm run dev
+```
+
+### Verify: page boots and types clean
+```
+npm run typecheck
+```
+Expected: no output (tsc --noEmit passes).
+
+### Verify: open the bird page and fly it manually
+Open http://localhost:5173/index-bird.html — a neon chevron bird glides over a dim teal wind backdrop; the tuning panel sits top-right, the scheme label top-left.
+
+### Verify: switch schemes and exercise each
+- Press `1`, drag-release on the canvas → the bird flings in the drag direction.
+- Press `2`, hold the mouse and move it → the bird thrusts toward the cursor; release → momentum + wind only.
+- Press `3`, tap ArrowLeft / ArrowRight → the glide banks (vel rotates) and momentum carries.
+- Press `4`, tap Space or click → the bird flaps forward along its heading.
+Confirm the top-left label updates each press.
+
+### Verify: tuning sliders move live
+Drag the `drag` slider down → the bird coasts longer; drag `windCoupling` up → the wind pushes harder. Each slider's value readout updates as you drag.
+
+### Verify: automated driver (boots clean, switcher, schemes 2/3, tuning, screenshot)
+```
+node .ai/tmp/bird-tastetest.mjs
+```
+Expected: `RESULT` JSON with `switcherWorks:true`, `scheme2.pass:true`, `scheme3.pass:true`, `tuning.pass:true`, `nonBlank:true`, `pageErrors:[]`; exit 0. PNG at `.ai/tmp/bird-tastetest.png`.
+
+### Watch for
+- The CPU camera reads `lastPos`, which is 1-2 frames stale (async readback) — scheme-2 thrust direction lags slightly at high cursor speed. Fine for a proto.
+- Mouse dispatch branches on the active scheme in one set of listeners; if you add a 5th scheme, extend those branches (don't stack parallel listeners).
+
 ## Plan 3 — GPU fluid spike (final gate, §8.1)
 **Date:** 2026-06-09
 **Commit:** 4354316
