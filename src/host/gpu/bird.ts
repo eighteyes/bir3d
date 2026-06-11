@@ -9,7 +9,9 @@
 //     the trail write index, and record the async bird-pos readback (guarded).
 //   - render(encoder, view): update the camera (deadzone ease toward last-known bird pos), upload the
 //     camera uniform, and record backdrop → trail → chevron render passes into the caller's encoder.
-//   - Expose lastPos/lastVel (CPU mirror) for the overlay + screenshot verification.
+//   - Map raw input → (impulse,turn) intent per control scheme (flick/thrust/bank/flap). The GPU sim
+//     is scheme-agnostic; only these CPU mappers differ. Live-tunable via setTuning/setCamera.
+//   - Expose lastPos/lastVel/getCameraPos/getTuning (CPU mirror) for input, overlay, and verification.
 
 import { makeComputePipeline, encodeComputePass } from "./dispatch";
 import type { GpuFluid } from "./fluid";
@@ -17,7 +19,10 @@ import type { GpuFluid } from "./fluid";
 export interface BirdTuning {
   windCoupling: number;
   drag: number;
-  flickStrength: number; // max impulse magnitude (world units/frame) for scheme 1
+  flickStrength: number; // max impulse magnitude (world units/frame) for scheme 1 flick
+  thrust: number; // scheme 2: continuous thrust magnitude toward cursor (per fixed step)
+  flapStrength: number; // scheme 4: impulse magnitude along heading per tap
+  bankRate: number; // scheme 3: turn (radians) applied to vel per arrow tap
 }
 
 export interface Intent {
@@ -42,11 +47,11 @@ export class Bird {
   readonly w: number;
   readonly h: number;
 
-  // World/camera.
+  // World/camera. deadzone + followStiffness are live-tunable (the tuning overlay sets them).
   private cameraPos: [number, number];
   private readonly viewSize: [number, number];
-  private readonly deadzone: number; // world-unit radius around center before camera eases
-  private readonly followStiffness: number; // 0..1 ease per frame
+  private deadzone: number; // world-unit radius around center before camera eases
+  private followStiffness: number; // 0..1 ease per frame
 
   // GPU resources.
   private birdBuf: GPUBuffer;
@@ -161,7 +166,22 @@ export class Bird {
     this.tuning = { ...this.tuning, ...t };
   }
 
-  /** Map a scheme-1 flick (drag vector in world units) → a length-capped one-shot impulse. */
+  getTuning(): BirdTuning {
+    return { ...this.tuning };
+  }
+
+  /** Live-tunable camera params (the tuning overlay sets these). */
+  setCamera(c: { deadzone?: number; followStiffness?: number }): void {
+    if (c.deadzone !== undefined) this.deadzone = c.deadzone;
+    if (c.followStiffness !== undefined) this.followStiffness = c.followStiffness;
+  }
+
+  /** Current camera center (world). Schemes need this to map screen-cursor → world. */
+  getCameraPos(): [number, number] {
+    return [this.cameraPos[0], this.cameraPos[1]];
+  }
+
+  /** Scheme 1 — flick: drag vector (world units) → a length-capped one-shot impulse. */
   flickToIntent(dragWorld: [number, number]): Intent {
     const len = Math.hypot(dragWorld[0], dragWorld[1]);
     const cap = this.tuning.flickStrength;
@@ -171,6 +191,32 @@ export class Bird {
       imp = [dragWorld[0] * scale, dragWorld[1] * scale];
     }
     return { impulse: imp, turn: 0 };
+  }
+
+  /**
+   * Scheme 2 — hold toward cursor: while held, a gentle continuous impulse toward the cursor.
+   * impulse = normalize(cursorWorld - birdWorld) * thrust * dt. Fresh each frame (the shader's
+   * vel += impulse does the accumulation; do NOT pre-accumulate or it grows unbounded).
+   */
+  thrustToIntent(cursorWorld: [number, number], dt: number): Intent {
+    const dx = cursorWorld[0] - this.lastPos[0];
+    const dy = cursorWorld[1] - this.lastPos[1];
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-4) return { impulse: [0, 0], turn: 0 };
+    const m = (this.tuning.thrust * dt) / len;
+    return { impulse: [dx * m, dy * m], turn: 0 };
+  }
+
+  /** Scheme 3 — tap to bank: a one-shot turn (radians) applied to vel; sign from the tapped arrow. */
+  bankToIntent(sign: number): Intent {
+    return { impulse: [0, 0], turn: sign * this.tuning.bankRate };
+  }
+
+  /** Scheme 4 — flap forward: a one-shot impulse along the current heading (normalize(vel)). */
+  flapToIntent(): Intent {
+    const len = Math.hypot(this.lastVel[0], this.lastVel[1]);
+    const dir: [number, number] = len > 1e-4 ? [this.lastVel[0] / len, this.lastVel[1] / len] : [1, 0];
+    return { impulse: [dir[0] * this.tuning.flapStrength, dir[1] * this.tuning.flapStrength], turn: 0 };
   }
 
   /** Record the bird compute pass into the caller's encoder. MUST run after fluid.step (u,v swap). */

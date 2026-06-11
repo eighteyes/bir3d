@@ -6,10 +6,21 @@
   #overlay{position:fixed;top:8px;left:8px;white-space:pre;text-shadow:0 0 4px #000;pointer-events:none}
   #aim{position:fixed;height:2px;background:linear-gradient(90deg,#7fffd4,rgba(127,255,212,0));
        transform-origin:0 50%;display:none;pointer-events:none;box-shadow:0 0 6px #7fffd4}
+  #tuning{position:fixed;top:8px;right:8px;width:230px;padding:8px 10px;background:rgba(5,7,12,.78);
+          border:1px solid rgba(127,255,212,.25);border-radius:6px;pointer-events:auto;
+          text-shadow:0 0 4px #000}
+  #tuning h2{margin:0 0 6px;font:bold 12px monospace;color:#9affe0}
+  #tuning label{display:flex;align-items:center;justify-content:space-between;gap:6px;margin:3px 0;
+                font:11px monospace}
+  #tuning label span:first-child{flex:0 0 96px}
+  #tuning input[type=range]{flex:1 1 auto;min-width:0;accent-color:#7fffd4}
+  #tuning .val{flex:0 0 40px;text-align:right;color:#cfe}
+  #schemes{margin-top:6px;font:11px monospace;color:#8fd}
 </style></head>
 <body>
   <canvas id="bird"></canvas>
   <div id="aim"></div>
   <div id="overlay">booting…</div>
+  <div id="tuning"><h2>tuning</h2></div>
   <script type="module" src="/src/host/bird-main.ts"></script>
 </body></html>
