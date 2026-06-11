@@ -1,14 +1,17 @@
-// bird-main.ts — 3D terrain + chase-cam look validation (NO bird). Entry for /index-bird.html.
+// bird-main.ts — 3D flapping-V bird over the neon ridgeline terrain. Entry for /index-bird.html.
 // Responsibilities:
-//   - Acquire device; configure the canvas context + an explicit-sized color/depth target.
-//   - Build Terrain3D (neon ridgeline heightfield) and a ChaseCamera that auto-advances forward.
-//   - Per frame (one encoder, one submit): advance + update camera; viewProj = proj*view;
-//     terrain.draw(...) into the canvas with the depth attachment and a dark hazy-sky clear.
-//   - Recreate the depth texture on canvas resize (must match the color attachment size).
-//   - Overlay: cam pos + fps. Expose window.__birdBooted for the screenshot driver.
+//   - Acquire device; configure canvas color + matching depth target (recreate on resize).
+//   - Build Terrain3D (neon ridgeline) and Bird3D (CPU-integrated flapping-V); ChaseCamera follows
+//     the BIRD: target=bird.pos, forward=bird.forwardVec(), camOffset=(bird.x,bird.z) so the terrain
+//     grid recenters under the bird.
+//   - ONE control: mouse-steer (cursor offset from screen-center → yaw+pitch rate); click/Space=flap.
+//   - Per frame (one encoder, one submit): read input → bird.integrate → camera follow → viewProj;
+//     terrain.draw (clears color+depth) → bird.draw (LOADS color+depth, second pass, depth-tested).
+//   - Overlay: altitude-over-terrain, speed, heading, wind, fps. Expose window.__birdBooted.
 
 import { acquireDevice } from "./gpu/device";
 import { Terrain3D } from "./gpu/terrain";
+import { Bird3D, type BirdInput } from "./gpu/bird3d";
 import { ChaseCamera } from "./gpu/camera";
 import { perspective, multiply } from "./gpu/mat4";
 import { FrameLoop } from "./frameloop";
@@ -17,9 +20,13 @@ const FOV_Y = (60 * Math.PI) / 180;
 const NEAR = 1;
 const FAR = 12000;
 
-// Dark hazy-horizon sky / fog color (near-black blue haze). Terrain fog mixes toward this so far
-// ridges fade into the horizon — keep the clear color == fog color so the horizon is seamless.
+// Dark hazy-horizon sky / fog color. Terrain fog mixes toward this; clear color == fog color.
 const SKY: [number, number, number] = [0.03, 0.04, 0.09];
+
+// Mouse-steer gains: cursor offset from screen-center (normalized -1..1) → rate.
+const YAW_GAIN = 1.1;   // rad/s at full deflection
+const PITCH_GAIN = 0.8; // rad/s at full deflection
+const DEADZONE = 0.06;
 
 async function boot() {
   const overlay = document.getElementById("overlay")!;
@@ -35,7 +42,6 @@ async function boot() {
   const format = navigator.gpu.getPreferredCanvasFormat();
   ctx.configure({ device, format, alphaMode: "opaque" });
 
-  // Explicit pixel size (don't trust CSS/dpr). Depth texture sized to match.
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   let pxW = Math.floor(canvas.clientWidth * dpr) || 900;
   let pxH = Math.floor(canvas.clientHeight * dpr) || 640;
@@ -48,26 +54,48 @@ async function boot() {
     usage: GPUTextureUsage.RENDER_ATTACHMENT,
   });
 
-  const shader = await fetch("/src/host/shaders/terrain3d.wgsl").then((r) => r.text());
-  const terrain = new Terrain3D(device, shader, format, {
+  const terrainShader = await fetch("/src/host/shaders/terrain3d.wgsl").then((r) => r.text());
+  const terrain = new Terrain3D(device, terrainShader, format, {
     n: 201,
-    cellSize: 24,        // 201*24 ≈ 4.8km — many 350m ridges to a horizon
+    cellSize: 24,
     fogColor: SKY,
-    fogDensity: 1 / 900, // far ridges vanish before the grid edge (no hard seam)
+    fogDensity: 1 / 900,
   });
 
-  // Cruise the camera near crest height (~220m relief) looking nearly level so near crests
-  // silhouette the valleys behind them — the receding-ridgeline occlusion.
-  // Eye must sit INSIDE the relief band (crests reach ~220) so near crests rise above the
-  // sightline and occlude the terrain behind them — that is the layered-ridgeline effect.
+  const birdShader = await fetch("/src/host/shaders/bird3d.wgsl").then((r) => r.text());
+  const startH = terrain.sampleHeight(0, 0);
+  const bird = new Bird3D(device, birdShader, format, terrain, [0, startH + 90, 0]);
+
+  // Chase cam follows the bird: behind + slightly above, looking ahead/slightly down.
   const cam = new ChaseCamera({
-    followDist: 140,
-    followHeight: 28,    // eye ≈ cruise + 28 ≈ 168 — below the tallest crests
-    lookAhead: 420,      // long look-ahead → near-level pitch
-    smooth: 0.12,
-    cruiseHeight: 140,   // inside the band; tallest crests rise ~50-80m above the eye
-    lookDrop: -15,       // look-target slightly ABOVE cruise → ~2-3° down (near level)
+    followDist: 80,
+    followHeight: 26,
+    lookAhead: 140,
+    smooth: 0.14,
+    cruiseHeight: 0, // unused: target set explicitly to bird.pos each frame
+    lookDrop: 18,    // slight downward pitch so the ridge field fills the lower frame
   });
+
+  // --- input: mouse-steer + flap ---
+  const input: BirdInput = { yawRate: 0, pitchRate: 0, flap: false };
+  let mouseX = pxW / 2, mouseY = pxH / 2;
+  let flapHeld = false;
+  let flapTap = false;
+
+  canvas.addEventListener("mousemove", (e) => {
+    const r = canvas.getBoundingClientRect();
+    mouseX = ((e.clientX - r.left) / r.width) * 2 - 1;  // -1..1
+    mouseY = ((e.clientY - r.top) / r.height) * 2 - 1;  // -1..1
+  });
+  canvas.addEventListener("mousedown", () => { flapTap = true; flapHeld = true; });
+  window.addEventListener("mouseup", () => { flapHeld = false; });
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "Space") { e.preventDefault(); flapTap = true; flapHeld = true; }
+  });
+  window.addEventListener("keyup", (e) => { if (e.code === "Space") flapHeld = false; });
+
+  const applyDead = (v: number) =>
+    Math.abs(v) < DEADZONE ? 0 : (v - Math.sign(v) * DEADZONE) / (1 - DEADZONE);
 
   const resize = () => {
     pxW = Math.floor(canvas.clientWidth * dpr) || pxW;
@@ -88,8 +116,20 @@ async function boot() {
   const loop = new FrameLoop((dt) => {
     fps = fps * 0.9 + (1 / Math.max(dt, 1e-3)) * 0.1;
 
-    cam.autoAdvance(dt);
+    // map input
+    input.yawRate = applyDead(mouseX) * YAW_GAIN;
+    input.pitchRate = -applyDead(mouseY) * PITCH_GAIN; // mouse-up = nose-up
+    input.flap = flapTap || flapHeld;
+    flapTap = false;
+
+    bird.integrate(dt, input);
+
+    // camera follows the bird
+    cam.target = [bird.pos[0], bird.pos[1], bird.pos[2]];
+    const fwd = bird.forwardVec();
+    cam.forward = [fwd[0], fwd[1], fwd[2]];
     cam.update();
+
     const proj = perspective(FOV_Y, pxW / pxH, NEAR, FAR);
     const view = cam.viewMatrix();
     const viewProj = multiply(proj, view);
@@ -99,18 +139,24 @@ async function boot() {
     const eye = cam.getEye();
 
     const enc = device.createCommandEncoder();
-    terrain.draw(enc, colorView, depthView, viewProj, cam.camOffset(), eye, {
+    // terrain pass: clears color+depth.
+    terrain.draw(enc, colorView, depthView, viewProj, [bird.pos[0], bird.pos[2]], eye, {
       r: SKY[0], g: SKY[1], b: SKY[2], a: 1,
     });
+    // bird pass: loads color+depth, depth-tested → ridges occlude the bird.
+    bird.draw(enc, colorView, depthView, viewProj);
     device.queue.submit([enc.finish()]);
 
     (window as any).__camPos = eye;
+    (window as any).__birdPos = bird.pos;
     frame++;
+    const headingDeg = ((bird.heading * 180) / Math.PI) % 360;
     overlay.textContent =
-      `vector-system — terrain3d (look validation)\n` +
-      `cam eye: ${eye[0].toFixed(0)}, ${eye[1].toFixed(0)}, ${eye[2].toFixed(0)}\n` +
-      `target z: ${cam.target[2].toFixed(0)} m   grid ${terrain.n}² @ ${terrain.cellSize}m (${(terrain.worldSpan / 1000).toFixed(1)}km)\n` +
-      `fps: ${fps.toFixed(0)}   frame ${frame}`;
+      `vector-system — bird3d (flapping-V chase)\n` +
+      `alt over terrain: ${bird.lastClearance.toFixed(0)} m   speed: ${bird.lastSpeed.toFixed(0)} m/s\n` +
+      `heading: ${headingDeg.toFixed(0)}°   pitch: ${((bird.pitch * 180) / Math.PI).toFixed(0)}°   bank: ${((bird.bank * 180) / Math.PI).toFixed(0)}°\n` +
+      `wind: ${bird.lastWind[0].toFixed(1)}, ${bird.lastWind[1].toFixed(1)} m/s\n` +
+      `fps: ${fps.toFixed(0)}   frame ${frame}   (mouse=steer, click/Space=flap)`;
   });
 
   loop.start();
