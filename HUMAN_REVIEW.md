@@ -293,8 +293,8 @@ Expected: `Finished dev profile` with zero warnings.
 ### What was done
 - Final look validation of the 3D Bird: WebGPU perspective scene (NDC z in [0,1], depth24plus, depthCompare less), flapping-V neon bird in a chase cam over a procedural ridged-fBm neon-ridgeline terrain, fog-as-depth hazing to the horizon.
 - Tuned for the look: lifted SKY/fog color to a dim indigo (0.06,0.05,0.12) so receding ridges dissolve into a visible haze band (no hard grid edge / black void); `fogDensity` 1/900 -> 1/700; bird `flapAmp` 0.85 -> 0.55 (reads as a flapping V, not a deep U); wing `DIHEDRAL` 5 -> 7 for a clearer static V mid-flap.
-- Confirmed: flapping-V silhouette, chase view, receding neon ridgelines hazing to a horizon, real 3D perspective depth, 60fps, zero page errors. Wingbeat motion verified via two shots ~half a beat apart (wings open/close).
-- Terrain depth-occlusion of the bird is structurally correct (shared depth buffer, GPU-vs-GPU depth test) — per-frame whether a near crest crosses the bird; not forced in the hero still to keep framing.
+- Confirmed all 5 named elements in the hero still (`.ai/tmp/bird3d-final.png`): flapping-V silhouette, chase view, receding neon ridgelines hazing to a horizon, real 3D perspective depth, AND terrain occluding the bird — a foreground crest cuts the bird's lower body (lower V hidden behind the near ridge, upper wings above the crest line). 60fps, zero page errors. Wingbeat motion separately verified via two shots ~half a beat apart (wings open/close).
+- Occlusion capture method: dead-center cursor (no steer, NO flap), settle to the ~20m clamp, then straight level glide so the bird crests a ridge and the far side drops; the post-crest clearance SPIKE frames (telemetry) are where the just-crossed crest sits between camera and bird → occlusion. Tap-flaps lift the bird out of the spike and break the occlusion, so the occlusion sweep must be flap-free. Driver: `.ai/tmp/sweep-occlude.mjs`.
 
 ### Pre-conditions
 ```
