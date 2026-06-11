@@ -87,7 +87,7 @@ export class Bird3D {
     this.windGain = t.windGain ?? 6;
     this.liftGain = t.liftGain ?? 0.5;
     this.flapHz = t.flapHz ?? 2.4;
-    this.flapAmp = t.flapAmp ?? 0.85;
+    this.flapAmp = t.flapAmp ?? 0.55; // shallower beat → reads as a flapping V, not a deep U
     this.minClearance = t.minClearance ?? 20;
 
     const meshArr = buildVMesh(); // number[]
@@ -277,7 +277,7 @@ function buildVMesh(): number[] {
   const verts: number[] = [];
   const SPAN = 12;     // half-wingspan (m) → ~24m tip-to-tip, reads at followDist 80
   const SWEEP = 5;     // how far back the tip sits (-Z)
-  const DIHEDRAL = 5;  // tip rise (m) at full span → static V even mid-flap
+  const DIHEDRAL = 7;  // tip rise (m) at full span → clear static V even mid-flap
   const RIBBON = 1.8;  // ribbon half-width (m)
   const BODY_LEN = 8;  // body spine length (m)
   const BODY_W = 1.2;

@@ -21,7 +21,9 @@ const NEAR = 1;
 const FAR = 12000;
 
 // Dark hazy-horizon sky / fog color. Terrain fog mixes toward this; clear color == fog color.
-const SKY: [number, number, number] = [0.03, 0.04, 0.09];
+// Dim indigo (not pure black) so receding ridges dissolve into a visible haze band at the horizon
+// and the grid's far edge is hidden. Kept low to respect the brightness cap (fills the screen).
+const SKY: [number, number, number] = [0.06, 0.05, 0.12];
 
 // Mouse-steer gains: cursor offset from screen-center (normalized -1..1) → rate.
 const YAW_GAIN = 1.1;   // rad/s at full deflection
@@ -59,7 +61,7 @@ async function boot() {
     n: 201,
     cellSize: 24,
     fogColor: SKY,
-    fogDensity: 1 / 900,
+    fogDensity: 1 / 700, // denser: far ridges haze into the horizon band sooner (hide grid edge)
   });
 
   const birdShader = await fetch("/src/host/shaders/bird3d.wgsl").then((r) => r.text());
