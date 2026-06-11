@@ -282,3 +282,45 @@ Expected: `Finished dev profile` with zero warnings.
 ### Watch for
 - Divergence tolerance margins are f32 frequency-floor dependent: project tests sit ~1.7× under the 1e-2 bound, the solver step test ~6.5× under. If the grid size or initial-condition fields ever change, re-sweep the Gaussian amp/sigma — NOT the iteration count (the Jacobi residual plateaus at a frequency floor, so more iters will not help).
 - Confirm `project.rs` still uses two buffers (`p` / `p_next`) with `std::mem::swap` — in-place Gauss-Seidel would break the 1:1 GPU port.
+
+
+
+## Bird 3D (chase cam + ridgeline terrain) — final SHOW gate
+**Date:** 2026-06-11
+**Commit:** 12d1e49
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done
+- Final look validation of the 3D Bird: WebGPU perspective scene (NDC z in [0,1], depth24plus, depthCompare less), flapping-V neon bird in a chase cam over a procedural ridged-fBm neon-ridgeline terrain, fog-as-depth hazing to the horizon.
+- Tuned for the look: lifted SKY/fog color to a dim indigo (0.06,0.05,0.12) so receding ridges dissolve into a visible haze band (no hard grid edge / black void); `fogDensity` 1/900 -> 1/700; bird `flapAmp` 0.85 -> 0.55 (reads as a flapping V, not a deep U); wing `DIHEDRAL` 5 -> 7 for a clearer static V mid-flap.
+- Confirmed: flapping-V silhouette, chase view, receding neon ridgelines hazing to a horizon, real 3D perspective depth, 60fps, zero page errors. Wingbeat motion verified via two shots ~half a beat apart (wings open/close).
+- Terrain depth-occlusion of the bird is structurally correct (shared depth buffer, GPU-vs-GPU depth test) — per-frame whether a near crest crosses the bird; not forced in the hero still to keep framing.
+
+### Pre-conditions
+```
+cd /Users/god/projects/ai-jank/vector-system
+```
+
+### Verify: typecheck clean
+```
+npx tsc --noEmit
+```
+Expected: exit 0, no output.
+
+### Verify: live in browser
+```
+npm run dev
+```
+Open http://localhost:5173/index-bird.html — mouse steers (cursor offset = yaw + pitch rate, bird banks into turns), click or Space flaps for lift, auto forward drift. Overlay shows altitude-over-terrain, speed, heading/pitch/bank, wind, fps.
+
+### Verify: the look reads
+Fly low and near-level so the camera looks ACROSS the ridge field (not down from high altitude). Confirm:
+- Flapping-V neon bird (teal-white core, magenta tips) reads as a V, drifting in frame.
+- Neon ridgelines (magenta near / teal-blue far) recede and fade into a dim indigo haze band at the horizon — the fog is the depth.
+- Real 3D perspective; 60fps; no `[WebGPU lost]` / `pageerror` / `console.error`.
+
+### Watch for
+- Pitch is rate-controlled (mouse-y), so it does not self-level — to recover from a dive you must actively pull the nose up; centering the cursor freezes pitch.
+- Holding flap continuously is a thrust runaway (impulse every frame) — it is a manual-input artifact, not a bug; tap to flap.
+- The TS `sampleHeight` (f64 `Math.sin`) and WGSL fBm (f32 `sin`) diverge by an estimated ~tens of meters near the origin (the `*43758.5453` fract amplifies the f32/f64 sin diff into a different hash; flagged terrain.ts:124). The render is 100% WGSL and occlusion is depth-correct regardless; consequence is only that the bird's ground-clamp / ridge-lift run against a slightly different height than is drawn. Fix if the bird ever looks conspicuously pasted over valleys: `Math.fround` the hash intermediates in TS to match f32.
+- Screenshot driver: `.ai/tmp/shoot-bird3d.mjs` (Playwright + Metal WebGPU flags, port 5173 then 5174); hero frame at `.ai/tmp/bird3d-final.png`.
