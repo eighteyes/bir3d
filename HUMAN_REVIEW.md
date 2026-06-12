@@ -1,5 +1,33 @@
 # Human Review Steps
 
+## Bird 3D v10 (near-dense wind + terrain-hugging pour)
+**Date:** 2026-06-12
+**Commit:** b1df7d3 (v10 wind code); this docs-only entry committed on top
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done (wind.ts / wind.wgsl ONLY)
+- **Density: DENSE near, SPARSE far.** Seed distance is biased to the near field — `ahead = base + (far−base)·rand^nearBias` with `nearBias` 2.6 (base floored at ~8% of `spanAhead` so the cloud peaks AT the bird ~120 m ahead, not under the camera). Inverts v9's uniform-world seed where perspective made the FAR field read densest. Far motes also thin via the speed/density cull + distance fog.
+- **HUG.** Nominal `clearance` 55→16 m, `minClear` 14→5 m — motes ride just over the surface and follow the contour up each ridge instead of floating in a flat sheet.
+- **POUR.** The pour reads stronger NOT by raising the vertical gain — `liftGain` was LOWERED 3.2→2.4 (rides `w = liftGain·(wind·uphill-grad)`; v9's higher value pinned every mote at the ceiling). It reads because: lower HUG clearance puts the arcs against the surface; `deflect` dropped 0.9→0.25 so most of the into-slope wind is KEPT, driving motes UP and OVER the crest rather than routing flat along the contour; and `maxClear` 100→170 m gives climbing motes headroom to stream up the windward face and SPILL over. Climbing motes are folded into `speedFrac` so they read BRIGHT + long-tailed while pouring; the backward-integrated curved tail then arcs down the lee = the visible spill.
+- FROZEN `windAt`/`thermalAt` untouched (bird imports them). Bird physics/camera/terrain untouched.
+
+### Verify: SHOW gate (the deliverable)
+```
+node .ai/tmp/myshot-v10.mjs
+```
+Expected: connects on 5174 (or 5173), zero page errors, `fps: 60`. Captures a 6-frame burst `.ai/tmp/v10-burst-*.png` (+ per-frame crops). The best soaring pair (autopilot in SOAR, dense near-band on a windward face) was then HAND-PICKED and `cp`'d to `.ai/tmp/v10-final-0.png`, `.ai/tmp/v10-final-1.png`, and `.ai/tmp/v10-final-crop.png` — not auto-selected by the script.
+
+### Verify: READ IT (eyes-on)
+Open http://localhost:5174/index-bird.html (or `.ai/tmp/v10-final-crop.png`):
+- [ ] Wind is a THICK cloud of streaks right around the bird, thinning into the distance (near-dense / far-sparse).
+- [ ] Motes HUG the terrain and POUR up the windward faces — bright near-vertical streaks climbing the slopes, the dense band spilling over a crest (best seen in a SOAR frame, vario positive).
+- [ ] Curved comet tails (not straight); additive neon cyan→white; ridges occlude motes (depth test).
+- [ ] Prior wins intact: small bird vs big EKG ridges, elevation color (cool low → warm/magenta high), terrain streams, glide + buffet.
+
+### Watch for
+- The capture runs against the working tree, which currently has an UNCOMMITTED out-of-scope AUTOPILOT effort (`autopilot.ts` + `bird-main.ts`/`bird3d.ts` mods, see v11/holdable-pitch entries above). So the framing in the captures is autopilot-driven, NOT committed mouse-steer. The WIND rendering is identical either way (driven by wind.ts/wind.wgsl + camera).
+- The pour reads strongest when the autopilot parks the dense near-band ON a windward face (SOAR mode). A frame over a valley can look flat — that's framing, not the wind code.
+
 ## Bird 3D v9 (wind↔terrain + curved tails + felt buffeting)
 **Date:** 2026-06-12
 **Commit:** 65fafdd (v9 code: wind a5eb19d/65fafdd, buffet 0d58e74); this docs-only entry committed on top
