@@ -1,5 +1,51 @@
 # Human Review Steps
 
+## Bird 3D v3 (EKG lines-only + ground-locked cam + glide)
+**Date:** 2026-06-11
+**Commit:** 4783a31
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done
+- Final SHOW gate for v3 (lines-only). Vision: the v3 section of `.ai/explore/2026-06-10-bird-sandbox-flow.md`.
+- Tuned the EKG terrain + camera so the line stack fills the lower frame: steepened the fixed camera downtilt `lookPitch` 16°→28° and tightened `rowSpacing` 65→36 m in `src/host/bird-main.ts`; raised far-row fog `fogDensity` 1/1400→1/1100 so the no-fill back-of-stack dissolves into haze before it tangles.
+- Exposed `window.__birdPitch` (bird-main) so the capture harness can wait for a HARD nose-up frame.
+- No fill anywhere — terrain is purely additive neon trace lines (`terrain_ekg.wgsl`, line-list); bird is a glide-only V (no flap input). Both depth-tested; ground-locked chase camera (world-up always, decoupled from bird pitch/roll) per `src/host/gpu/camera.ts`.
+- Capture script `.ai/tmp/myshot-bird3d.mjs` (gitignored verification artifact): mouse-steers, waits `__birdBooted`, holds nose-up to +40° and saves the hero to `.ai/tmp/v3b-final.png`, plus a streaming motion pair and a banked frame.
+
+### Pre-conditions
+```
+cd /Users/god/projects/ai-jank/vector-system
+```
+```
+npm run dev
+```
+
+### Verify: typecheck clean
+```
+node node_modules/typescript/bin/tsc --noEmit
+```
+Expected: no output, exit 0.
+
+### Verify: FLY IT — http://localhost:5173/index-bird.html (mouse steers, no flap, glide)
+- [ ] Terrain reads as stacked horizontal neon EKG/oscilloscope trace lines on a dark ground — NO fill, NO shaded surface; lines fill the lower frame, far rows fade into haze with a faint horizon strip at top.
+- [ ] The lines ARE the ridges: each line's bumps track the fBm terrain height (not flat scanlines).
+- [ ] The terrain MOVES: as you glide forward the lines stream toward the camera and recycle at the horizon (never static).
+- [ ] Bird is a clean bright gliding V (hot core, magenta tips, real wingspan), wings held OUT, no flap beat; it banks (rolls) into turns.
+- [ ] GROUND STAYS IN FRAME even when you pitch the nose up hard (mouse to top of screen → pitch ~+40°): the camera does NOT follow the bird's pitch.
+- [ ] You can sustain/gain altitude on lift: cross a windward ridge → `ridge lift` >0 and vario goes positive without diving (the soar). Level glide sinks gently.
+- [ ] 60 fps, no page errors.
+
+### Verify: headless hero capture (proves ground-lock at hard nose-up)
+```
+node .ai/tmp/myshot-bird3d.mjs
+```
+Expected: `connected: …5174/index-bird.html`, `hero pitch (deg): 40`, overlay dump with `fps: 60`, `=== errors ===` empty. Writes `.ai/tmp/v3b-final.png` (gliding V over EKG stack, pitch 40°, ground filling the lower frame), plus `v3b-motion-0/1.png` (streaming pair) and `v3b-bank.png`.
+
+### Watch for
+- KNOWN LIMITATION (ship-A decision): the EKG rows are world-X-locked (built from `camOffset` only, not camera heading). At heading ~0 they read as clean horizontal stacked lines; while BANKING/TURNING they skew diagonally (`v3b-bank.png`) — geometrically-correct perspective on a world-locked feature, not a regression. If the diagonal-on-turn look is undesirable, the fix is camera-relative rows (lay each row perpendicular to camForward) — deferred pending live feedback.
+- The mid-distance line tangle is inherent to the no-fill constraint (no hidden-line removal without a fill); the only lever is far-row fade, already applied. Do not add fill.
+- Ridge lift uses the analytic curl-noise wind (FLAGGED stand-in for the GPU fluid); lift bands exist where wind blows into uphill slopes.
+
 ## Bird3D — soaring glider physics (energy-exchange model + live tuning panel)
 **Date:** 2026-06-11
 **Commit:** working tree on top of d0ca3c3
