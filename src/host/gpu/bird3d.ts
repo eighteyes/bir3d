@@ -7,6 +7,10 @@
 //     plus explicit THERMAL updraft, plus CRANKED horizontal wind drift (shared analytic curl-noise
 //     field from wind.ts — the SAME field the streamline overlay draws; FLAGGED stand-in for the GPU
 //     fluid), altitude clamp above ground. Wind is cranked so cross-track drift is unmistakable.
+//     BUFFETING: a fast-varying turbulence term (fast time + spatial phase) rocks the render-bank
+//     (±~7°), bobs vel[1] (±~1.5 m/s, so vario oscillates) and shoves horizontal vel in pulses; plus a
+//     steady CRAB lean of the render-bank into the cross-wind. Felt, controllable — not violent.
+//     Exposes window.__birdBank (the drawn render-bank) for the buffet probe.
 //   - Expose public `tuning` (live-writable) so a host overlay can slide feel parameters at runtime.
 //   - Build a procedural V mesh (body + two swept dihedral wing ribbons) as triangle strips packed
 //     to a triangle list; each vertex carries (signed spanFrac, wingFlag, edgeFrac) for shader flap.
@@ -52,6 +56,7 @@ export class Bird3D {
   heading = 0;   // yaw, +Z forward at 0
   pitch = 0;     // radians, + = nose up
   bank = 0;      // roll, banks into turns
+  renderBank = 0; // bank actually drawn: steering bank + crab lean + buffet rock (visual only)
   private time = 0;
 
   tuning: Required<BirdTuning>;
@@ -226,6 +231,25 @@ export class Bird3D {
     this.vel[1] = dir[1] * this.speed + updraft - sink;
     this.vel[2] = dir[2] * this.speed + wz * T.windDrift;
 
+    // --- BUFFETING: fast-varying turbulence so MOVING AIR is FELT (not the steady mean wind drift).
+    // Three decorrelated fast oscillators sampled in (fast time + space) so the gust pattern shifts as
+    // the bird flies through it — phase-locked to position, not a pure clock. Tuned felt-but-controllable.
+    const bt = this.time * 2.0;                       // fast buffet clock (~rad/s base)
+    const ph = this.pos[0] * 0.05 + this.pos[2] * 0.05; // spatial phase → gust texture varies in space
+    const g1 = Math.sin(bt * 3.1 + ph);              // ~0.5 Hz-ish primary gust
+    const g2 = Math.sin(bt * 5.7 - ph * 1.7 + 1.3);  // faster chop
+    const g3 = Math.sin(bt * 1.9 + ph * 0.6 + 2.1);  // slow swell
+    const gustV = 0.6 * g1 + 0.4 * g2;               // vertical bob driver  (-1..1)
+    const gustL = 0.6 * g3 + 0.4 * g1;               // lateral shove driver (-1..1)
+    // (b) vertical BOB ±~1.5 m/s on vel[1] → lastVario oscillates (and the bird physically rises/falls).
+    this.vel[1] += gustV * 1.5;
+    // (c) lateral SHOVE in pulses: perpendicular to heading, ±~1.2 m/s, so the path twitches sideways.
+    const rightX = Math.cos(this.heading);  // heading-right unit (XZ): (cos h, -sin h)
+    const rightZ = -Math.sin(this.heading);
+    const shove = gustL * 1.2;
+    this.vel[0] += rightX * shove;
+    this.vel[2] += rightZ * shove;
+
     this.pos[0] += this.vel[0] * clamped;
     this.pos[1] += this.vel[1] * clamped;
     this.pos[2] += this.vel[2] * clamped;
@@ -240,6 +264,16 @@ export class Bird3D {
     // ground-track: the ACTUAL horizontal travel direction. Wind drift makes it diverge from
     // heading — this is the felt-wind proof (overlay compares heading vs ground-track).
     this.lastGroundTrack = Math.atan2(this.vel[0], this.vel[2]);
+
+    // --- render-bank: steady CRAB lean into the cross-wind + buffet ROCK (visual only, no physics) ---
+    // Steady DC lean: cross-wind component (wind projected onto heading-right) tips the V into the
+    // breeze, like a glider crabbing. Proportional, capped, so it's a visible steady offset (not a wobble).
+    const crossWind = wx * rightX + wz * rightZ;       // m/s of wind across the heading (signed)
+    const crab = Math.max(-0.18, Math.min(0.18, crossWind * 0.012)); // ~±10° cap, leans with the gust DC
+    // Buffet ROCK: fast roll oscillation ±~0.12 rad (~7°) so the V visibly rolls back and forth.
+    const rock = (0.6 * g1 - 0.4 * g3) * 0.12;
+    this.renderBank = this.bank + crab + rock;
+    if (typeof window !== "undefined") (window as any).__birdBank = this.renderBank;
   }
 
   draw(
@@ -253,7 +287,7 @@ export class Bird3D {
     u[16] = this.pos[0]; u[17] = this.pos[1]; u[18] = this.pos[2];
     u[19] = this.time * this.tuning.flexHz * Math.PI * 2; // flexPhase (subtle, not a flap beat)
     u[20] = this.heading;
-    u[21] = this.bank;
+    u[21] = this.renderBank; // steering bank + crab lean + buffet rock → the V visibly rolls/leans
     u[22] = this.tuning.flexHz;
     u[23] = this.tuning.flexAmp;
     this.device.queue.writeBuffer(this.ubuf, 0, this.uniformHost);
