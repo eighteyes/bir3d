@@ -174,10 +174,13 @@ export class Wind {
     this.clearance = p.clearance ?? 55;
     // small head: many tiny motes, not star-like blobs.
     this.dotPx = p.dotPx ?? 2.6;
-    // v8: LONGER base tail than v7 (11 → 16); per-mote tail scales DOWN from this in calm air.
-    this.tailMul = p.tailMul ?? 16;
-    // calmest-air tail = 25% of base (short stub); fast air = full base tail (long streak).
-    this.tailFloor = p.tailFloor ?? 0.25;
+    // v8: LONGER base tail than v7 (11 → 40); per-mote tail scales DOWN from this in calm air. 40 makes
+    // fast lanes read as clear streaks on screen (~52px) while mid/calm air stays dashes/stubs — the
+    // streak length cancels perspective (VS scales the offset by clip.w) so this is the true screen size.
+    this.tailMul = p.tailMul ?? 40;
+    // calmest-air tail = 20% of base (short stub); fast air = full base tail (long streak). Kept LOW so
+    // the speed contrast stays steep (a high floor would lengthen calm stubs and flatten the read).
+    this.tailFloor = p.tailFloor ?? 0.2;
     // even the calmest air keeps ~18% of motes visible → wind EVERYWHERE, just sparse where slow.
     this.densityFloor = p.densityFloor ?? 0.18;
     // calibrated to the field's real |windAt| distribution (sampled min ~0.03, max ~16.5, mean ~8.5):
