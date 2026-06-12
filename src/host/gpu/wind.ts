@@ -140,12 +140,17 @@ export class Wind {
     p: DotParams = {}
   ) {
     this.cfg = { ...DEFAULTS, ...cfg };
-    this.count = p.count ?? 900;
-    this.spanAhead = p.spanAhead ?? 1400;
+    this.count = p.count ?? 1300;
+    // spanAhead matches the terrain maxDist (~950) so every mote lives in the DRAWN terrain band —
+    // dots past the cutoff floated over a void and read as detached sky specks, not wind in the scene.
+    this.spanAhead = p.spanAhead ?? 950;
     this.spanBehind = p.spanBehind ?? 260;
-    this.spanWide = p.spanWide ?? 1400;
-    this.clearance = p.clearance ?? 45;
-    this.dotPx = p.dotPx ?? 7;
+    this.spanWide = p.spanWide ?? 950;
+    // clearance keeps motes above the near fill-curtain crests (which write depth and would otherwise
+    // occlude low dots) but LOW enough to hug the ridges — too high lifts them into the pure-sky band
+    // above the terrain silhouette where they conflict with the starfield. 55 is the readable middle.
+    this.clearance = p.clearance ?? 55;
+    this.dotPx = p.dotPx ?? 11;
 
     this.px = new Float32Array(this.count);
     this.pz = new Float32Array(this.count);

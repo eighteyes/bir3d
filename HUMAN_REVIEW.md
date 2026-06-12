@@ -459,3 +459,49 @@ Fly low and near-level so the camera looks ACROSS the ridge field (not down from
 - Holding flap continuously is a thrust runaway (impulse every frame) — it is a manual-input artifact, not a bug; tap to flap.
 - The TS `sampleHeight` (f64 `Math.sin`) and WGSL fBm (f32 `sin`) diverge by an estimated ~tens of meters near the origin (the `*43758.5453` fract amplifies the f32/f64 sin diff into a different hash; flagged terrain.ts:124). The render is 100% WGSL and occlusion is depth-correct regardless; consequence is only that the bird's ground-clamp / ridge-lift run against a slightly different height than is drawn. Fix if the bird ever looks conspicuously pasted over valleys: `Math.fround` the hash intermediates in TS to match f32.
 - Screenshot driver: `.ai/tmp/shoot-bird3d.mjs` (Playwright + Metal WebGPU flags, port 5173 then 5174); hero frame at `.ai/tmp/bird3d-final.png`.
+
+---
+
+## Bird 3D v5 (denser occluding terrain + elevation color + wind dots)
+**Date:** 2026-06-11
+**Commit:** d9325e7
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done
+- **Terrain 2× density:** EKG rows 64→128, cols 256→512, rowSpacing 36→18 m → ~2× visible rows inside the maxDist cutoff and finer ridge profiles. Still camera-relative + screen-horizontal at every heading (terrain.ts / terrain_ekg.wgsl).
+- **Black-fill hidden-line occlusion:** per-row OPAQUE curtain from each ridge line DOWN to a low baseline, colored the SKY background, drawn FIRST with depthWrite ON (vsFill/fsFill). Lines drawn AFTER with depthCompare less-equal + depthWrite OFF. A near curtain writes nearer depth and occludes the lines of farther rows → Joy Division hidden-line removal, no horizon tangle. NOT the row-to-row shaded mesh the user rejected — each row is its own vertical curtain at constant depth.
+- **Elevation color hints:** lines tinted by terrain height — deep teal/blue valleys → magenta mid-slopes → hot near-white peaks (two-stage smoothstep ramp, brightness-capped) so color reads elevation.
+- **Wind = DOTS, not lines:** wind.ts/wind.wgsl replaced the streamline comets with a persistent field of drifting neon DOT particles. Each mote's world position is advected CPU-side by the SAME `windAt` field (p += w·dt) and recycled when it leaves the camera-relative span (reseeded ahead). Rendered as additive billboard quads, depth-tested (no write) so ridges occlude them. Compass/wind-vector overlay retained.
+- **Tuning (this commit):** dot `count` 900→1300, `dotPx` 7→11, glow falloff 2.2→1.6 + base intensity 0.55→0.85 (motes read as dots, not pinpricks); `spanAhead`/`spanWide` 1400→950 to match terrain `maxDist` (dots past the cutoff floated over a void and read as detached sky specks); `clearance` 45→55 (clear near crests but hug the ridges, not the pure-sky band); terrain `fogDensity` 1/700→1/550 (far rows dissolve before they compress at the horizon — at 2× density adjacent rows barely self-occlude).
+- Flight physics (bird3d.ts integrate — glider sinks by default, lift is local) and the chase camera were NOT touched.
+
+### Pre-conditions
+```
+cd /Users/god/projects/ai-jank/vector-system
+```
+
+### Verify: typecheck clean
+```
+npx tsc --noEmit
+```
+Expected: exit 0, no output.
+
+### Verify: live in browser
+```
+npm run dev
+```
+Open http://localhost:5173/index-bird.html (vite may use 5174 if 5173 is taken). Mouse = steer (down dive/speed, up zoom-climb); the glider sinks by default and you must hunt lift.
+
+### Verify: the look reads
+Fly a moment with the cursor near screen-center, then confirm:
+- Denser EKG terrain — many fine horizontal neon ridge lines.
+- Near ridge crests cleanly SEVER the lines behind them — no horizon tangle; far rows dissolve into the haze.
+- Elevation color — teal/blue valleys ramping to magenta/white peaks.
+- Wind shown as drifting cyan DOTS (NOT lines) floating over the terrain — flow reads through their drift + density.
+- Readable gliding-V bird, ground framed, compass overlay (heading / track / wind, drift readout).
+- 60fps; no `[WebGPU lost]` / `pageerror` / `console.error`.
+
+### Watch for
+- The wind-dot drift is invisible in a single still frame — judge the flow in MOTION (a frozen PNG shows position + density only). Sky-band dots above the terrain silhouette read as specks when frozen but as flow when moving.
+- Dot `clearance` below ~50 risks re-bunching motes under the near fill curtains (they get depth-occluded) — 55 is the readable floor now that span/glow are fixed.
+- Screenshot driver: `.ai/tmp/myshot-v5-final.mjs` (Playwright + Metal WebGPU flags, port 5174 then 5173); waits `window.__birdBooted`; final frame at `.ai/tmp/v5-final.png`.

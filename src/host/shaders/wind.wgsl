@@ -52,10 +52,11 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
   // radial soft falloff → round glowing mote; discard outside the disc to avoid square edges.
   let r = length(in.corner);
   if (r > 1.0) { discard; }
-  let glow = pow(1.0 - r, 2.2);
+  // softer falloff (1.6 vs 2.2) → a wider visible glow disc so each mote reads as a dot, not a pinprick.
+  let glow = pow(1.0 - r, 1.6);
 
-  // faster wind → brighter + whiter core.
-  let intensity = glow * (0.55 + in.speedFrac * 1.1);
+  // faster wind → brighter + whiter core. Raised base so slow-wind motes still read against the dark.
+  let intensity = glow * (0.85 + in.speedFrac * 1.1);
   let tint = mix(CYAN, WHITE, clamp(in.speedFrac, 0.0, 1.0));
 
   // distance fog → far motes dissolve into the haze.

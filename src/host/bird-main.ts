@@ -84,7 +84,9 @@ async function boot() {
                       // tangles into a horizon mess (user is fine losing far detail). ~60 visible rows.
     baseline: -300,   // fill curtains drop to this world-y (occlusion only; below the frame).
     fogColor: SKY,
-    fogDensity: 1 / 700, // strong fog: far rows dissolve well before the cutoff edge.
+    fogDensity: 1 / 550, // stronger fog (v5 700→550): far rows dissolve before they compress at the
+                         // horizon — at 2× density adjacent rows have near-zero height delta so their
+                         // curtains barely self-occlude; the fog kills the residual far-stack tangle.
   });
 
   const birdShader = await fetch("/src/host/shaders/bird3d.wgsl").then((r) => r.text());
