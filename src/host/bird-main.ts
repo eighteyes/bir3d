@@ -7,14 +7,18 @@
 //   - ONE control: mouse-steer (cursor offset from screen-center → yaw+pitch rate). Pure glide —
 //     dive to gain speed, pull up to zoom-climb, ride ridge lift to stay aloft. No flap input.
 //   - Per frame (one encoder, one submit): read input → bird.integrate → camera follow → viewProj;
-//     terrain.draw (clears color+depth) → bird.draw (LOADS color+depth, second pass, depth-tested).
-//   - Overlay: altitude-over-terrain, airspeed, vario (climb m/s), ridge lift, heading, wind, fps.
+//     terrain.draw (clears color+depth) → wind.draw (streamline comets, LOADS, depth-test no-write)
+//     → bird.draw (LOADS color+depth, depth-tested).
+//   - Overlay: altitude, airspeed, vario, updraft, heading vs GROUND-TRACK + DRIFT, wind, fps.
+//   - Compass canvas (bottom-right): large heading/ground-track/wind vectors — the felt-wind proof
+//     (cyan heading vs yellow ground-track gap = visible cross-track drift from wind).
 //   - Tuning panel ('T' toggles): live sliders writing straight into bird.tuning (feel dial-in).
 //   - Expose window.__birdBooted.
 
 import { acquireDevice } from "./gpu/device";
 import { TerrainEKG } from "./gpu/terrain";
 import { Bird3D, type BirdInput } from "./gpu/bird3d";
+import { Wind } from "./gpu/wind";
 import { ChaseCamera } from "./gpu/camera";
 import { perspective, multiply } from "./gpu/mat4";
 import { FrameLoop } from "./frameloop";
@@ -78,6 +82,11 @@ async function boot() {
   // the first frame and the EKG stack sits below the eyeline (less horizon tangle).
   const bird = new Bird3D(device, birdShader, format, terrain, [0, startH + 200, 0]);
 
+  // VISIBLE WIND: neon streamline comets over the terrain, integrated from the SAME shared windAt
+  // field that pushes the bird (src/host/gpu/wind.ts). Camera-relative like the EKG rows.
+  const windShader = await fetch("/src/host/shaders/wind.wgsl").then((r) => r.text());
+  const wind = new Wind(device, windShader, format, (x, z) => terrain.sampleHeight(x, z));
+
   // Chase cam follows the bird POSITION + HEADING only (world-up, ground-locked aim). Looks DOWN
   // on the bird's back at a FIXED angle so the ground ALWAYS fills the lower frame, whatever the
   // bird's pitch — this is the v3 ground-lock fix.
@@ -120,6 +129,17 @@ async function boot() {
       tunePanel.style.display = tunePanel.style.display === "none" ? "block" : "none";
     }
   });
+
+  // --- compass overlay canvas: large heading-vs-ground-track-vs-wind vectors (the felt-wind proof) ---
+  const compass = document.createElement("canvas");
+  compass.id = "compass";
+  compass.width = 200;
+  compass.height = 200;
+  compass.style.cssText =
+    "position:fixed;right:14px;bottom:14px;width:200px;height:200px;z-index:9;" +
+    "background:rgba(6,5,18,0.55);border:1px solid #2a2550;border-radius:8px;";
+  document.body.appendChild(compass);
+  const compassCtx = compass.getContext("2d")!;
 
   const applyDead = (v: number) =>
     Math.abs(v) < DEADZONE ? 0 : (v - Math.sign(v) * DEADZONE) / (1 - DEADZONE);
@@ -186,6 +206,10 @@ async function boot() {
     terrain.draw(enc, colorView, depthView, viewProj, camGround, camFwd, camRight, eye, {
       r: SKY[0], g: SKY[1], b: SKY[2], a: 1,
     });
+    // wind pass: loads color+depth (no clear); neon streamline comets over the ridges (depth-tested,
+    // no depth-write) — uses the bird's sim time so the drawn field matches the field that pushes.
+    wind.draw(enc, colorView, depthView, viewProj, camGround, camFwd, camRight, eye,
+      bird.simTime, SKY, 1 / 700);
     // bird pass: loads color+depth, depth-tested → ridges occlude the bird.
     bird.draw(enc, colorView, depthView, viewProj);
     device.queue.submit([enc.finish()]);
@@ -194,18 +218,28 @@ async function boot() {
     (window as any).__birdPos = bird.pos;
     (window as any).__birdPitch = bird.pitch;     // live pitch (rad)
     (window as any).__birdHeading = bird.heading; // live heading (rad) — capture harness waits for a real turn
+    (window as any).__birdGroundTrack = bird.lastGroundTrack; // actual travel dir (rad) — drift proof
     (window as any).__birdWind = bird.lastWind;   // [wx,wz] m/s — overlay/diagnostics
+    (window as any).__birdVario = bird.lastVario; // climb m/s — lift proof
     frame++;
     const headingDeg = ((bird.heading * 180) / Math.PI) % 360;
+    const trackDeg = (bird.lastGroundTrack * 180) / Math.PI;
+    // signed drift = ground-track − heading wrapped to (-180,180]; this is the felt-wind number.
+    let drift = trackDeg - (bird.heading * 180) / Math.PI;
+    drift = ((((drift + 180) % 360) + 360) % 360) - 180;
     const vario = bird.lastVario;
     const varioStr = `${vario >= 0 ? "+" : ""}${vario.toFixed(1)}`;
+    const windSpeed = Math.hypot(bird.lastWind[0], bird.lastWind[1]);
     overlay.textContent =
       `vector-system — bird3d (soaring glider chase)\n` +
       `alt over terrain: ${bird.lastClearance.toFixed(0)} m   air: ${bird.lastSpeed.toFixed(0)} m/s\n` +
-      `vario: ${varioStr} m/s ${vario > 0.5 ? "▲" : vario < -0.5 ? "▼" : "—"}   ridge lift: +${bird.lastUpdraft.toFixed(1)} m/s\n` +
-      `heading: ${headingDeg.toFixed(0)}°   pitch: ${((bird.pitch * 180) / Math.PI).toFixed(0)}°   bank: ${((bird.bank * 180) / Math.PI).toFixed(0)}°\n` +
-      `wind: ${bird.lastWind[0].toFixed(1)}, ${bird.lastWind[1].toFixed(1)} m/s\n` +
+      `vario: ${varioStr} m/s ${vario > 0.5 ? "▲" : vario < -0.5 ? "▼" : "—"}   updraft: +${bird.lastUpdraft.toFixed(1)} m/s\n` +
+      `heading: ${headingDeg.toFixed(0)}°   ground-track: ${trackDeg.toFixed(0)}°   DRIFT: ${drift >= 0 ? "+" : ""}${drift.toFixed(0)}°\n` +
+      `wind: ${bird.lastWind[0].toFixed(1)}, ${bird.lastWind[1].toFixed(1)} m/s  (|${windSpeed.toFixed(1)}|)\n` +
       `fps: ${fps.toFixed(0)}   frame ${frame}   (mouse=steer: down=dive/speed, up=zoom-climb, T=tuning)`;
+
+    // compass overlay: large vectors — heading (cyan), ground-track (yellow), wind (magenta).
+    drawCompass(compassCtx, bird.heading, bird.lastGroundTrack, bird.lastWind, windSpeed, drift);
   });
 
   loop.start();
@@ -245,6 +279,67 @@ function buildTunePanel(
     panel.appendChild(row);
   }
   return panel;
+}
+
+// Draw the felt-wind compass: heading (cyan), ground-track (yellow), wind (magenta) as vectors from
+// center. North (heading reference) is UP. World X=east → screen +x; world Z=north → screen -y.
+// A non-zero gap between cyan (heading) and yellow (ground-track) is the visible drift proof.
+function drawCompass(
+  ctx: CanvasRenderingContext2D,
+  heading: number,
+  track: number,
+  wind: [number, number],
+  windSpeed: number,
+  driftDeg: number
+): void {
+  const w = ctx.canvas.width, h = ctx.canvas.height;
+  const cx = w / 2, cy = h / 2;
+  ctx.clearRect(0, 0, w, h);
+
+  // ring
+  ctx.strokeStyle = "rgba(120,120,180,0.35)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(cx, cy, 72, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // a heading angle (rad, +Z=north=up, +X=east=right) → screen vector. dir=(sin,cos) world (x,z).
+  const vec = (ang: number, len: number): [number, number] => [
+    cx + Math.sin(ang) * len,
+    cy - Math.cos(ang) * len, // world +Z (north) is screen up
+  ];
+  const arrow = (ang: number, len: number, color: string, lw: number) => {
+    const [ex, ey] = vec(ang, len);
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = lw;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+    // arrowhead
+    const a = Math.atan2(ey - cy, ex - cx);
+    ctx.beginPath();
+    ctx.moveTo(ex, ey);
+    ctx.lineTo(ex - 9 * Math.cos(a - 0.4), ey - 9 * Math.sin(a - 0.4));
+    ctx.lineTo(ex - 9 * Math.cos(a + 0.4), ey - 9 * Math.sin(a + 0.4));
+    ctx.closePath();
+    ctx.fill();
+  };
+
+  // wind vector: angle from world (wx,wz); length scales with speed (capped).
+  const windAng = Math.atan2(wind[0], wind[1]); // atan2(x,z) → heading-convention angle
+  const windLen = Math.min(70, 14 + windSpeed * 3.0);
+  arrow(windAng, windLen, "rgba(230,90,230,0.95)", 5); // wind — magenta, thick
+  arrow(heading, 66, "rgba(80,220,255,0.95)", 3);        // heading — cyan
+  arrow(track, 66, "rgba(255,225,70,0.95)", 3);          // ground-track — yellow
+
+  ctx.font = "11px monospace";
+  ctx.fillStyle = "#9fe8ff"; ctx.fillText("heading", 8, 16);
+  ctx.fillStyle = "#ffe146"; ctx.fillText("track", 8, 30);
+  ctx.fillStyle = "#e65ae6"; ctx.fillText("wind", 8, 44);
+  ctx.fillStyle = "#fff";
+  ctx.fillText(`drift ${driftDeg >= 0 ? "+" : ""}${driftDeg.toFixed(0)}°`, 8, h - 10);
 }
 
 boot().catch((e) => {

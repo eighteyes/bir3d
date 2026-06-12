@@ -4,8 +4,9 @@
 //     energy-exchange glider — pitch trades airspeed for altitude (dive to gain speed, pull up to
 //     zoom-climb), drag relaxes speed toward trim, base sink rate (mushes when slow), RIDGE LIFT as
 //     vertical AIR MOTION the bird rides (wind · uphill gradient, finite-diff of sampleHeight),
-//     horizontal wind drift (analytic curl-noise — FLAGGED stand-in for fluid sampling), flap as a
-//     decaying boost (speed kick + vertical surge), altitude clamp above ground.
+//     plus explicit THERMAL updraft, plus CRANKED horizontal wind drift (shared analytic curl-noise
+//     field from wind.ts — the SAME field the streamline overlay draws; FLAGGED stand-in for the GPU
+//     fluid), altitude clamp above ground. Wind is cranked so cross-track drift is unmistakable.
 //   - Expose public `tuning` (live-writable) so a host overlay can slide feel parameters at runtime.
 //   - Build a procedural V mesh (body + two swept dihedral wing ribbons) as triangle strips packed
 //     to a triangle list; each vertex carries (signed spanFrac, wingFlag, edgeFrac) for shader flap.
@@ -16,6 +17,7 @@
 //   - forwardVec()/heading expose the chase convention (+Z forward) for the camera.
 
 import type { TerrainEKG } from "./terrain";
+import { windAt, thermalAt } from "./wind";
 
 export interface BirdInput {
   yawRate: number;   // rad/s, from mouse-x offset
@@ -58,8 +60,9 @@ export class Bird3D {
   lastWind: [number, number] = [0, 0];
   lastSpeed = 0;
   lastClearance = 0;
-  lastVario = 0;   // vertical speed (m/s)
-  lastUpdraft = 0; // ridge updraft being ridden (m/s)
+  lastVario = 0;     // vertical speed (m/s)
+  lastUpdraft = 0;   // total updraft being ridden (ridge + thermal, m/s)
+  lastGroundTrack = 0; // actual horizontal travel direction (rad) — differs from heading under wind
 
   private vbuf: GPUBuffer;
   private vertexCount: number;
@@ -86,8 +89,8 @@ export class Bird3D {
       divePower: t.divePower ?? 0.9,
       gravity: t.gravity ?? 9.0,
       sinkRate: t.sinkRate ?? 1.4,
-      windGain: t.windGain ?? 6,
-      windDrift: t.windDrift ?? 1.0,
+      windGain: t.windGain ?? 1.6,  // multiplier on the shared windAt field (CRANKED)
+      windDrift: t.windDrift ?? 1.0, // fraction of horizontal wind the glider drifts with
       liftGain: t.liftGain ?? 2.2,
       flexHz: t.flexHz ?? 0.6,   // slow, subtle flex — wings stay OUT (no flap beat)
       flexAmp: t.flexAmp ?? 0.06, // tiny → static gliding V
@@ -155,18 +158,8 @@ export class Bird3D {
     return [Math.sin(this.heading), 0, Math.cos(this.heading)];
   }
 
-  // Analytic curl-noise horizontal wind (FLAGGED: stand-in for the GPU fluid; fluid sampling
-  // needs async readback which is deferred this pass). Divergence-free 2D flow over (x,z).
-  private windAt(x: number, z: number): [number, number] {
-    const s = 0.0016;
-    const e = 1.0;
-    const pot = (px: number, pz: number) =>
-      Math.sin(px * s) * Math.cos(pz * s * 1.3) + 0.5 * Math.sin((px + pz) * s * 0.6);
-    // wind = curl of scalar potential = (dPot/dz, -dPot/dx)
-    const dz = (pot(x, z + e) - pot(x, z - e)) / (2 * e);
-    const dx = (pot(x + e, z) - pot(x - e, z)) / (2 * e);
-    return [dz * this.tuning.windGain * 200, -dx * this.tuning.windGain * 200];
-  }
+  // accumulated sim time — shared with the wind overlay so its streamlines use the SAME field state.
+  get simTime(): number { return this.time; }
 
   integrate(dt: number, input: BirdInput): void {
     this.time += dt;
@@ -200,8 +193,12 @@ export class Bird3D {
     // exchange above and bled by drag toward trim; lift comes from glide + ridge updraft below.
     this.speed = Math.max(T.minSpeed, Math.min(T.maxSpeed, this.speed));
 
-    // --- wind + ridge updraft: vertical air motion the bird RIDES ---
-    const [wx, wz] = this.windAt(this.pos[0], this.pos[2]);
+    // --- wind + lift: SHARED field (wind.ts) — the SAME field the streamline overlay draws.
+    // CRANKED: windGain scales the field; the lateral component visibly shoves the glide off
+    // heading (you must correct), and updraft (ridge + thermal) carries it up. ---
+    const [bwx, bwz] = windAt(this.pos[0], this.pos[2], this.time);
+    const wx = bwx * T.windGain;
+    const wz = bwz * T.windGain;
     this.lastWind = [wx, wz];
     const eps = 6;
     const hC = this.terrain.sampleHeight(this.pos[0], this.pos[2]);
@@ -209,8 +206,10 @@ export class Bird3D {
     const hZ = this.terrain.sampleHeight(this.pos[0], this.pos[2] + eps);
     const gx = (hX - hC) / eps; // uphill gradient
     const gz = (hZ - hC) / eps;
-    const into = wx * gx + wz * gz; // wind · uphill
-    const updraft = Math.max(0, into) * T.liftGain;
+    const into = wx * gx + wz * gz; // wind · uphill → ridge lift
+    const ridge = Math.max(0, into) * T.liftGain;
+    const thermal = thermalAt(this.pos[0], this.pos[2], this.time) * T.windGain;
+    const updraft = ridge + thermal; // total vertical air motion the bird rides
     this.lastUpdraft = updraft;
 
     // --- sink: minimal at trim, mushes CUBICALLY when slow — at minSpeed full-nose-up the
@@ -233,6 +232,9 @@ export class Bird3D {
     this.lastSpeed = this.speed;
     this.lastVario = this.vel[1];
     this.lastClearance = this.pos[1] - hC;
+    // ground-track: the ACTUAL horizontal travel direction. Wind drift makes it diverge from
+    // heading — this is the felt-wind proof (overlay compares heading vs ground-track).
+    this.lastGroundTrack = Math.atan2(this.vel[0], this.vel[2]);
   }
 
   draw(
