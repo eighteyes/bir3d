@@ -8,14 +8,18 @@
 //     (src/host/gpu/fluid.ts), which is compute-only and would need frame-laggy async readback +
 //     a grid→world mapping and STILL need a closed form for advection/overlay; the analytic field
 //     keeps one coherent, arbitrarily-sampleable source so the field you SEE is the field that PUSHES.
-//   - Wind: a render pipeline (wind.wgsl) that draws a field of drifting neon COMET motes over the
-//     terrain. Each mote's WORLD position is PERSISTED and advected every frame by windAt (p += w*dt),
-//     so the dots literally drift on the wind (motion + density = the flow). Each mote is a small
-//     comet — a quad stretched along the screen-space wind direction with a bright head and a fading
-//     tail — so drift + direction read even in a still frame and the motes stay distinct from the sky
-//     stars. Motes that age out or leave the camera-relative span are recycled ahead. Rendered as
-//     additive billboards, depth-tested against terrain (ridges occlude them). NOT regenerated each
-//     frame — that would freeze them in place; persistence is what makes them move.
+//   - Wind: a render pipeline (wind.wgsl) that draws drifting neon COMET motes over the terrain,
+//     organized into CLUSTERS (gusts). The field is NOT a uniform speckle (that reads like a
+//     starfield); instead a set of cluster CENTERS is scattered across the camera span, each carrying
+//     several motes seeded within a small radius. Every mote's WORLD position is PERSISTED and advected
+//     every frame by windAt (p += w*dt) — both centers and members ride the SAME field — so each gust
+//     drifts as a coherent packet (curl wavelength ≫ cluster radius → members stay together). A cluster
+//     is recycled AS A UNIT (reseeded ahead + members re-scattered) when its center ages out or leaves
+//     the span — members never recycle individually, which would bleed the packets back into speckle.
+//     Each mote is a small comet — a quad stretched along the screen-space wind direction with a bright
+//     head and a long fading tail — so drift + direction read even in a still frame and the motes stay
+//     distinct from the sky stars. Rendered as additive billboards, depth-tested against terrain
+//     (ridges occlude them). NOT regenerated each frame — persistence is what makes them move.
 //   - thermalAt(x,z,t): explicit vertical updraft (m/s) the bird rides — a few broad thermals so the
 //     vario reads clearly positive somewhere, independent of ridge-lift geometry.
 
@@ -90,9 +94,11 @@ export function thermalAt(
 // --- dot-particle overlay pipeline ---
 
 interface DotParams {
-  count?: number;     // number of drifting motes
+  numClusters?: number;     // number of drifting gust packets
+  motesPerCluster?: number; // motes scattered within each cluster
+  clusterRadius?: number;   // half-width (m) members are scattered around their center
   spanAhead?: number; // how far ahead of the camera ground point the field reaches (m)
-  spanBehind?: number;// margin behind the camera before a mote is recycled (m)
+  spanBehind?: number;// margin behind the camera before a cluster is recycled (m)
   spanWide?: number;  // half-width of the camera-relative field (m)
   clearance?: number; // meters above terrain the motes float
   dotPx?: number;     // on-screen comet head diameter (px) — converted to NDC half-width per frame
@@ -101,7 +107,10 @@ interface DotParams {
 
 export class Wind {
   private cfg: Required<WindConfig>;
-  private count: number;
+  private numClusters: number;
+  private motesPerCluster: number;
+  private clusterRadius: number;
+  private count: number;          // numClusters * motesPerCluster (total motes)
   private spanAhead: number;
   private spanBehind: number;
   private spanWide: number;
@@ -110,9 +119,14 @@ export class Wind {
   private tailMul: number;
 
   // PERSISTENT world-space particle state (NOT regenerated each frame — that is what makes them drift).
-  private px: Float32Array;   // world x
-  private pz: Float32Array;   // world z
+  // Motes are laid out cluster-major: cluster k owns indices [k*motesPerCluster, (k+1)*motesPerCluster).
+  private px: Float32Array;   // world x (per mote)
+  private pz: Float32Array;   // world z (per mote)
   private speedFrac: Float32Array; // cached 0..1 wind speed at the mote (for color/brightness)
+  // PERSISTENT cluster-center state — advected as a unit; drives whole-cluster recycle.
+  private cx: Float32Array;   // cluster center world x
+  private cz: Float32Array;   // cluster center world z
+  private cage: Float32Array; // cluster age (seconds) — aged-out clusters recycle as a safety net
 
   private vbuf: GPUBuffer;     // per-vertex instanced quad data, rebuilt from particle state each frame
   private vertexCount: number; // count * 6 (two triangles per quad)
@@ -144,7 +158,11 @@ export class Wind {
     p: DotParams = {}
   ) {
     this.cfg = { ...DEFAULTS, ...cfg };
-    this.count = p.count ?? 1300;
+    // GUST packets: many tiny motes grouped into drifting clusters (NOT a uniform speckle/starfield).
+    this.numClusters = p.numClusters ?? 70;
+    this.motesPerCluster = p.motesPerCluster ?? 60; // 70*60 = 4200 motes
+    this.clusterRadius = p.clusterRadius ?? 28;      // members scattered within ~28 m of the center
+    this.count = this.numClusters * this.motesPerCluster;
     // spanAhead matches the terrain maxDist (~950) so every mote lives in the DRAWN terrain band —
     // dots past the cutoff floated over a void and read as detached sky specks, not wind in the scene.
     this.spanAhead = p.spanAhead ?? 950;
@@ -154,14 +172,17 @@ export class Wind {
     // occlude low dots) but LOW enough to hug the ridges — too high lifts them into the pure-sky band
     // above the terrain silhouette where they conflict with the starfield. 55 is the readable middle.
     this.clearance = p.clearance ?? 55;
-    // smaller head than v5 (11 → 5) so motes read as streaking comets, not star-like blobs.
-    this.dotPx = p.dotPx ?? 5;
-    // tail a few head-widths long → drift direction reads even in a still frame.
-    this.tailMul = p.tailMul ?? 5;
+    // smaller head than v6 (5 → 2.6): many tiny motes per gust, not star-like blobs.
+    this.dotPx = p.dotPx ?? 2.6;
+    // long tail (≫ head) → streak + drift direction read clearly even in a still frame.
+    this.tailMul = p.tailMul ?? 11;
 
     this.px = new Float32Array(this.count);
     this.pz = new Float32Array(this.count);
     this.speedFrac = new Float32Array(this.count);
+    this.cx = new Float32Array(this.numClusters);
+    this.cz = new Float32Array(this.numClusters);
+    this.cage = new Float32Array(this.numClusters);
 
     this.vertexCount = this.count * 6;
     this.vertBytes = new ArrayBuffer(this.vertexCount * Wind.FPV * 4);
@@ -221,10 +242,11 @@ export class Wind {
     });
   }
 
-  // Place one mote at a fresh world position within the camera-relative span (random ahead+lateral).
-  // Used to seed the whole field at start and to recycle motes that drift out.
-  private spawn(
-    i: number,
+  // Place cluster k's CENTER at a fresh world position within the camera-relative span and scatter its
+  // members tightly around it (so the cluster reads as one gust packet). Used to seed the field at start
+  // and to recycle a whole cluster that drifts out. aheadMin lets recycle reseed near the far edge.
+  private spawnCluster(
+    k: number,
     camGround: [number, number],
     camFwd: [number, number],
     camRight: [number, number],
@@ -232,8 +254,19 @@ export class Wind {
   ): void {
     const ahead = aheadMin + Math.random() * (this.spanAhead - aheadMin);
     const lateral = (Math.random() * 2 - 1) * this.spanWide;
-    this.px[i] = camGround[0] + camFwd[0] * ahead + camRight[0] * lateral;
-    this.pz[i] = camGround[1] + camFwd[1] * ahead + camRight[1] * lateral;
+    const ccx = camGround[0] + camFwd[0] * ahead + camRight[0] * lateral;
+    const ccz = camGround[1] + camFwd[1] * ahead + camRight[1] * lateral;
+    this.cx[k] = ccx;
+    this.cz[k] = ccz;
+    this.cage[k] = 0;
+    // scatter members in a disc around the center (uniform-area: r = R*sqrt(u)).
+    const base = k * this.motesPerCluster;
+    for (let m = 0; m < this.motesPerCluster; m++) {
+      const ang = Math.random() * Math.PI * 2;
+      const r = this.clusterRadius * Math.sqrt(Math.random());
+      this.px[base + m] = ccx + Math.cos(ang) * r;
+      this.pz[base + m] = ccz + Math.sin(ang) * r;
+    }
   }
 
   // Advect every mote by windAt (p += w*dt), recycle ones that leave the camera-relative span, then
@@ -245,10 +278,11 @@ export class Wind {
     camRight: [number, number],
     t: number
   ): void {
-    // seed the field once, spread across the whole span so frame-0 is already populated and mid-flow.
+    // seed once: scatter cluster CENTERS across the whole span (members tight around each) so frame-0
+    // is already populated as discrete gusts and mid-flow.
     if (!this.seeded) {
-      for (let i = 0; i < this.count; i++) {
-        this.spawn(i, camGround, camFwd, camRight, -this.spanBehind);
+      for (let k = 0; k < this.numClusters; k++) {
+        this.spawnCluster(k, camGround, camFwd, camRight, -this.spanBehind);
       }
       this.seeded = true;
     }
@@ -258,33 +292,45 @@ export class Wind {
     if (dt < 0) dt = 0;
     if (dt > 0.05) dt = 0.05; // clamp stalls
 
+    const clusterLifetime = 18; // s — safety-net age-out; span-exit dominates recycling in practice.
+
+    // PASS 1 — clusters: advect each center by windAt; recycle the WHOLE cluster (center + members) if
+    // it ages out or leaves the span. Recycling as a unit is what keeps gusts discrete (no speckle).
+    for (let k = 0; k < this.numClusters; k++) {
+      const [wx, wz] = windAt(this.cx[k]!, this.cz[k]!, t, this.cfg);
+      this.cx[k]! += wx * dt;
+      this.cz[k]! += wz * dt;
+      this.cage[k]! += dt;
+      const rx = this.cx[k]! - camGround[0];
+      const rz = this.cz[k]! - camGround[1];
+      const fwdDist = rx * camFwd[0] + rz * camFwd[1];
+      const sideDist = rx * camRight[0] + rz * camRight[1];
+      if (
+        this.cage[k]! > clusterLifetime ||
+        fwdDist < -this.spanBehind ||
+        fwdDist > this.spanAhead ||
+        Math.abs(sideDist) > this.spanWide
+      ) {
+        // reseed the whole cluster near the FAR edge so the field stays full as the camera advances.
+        this.spawnCluster(k, camGround, camFwd, camRight, this.spanAhead * 0.55);
+      }
+    }
+
+    // PASS 2 — members: advect each mote by its own windAt (gives BOTH the position update and the
+    // per-mote windDir/speedFrac the shader consumes) and build the billboard vertex buffer. Members
+    // are NEVER recycled individually — only as part of their cluster (pass 1).
     const refSpeed = this.cfg.curlAmp + this.cfg.driftAmp; // for speedFrac normalization
     const v = this.vertHost;
     const corners = Wind.CORNERS;
     let vi = 0;
     for (let i = 0; i < this.count; i++) {
-      let x = this.px[i]!;
-      let z = this.pz[i]!;
-
-      // advect by the SAME shared field (no amplification — drift accumulates over the mote lifetime).
-      const [wx, wz] = windAt(x, z, t, this.cfg);
-      x += wx * dt;
-      z += wz * dt;
-
-      // recycle: project onto the camera-relative basis; respawn ahead if out of the span.
-      const rx = x - camGround[0];
-      const rz = z - camGround[1];
-      const fwdDist = rx * camFwd[0] + rz * camFwd[1];   // along view
-      const sideDist = rx * camRight[0] + rz * camRight[1]; // lateral
-      if (fwdDist < -this.spanBehind || fwdDist > this.spanAhead || Math.abs(sideDist) > this.spanWide) {
-        // reseed near the FAR edge of the span so the field stays full as the camera advances.
-        this.spawn(i, camGround, camFwd, camRight, this.spanAhead * 0.55);
-        x = this.px[i]!;
-        z = this.pz[i]!;
-      } else {
-        this.px[i] = x;
-        this.pz[i] = z;
-      }
+      const x0 = this.px[i]!;
+      const z0 = this.pz[i]!;
+      const [wx, wz] = windAt(x0, z0, t, this.cfg);
+      const x = x0 + wx * dt;
+      const z = z0 + wz * dt;
+      this.px[i] = x;
+      this.pz[i] = z;
 
       const wspeed = Math.hypot(wx, wz);
       const sp = Math.min(1, wspeed / (refSpeed * 1.4));
@@ -297,9 +343,9 @@ export class Wind {
 
       // emit two triangles (6 verts) — same world center+windDir, four corners.
       for (let c = 0; c < 6; c++) {
-        const [cx, cy] = corners[c]!;
+        const [ccx, ccy] = corners[c]!;
         v[vi++] = x; v[vi++] = y; v[vi++] = z;
-        v[vi++] = cx; v[vi++] = cy;
+        v[vi++] = ccx; v[vi++] = ccy;
         v[vi++] = sp;
         v[vi++] = wdx; v[vi++] = wdz;
       }

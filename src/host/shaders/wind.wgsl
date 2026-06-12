@@ -6,6 +6,8 @@
 //     half-width. The streak is oriented in screen space from the mote's world-space wind direction.
 //   - Each mote's world position is advected CPU-side by the SHARED windAt field (src/host/gpu/wind.ts)
 //     and persisted frame-to-frame, so the field you SEE streaking is the field that PUSHES the glider.
+//     Motes are grouped into CLUSTERS (gusts) host-side — this shader is per-mote and cluster-agnostic;
+//     grouping comes from the seeded world positions, not from any extra vertex attribute.
 //   - Bright neon head (cyan→white by wind speed) fading to a transparent tail (alpha along streak),
 //     additive (host blend), so drift + direction read even in a still frame and the motes stay
 //     distinct from the sky starfield. Depth-tested (no write) so terrain ridges occlude them; distance
