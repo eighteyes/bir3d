@@ -253,7 +253,11 @@ export class Wind {
     aheadMin: number
   ): void {
     const ahead = aheadMin + Math.random() * (this.spanAhead - aheadMin);
-    const lateral = (Math.random() * 2 - 1) * this.spanWide;
+    // Seed into the camera's view WEDGE: lateral spread scales with distance so near/mid clusters land
+    // on-screen instead of off to the sides (a flat ±spanWide wastes most clusters in the side frustum,
+    // leaving only far horizon clusters visible → the sparse high-band concentration we are fixing).
+    const wedge = Math.min(1, Math.max(0.15, ahead / this.spanAhead));
+    const lateral = (Math.random() * 2 - 1) * this.spanWide * wedge;
     const ccx = camGround[0] + camFwd[0] * ahead + camRight[0] * lateral;
     const ccz = camGround[1] + camFwd[1] * ahead + camRight[1] * lateral;
     this.cx[k] = ccx;
@@ -292,7 +296,10 @@ export class Wind {
     if (dt < 0) dt = 0;
     if (dt > 0.05) dt = 0.05; // clamp stalls
 
-    const clusterLifetime = 18; // s — safety-net age-out; span-exit dominates recycling in practice.
+    // Age-out is a SAFETY NET only. The camera closes the ~950 m span at ~24 m/s (>30 s traversal), so
+    // lifetime must exceed that — otherwise clusters age out mid-flight and respawn at the far edge,
+    // trapping them near the horizon so none ever stream through the foreground. Span-exit dominates.
+    const clusterLifetime = 45;
 
     // PASS 1 — clusters: advect each center by windAt; recycle the WHOLE cluster (center + members) if
     // it ages out or leaves the span. Recycling as a unit is what keeps gusts discrete (no speckle).
