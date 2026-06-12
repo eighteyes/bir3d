@@ -118,6 +118,7 @@ interface DotParams {
   clearance?: number; // nominal meters above terrain the motes relax toward (height is advected, not pinned)
   minClear?: number;  // hard floor: motes never sink closer than this above terrain
   maxClear?: number;  // soft ceiling on height above terrain (keeps motes in the readable band)
+  nearBias?: number;  // v10 density: ahead = near + (far-near)·rand^nearBias (k>1 → cluster near the bird)
   liftGain?: number;  // multiplier on the vertical flow w = liftGain · (horizontalWind · uphillGrad)
   relax?: number;     // per-second relaxation of height back toward nominal clearance (anti-deplete)
   deflect?: number;   // 0..1 strength of horizontal into-slope deflection near steep terrain
@@ -139,6 +140,7 @@ export class Wind {
   private clearance: number;
   private minClear: number;
   private maxClear: number;
+  private nearBias: number;
   private liftGain: number;
   private relax: number;
   private deflect: number;
@@ -203,21 +205,34 @@ export class Wind {
     this.spanAhead = p.spanAhead ?? 950;
     this.spanBehind = p.spanBehind ?? 260;
     this.spanWide = p.spanWide ?? 950;
-    // nominal clearance the height RELAXES toward; height is advected by w (not pinned) so motes pour
-    // up/over ridges, but mild relaxation pulls them back so the field doesn't deplete or pile at a ceiling.
-    this.clearance = p.clearance ?? 55;
-    this.minClear = p.minClear ?? 14;   // hard floor above terrain (never sink into the ridge)
-    this.maxClear = p.maxClear ?? 100;  // soft ceiling above terrain — kept below the ridge silhouette so
-                                        // motes don't float into the star band; the pour reads as the
-                                        // height BAND of many motes climbing the windward face, not a ceiling.
-    // liftGain matches the bird's ridge-lift order (v5 set bird liftGain 1.2): a mote crossing an ~80m
-    // windward slope climbs tens of meters (reads against ~120m relief) then sinks in the lee — the pour.
-    // Higher (~9) rocketed every mote vertically and pinned them at the ceiling; 2.2 keeps the tail along
-    // the horizontal streamline so its terrain-shaped CURVE reads.
-    this.liftGain = p.liftGain ?? 3.2;
+    // v10 HUG: drop the clearance the height RELAXES toward from 55→16 so the field rides JUST over the
+    // ridges and follows the contour up and over each crest (v9's 55 floated a flat sheet above 220m relief).
+    // height is advected by w (not pinned) so motes pour up/over ridges, with mild relaxation back to this low
+    // nominal so the field doesn't deplete or pile at a ceiling.
+    this.clearance = p.clearance ?? 16;
+    this.minClear = p.minClear ?? 5;    // v10: hard floor 14→5 — motes hug right down onto the surface.
+    this.maxClear = p.maxClear ?? 170;  // v10: RAISE the ceiling 100→170 so actively-CLIMBING motes have room
+                                        // to stream up the windward face and SPILL over the crest (in flat/lee
+                                        // air w≈0 so relax keeps motes at the LOW clearance — the raised ceiling
+                                        // does not lift the baseline, it only frees the pour to read as a plume).
+    // v10 POUR: dh/dt = (liftGain−1)·d(terr)/dt along the path, so liftGain>1 lifts climbing motes OFF the
+    // windward face into a visible arc; raise 3.2→2.4 — strong enough to pour up + spill (with the now-low
+    // clearance the arcs read against the surface) but NOT the v9 "9" that pinned every mote at the ceiling.
+    this.liftGain = p.liftGain ?? 2.4;
     this.relax = p.relax ?? 0.1;        // gentle pull back toward nominal clearance (τ~10s) — anti-deplete
                                         // without damping the multi-second pour-over transient.
-    this.deflect = p.deflect ?? 0.9;    // strong into-slope removal → flow bends around/over, not through
+    // v10 POUR over deflect: v9's strong deflection (0.9) routed motes AROUND ridges ALONG the contour —
+    // flat horizontal streaks, the opposite of v10's "stream UP windward faces and SPILL over crests". Drop
+    // to 0.25 so most of the into-slope horizontal wind is KEPT → motes drive UP and OVER the crest (the
+    // minClear clamp rides them along the surface; once they crest, the gradient flips and w<0 spills them
+    // down the lee). `w` is computed pre-deflection so the vertical pour is unchanged — only the horizontal
+    // path reorients from along-contour to into-and-over, and more motes dwell in the bright climbing state.
+    this.deflect = p.deflect ?? 0.25;
+    // v10 DENSITY: bias the seed distance toward the NEAR field so the cloud is THICK around the bird and
+    // thins into the distance. ahead = near + (far−near)·rand^nearBias; k=2.6 lands ~70% of motes in the
+    // near third (the camera→bird→just-beyond band; bird sits ~followDist=120m ahead) — inverts v9's
+    // uniform-world seed where perspective made the FAR field read densest.
+    this.nearBias = p.nearBias ?? 2.6;
     // CURVED long tails: segments × segStep seconds of flow integrated backward = the comet arc. Much
     // longer than v8: 10 × 0.5s ≈ 5s of real flow (~35-50m near/mid-field) so the arc spans the deflection
     // zone near a ridge and the curve is unmistakable. segStep is the cheap length knob (no extra verts).
@@ -317,7 +332,13 @@ export class Wind {
     aheadMin: number,
     lateralSign: number // 0 = either side; ±1 = force this side (for side-exit wrap)
   ): void {
-    const ahead = aheadMin + Math.random() * (this.spanAhead - aheadMin);
+    // v10 DENSITY: bias the distance toward the NEAR field — ahead = base + (far−base)·rand^nearBias,
+    // k>1 clusters most motes near `base`, thinning into the distance. base is floored at ~8% of spanAhead
+    // (~75m) so the THICK cloud peaks AT THE BIRD (which sits ~followDist=120m ahead of the camera), NOT
+    // under the camera (ahead≈0 motes fall off the bottom edge / off the sides at the 0.15 wedge floor).
+    // On a front-exit reseed (aheadMin = spanAhead·0.6) the larger aheadMin wins, refilling near the far edge.
+    const base = Math.max(this.spanAhead * 0.08, aheadMin);
+    const ahead = base + Math.pow(Math.random(), this.nearBias) * (this.spanAhead - base);
     const wedge = Math.min(1, Math.max(0.15, ahead / this.spanAhead));
     let lat = Math.random();             // 0..1 magnitude fraction
     let sign = lateralSign;
@@ -433,7 +454,15 @@ export class Wind {
       const wspeed = Math.hypot(wx, wz);
       // calibrated smoothstep(lo,hi): calm→fast spans the full 0..1 so density+tail contrast reads.
       const u = Math.min(1, Math.max(0, (wspeed - lo) / (hi - lo)));
-      const sp = u * u * (3 - 2 * u);
+      let sp = u * u * (3 - 2 * u);
+      // v10 POUR-READS: brightness + tail-length + density-survival all key off `sp`, but on a windward
+      // face the into-slope DEFLECTION collapses the HORIZONTAL speed exactly where the VERTICAL pour w is
+      // strongest — so climbing motes would go dim+short, hiding the pour. Fold the upward climb into sp so
+      // a mote streaming UP a ridge is bright, long-tailed, and survives the cull. wScale≈7 m/s maps a strong
+      // pour to ~full. The backward tail (integrated along flowAt) then arcs DOWN the windward face behind the
+      // bright climbing head — that descending bright arc IS the visible pour over the crest.
+      const climbFrac = Math.min(1, Math.max(0, w / 7.0));
+      sp = Math.max(sp, climbFrac);
       this.speedFrac[i] = sp;
 
       // CPU-side DENSITY cull (replaces the fragile vidx/6u hash in the shader, which broke once a mote
