@@ -9,6 +9,9 @@
 //   - Per frame (one encoder, one submit): read input → bird.integrate → camera follow → viewProj;
 //     terrain.draw (clears color+depth) → wind.draw (streamline comets, LOADS, depth-test no-write)
 //     → bird.draw (LOADS color+depth, depth-tested).
+//   - DEPTH/SWOOP cues: altitude-adaptive chase cam (low clearance → eye drops + look flattens →
+//     ground rush; high → v3/v4 god-view), speed FOV kick (dive widens the view), and GroundMarker
+//     plumb-line (dashed bird→ground drop-line, ~9 m/dash, + pulsing ground diamond) drawn last.
 //   - Overlay: altitude, airspeed, vario, updraft, heading vs GROUND-TRACK + DRIFT, wind, fps.
 //   - Compass canvas (bottom-right): large heading/ground-track/wind vectors — the felt-wind proof
 //     (cyan heading vs yellow ground-track gap = visible cross-track drift from wind).
@@ -19,13 +22,20 @@ import { acquireDevice } from "./gpu/device";
 import { TerrainEKG } from "./gpu/terrain";
 import { Bird3D, type BirdInput } from "./gpu/bird3d";
 import { Wind } from "./gpu/wind";
+import { GroundMarker } from "./gpu/marker";
 import { ChaseCamera } from "./gpu/camera";
 import { perspective, multiply } from "./gpu/mat4";
 import { FrameLoop } from "./frameloop";
 
 const FOV_Y = (60 * Math.PI) / 180;
+const FOV_KICK = (16 * Math.PI) / 180; // extra FOV at dive ceiling — speed reads as widening view
 const NEAR = 1;
 const FAR = 12000;
+
+// Altitude-adaptive camera (the swoop fix): LOW clearance pulls the eye down near the bird and
+// flattens the look angle so the ground rushes; HIGH clearance restores the v3/v4 god-view framing.
+const CAM_LOW = { clearance: 25, height: 10, pitchDeg: 8 };
+const CAM_HIGH = { clearance: 160, height: 55, pitchDeg: 28 };
 
 // Near-black ground/haze. Clear color == fog color. The terrain exists PURELY as glowing lines on
 // this dark ground (NO fill); far lines fade into this haze. Very dark so the neon lines read.
@@ -64,14 +74,15 @@ async function boot() {
 
   const terrainShader = await fetch("/src/host/shaders/terrain_ekg.wgsl").then((r) => r.text());
   const terrain = new TerrainEKG(device, terrainShader, format, {
-    rows: 64,         // stacked EKG depth rows
-    cols: 256,        // samples per row (polyline resolution)
-    rowSpacing: 36,   // m between rows — tight stack so the lower frame fills with EKG traces
+    rows: 128,        // stacked EKG depth rows (2× v4) — spacing halved so ~2× actually render
+    cols: 512,        // samples per row (2× v4) — finer ridge profiles
+    rowSpacing: 18,   // m between rows (v4 36→18): ~2× visible rows inside maxDist for finer ridges
     rowStart: -150,   // BEHIND the camera ground point. Rows are built ahead of the camera; start a
                       // little behind so the near-ground under the camera isn't empty black.
     halfWidth: 1500,  // horizontal extent per row (m)
     maxDist: 950,     // CLEAN HORIZON: hard cutoff — drop rows past ~950 m so the far stack never
-                      // tangles into a horizon mess (user is fine losing far detail). ~30 visible rows.
+                      // tangles into a horizon mess (user is fine losing far detail). ~60 visible rows.
+    baseline: -300,   // fill curtains drop to this world-y (occlusion only; below the frame).
     fogColor: SKY,
     fogDensity: 1 / 700, // strong fog: far rows dissolve well before the cutoff edge.
   });
@@ -86,6 +97,11 @@ async function boot() {
   // field that pushes the bird (src/host/gpu/wind.ts). Camera-relative like the EKG rows.
   const windShader = await fetch("/src/host/shaders/wind.wgsl").then((r) => r.text());
   const wind = new Wind(device, windShader, format, (x, z) => terrain.sampleHeight(x, z));
+
+  // ALTITUDE PLUMB-LINE: dashed neon drop-line bird→ground (one dash per ~9 m = readable altimeter)
+  // + pulsing ground diamond. THE direct how-close-is-the-ground cue for swoops.
+  const markerShader = await fetch("/src/host/shaders/marker.wgsl").then((r) => r.text());
+  const marker = new GroundMarker(device, markerShader, format);
 
   // Chase cam follows the bird POSITION + HEADING only (world-up, ground-locked aim). Looks DOWN
   // on the bird's back at a FIXED angle so the ground ALWAYS fills the lower frame, whatever the
@@ -165,6 +181,7 @@ async function boot() {
 
   let frame = 0;
   let fps = 0;
+  let fovCur = FOV_Y; // eased per-frame toward FOV_Y + speed kick
   const loop = new FrameLoop((dt) => {
     fps = fps * 0.9 + (1 / Math.max(dt, 1e-3)) * 0.1;
 
@@ -183,13 +200,25 @@ async function boot() {
 
     bird.integrate(dt, input);
 
+    // altitude-adaptive camera: low clearance → eye drops + look flattens (ground rush);
+    // high clearance → exact v3/v4 framing. cam.update() smooths the transition.
+    const cf = Math.min(1, Math.max(0,
+      (bird.lastClearance - CAM_LOW.clearance) / (CAM_HIGH.clearance - CAM_LOW.clearance)));
+    cam.followHeight = CAM_LOW.height + cf * (CAM_HIGH.height - CAM_LOW.height);
+    cam.lookPitch = ((CAM_LOW.pitchDeg + cf * (CAM_HIGH.pitchDeg - CAM_LOW.pitchDeg)) * Math.PI) / 180;
+
     // camera follows the bird
     cam.target = [bird.pos[0], bird.pos[1], bird.pos[2]];
     const fwd = bird.forwardVec();
     cam.forward = [fwd[0], fwd[1], fwd[2]];
     cam.update();
 
-    const proj = perspective(FOV_Y, pxW / pxH, NEAR, FAR);
+    // speed FOV kick: diving widens the view (eases, never snaps).
+    const speedFrac = Math.min(1, Math.max(0,
+      (bird.lastSpeed - bird.tuning.glideSpeed) / (bird.tuning.maxSpeed - bird.tuning.glideSpeed)));
+    fovCur += (FOV_Y + speedFrac * FOV_KICK - fovCur) * Math.min(1, dt * 5);
+
+    const proj = perspective(fovCur, pxW / pxH, NEAR, FAR);
     const view = cam.viewMatrix();
     const viewProj = multiply(proj, view);
 
@@ -212,6 +241,10 @@ async function boot() {
       bird.simTime, SKY, 1 / 700);
     // bird pass: loads color+depth, depth-tested → ridges occlude the bird.
     bird.draw(enc, colorView, depthView, viewProj);
+    // altitude plumb-line + ground diamond under the bird (depth-tested → ridges occlude it).
+    marker.draw(enc, colorView, depthView, viewProj,
+      [bird.pos[0], bird.pos[1], bird.pos[2]],
+      bird.pos[1] - bird.lastClearance, bird.simTime);
     device.queue.submit([enc.finish()]);
 
     (window as any).__camPos = eye;

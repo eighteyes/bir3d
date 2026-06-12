@@ -105,3 +105,18 @@ v3 RESULT: landed well (no-fill EKG ridges, ground-locked cam, readable gliding-
 3. **Make the WIND FELT.** User: "i'm not feeling the wind at all." The coupling is too weak and invisible. (a) CRANK wind coupling so the glide is visibly shoved/carried/lifted — gusts blow you off heading (you must correct), thermals/ridge-lift clearly carry you up. (b) Make it VISIBLE — exaggerated streamline ribbons / drifting wind traces over the terrain (§7.1 "stylized wind, more legible than literal") so you SEE the field you're feeling. (c) Wire the REAL GPU fluid as the wind source if it can be sampled cleanly (no in-loop sync readback); else keep strong curl-noise and FLAG it. The bird should visibly drift, lift, and fight the air; the overlay's wind vector should be large and clearly acting on the flight.
 
 **Done (v4):** open `/index-bird.html` — EKG ridge-lines stay horizontal on screen in every turn; the horizon is clean (far lines occluded); the bird starts high and aerial; and the WIND is unmistakable — visible streamlines + the glider is clearly pushed/lifted/carried by it.
+
+---
+
+## v5 (2026-06-11) — glider energy fix + denser occluding terrain + wind DOTS
+
+**Glide energy — FIXED (committed 768af6f).** User: "i seem to keep flying up." Cause: v4 cranked the horizontal-wind gain and that ALSO multiplied the vertical thermal updraft, while thermals were broad/frequent — so updraft beat the small sink almost everywhere → constant climb. Fix: decoupled thermal from windGain, made thermals SPARSE narrow cores (pow), raised base sink (1.4→2.2), lowered ridge liftGain (2.2→1.2), added a hands-off pitch auto-trim to a gentle descent. Verified: hands-off the glider sinks ~2.8 m/s (195m→57m/5s); you must HUNT lift to stay up — the soaring contract.
+
+**Terrain (v5):**
+- **2× line density** — double the EKG rows (and/or samples per row) for finer ridges.
+- **BLACK FILL to occlude (hidden-line removal).** NOT the shaded fill that looked bad — a BACKGROUND-COLORED (black) fill UNDER each ridge line so nearer ridges HIDE the lines behind them (Joy Division technique: draw back-to-front, each line's black fill paints over the far lines; or depth-buffer equivalent). Result stays lines-only in look, but the tangle is gone because far lines are properly occluded by near terrain.
+- **Elevation coloration hints** — tint the lines by terrain HEIGHT (e.g., low/valley → cool, high/peak → warm/bright), so color reads elevation.
+
+**Wind (v5): DOTS, not lines.** Replace the streamline comet *lines* with drifting neon DOT particles advected by the SAME `windAt` field — a field of motes carried by the wind, showing flow through their motion and density (recycle as they age/leave). Over the terrain, depth-tested, additive glow.
+
+**Done (v5):** denser EKG terrain with black-fill hidden-line occlusion (clean, no tangle) + elevation-tinted lines; wind shown as drifting dots; and the glider sinks by default, soaring only on found lift.

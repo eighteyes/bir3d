@@ -1,17 +1,22 @@
-// terrain.ts — TerrainEKG: stacked horizontal neon trace LINES (no fill) + depth-tested pipeline.
+// terrain.ts — TerrainEKG: stacked horizontal neon trace LINES + opaque hidden-line FILL curtains.
 // Responsibilities:
 //   - Build a STACK of ~rows horizontal polylines (line-list). Each row is a fixed depth ahead of
 //     the camera; each vertex is (xFrac in [-1,1], rowDepth in meters) + rowFade. Segments are
-//     emitted as line-list pairs (no strip restart). There is NO filled surface — lines only.
+//     emitted as line-list pairs (no strip restart).
+//   - Build a matching STACK of opaque FILL curtains (triangle-list): per row, a vertical quad from
+//     the ridge line DOWN to a low baseline. Drawn FIRST, opaque, SKY-colored, depthWrite ON. A near
+//     curtain writes nearer depth and OCCLUDES the lines of farther rows → hidden-line removal (no
+//     horizon tangle). NOT a row-to-row connected mesh (that is the shaded surface the user rejected).
+//   - Lines drawn AFTER the fills with depthCompare "less-equal" and depthWrite OFF, so a line sits
+//     on its own curtain's top edge without z-fighting while NEARER curtains still occlude it.
 //   - CAMERA-RELATIVE ROWS (v4): the WGSL builds each world sample as camGround + camFwd*depth +
 //     camRight*(xFrac*halfWidth). Rows are perpendicular to camForward → screen-horizontal at every
 //     heading (v3 locked rows to world-East, so turning skewed them diagonally; fixed here).
-//   - Create the render pipeline from terrain_ekg.wgsl, topology "line-list", WITH depthStencil
-//     (depth24plus, less, write on) so terrain lines occlude the bird, and additive blend for glow.
-//   - Own the uniform buffer (viewProj, camGround, halfWidth, maxDist, camFwd, camRight, fog, eye);
-//     upload per draw. maxDist gives a hard horizon cutoff in the fragment shader (clean horizon).
+//   - Own the uniform buffer (viewProj, camGround, halfWidth, maxDist, camFwd, camRight, fog, eye,
+//     baseline); upload per draw. maxDist gives a hard horizon cutoff (clean horizon).
+//   - Elevation color is in the line fragment shader (cool valleys → warm/bright peaks).
 //   - sampleHeight(x,z): TS mirror of the WGSL fBm (same constants/hash) for the bird ridge-lift.
-//   - draw(...): record one line-list draw that CLEARS color+depth (first pass of the frame).
+//   - draw(...): record fill pass (clears color+depth) then line pass (loads) — first pass of frame.
 
 const BASE_FREQ = 0.00285714; // ~1/350 per meter (mirrors WGSL)
 const LACUNARITY = 2.0;
@@ -28,6 +33,7 @@ export interface TerrainParams {
   maxDist?: number;    // hard draw-distance cutoff (m) → clean horizon
   fogColor?: [number, number, number];
   fogDensity?: number;
+  baseline?: number;   // low world-y the fill curtains drop to (occlusion only)
 }
 
 export class TerrainEKG {
@@ -40,14 +46,19 @@ export class TerrainEKG {
 
   private vbuf: GPUBuffer;
   private vertexCount: number;
+  private fillBuf: GPUBuffer;
+  private fillVertexCount: number;
   private ubuf: GPUBuffer;
   private pipeline: GPURenderPipeline;
+  private fillPipeline: GPURenderPipeline;
   private bindGroup: GPUBindGroup;
+  private fillBindGroup: GPUBindGroup;
   private uniformHost: ArrayBuffer;
   private uniformData: Float32Array;
 
   private fogColor: [number, number, number];
   private fogDensity: number;
+  private baseline: number;
 
   constructor(
     private device: GPUDevice,
@@ -64,6 +75,7 @@ export class TerrainEKG {
     this.maxDist = p.maxDist ?? (this.rowStart + this.rows * this.rowSpacing);
     this.fogColor = p.fogColor ?? [0.01, 0.012, 0.03];
     this.fogDensity = p.fogDensity ?? 1 / 1600;
+    this.baseline = p.baseline ?? -300; // terrain min is 0; drop curtains well below frame.
 
     // --- line-list vertices: per row, (cols-1) segments = 2 verts each. ---
     // each vertex: xFrac(1) + rowDepth(1) + rowFade(1) = 3 floats.
@@ -88,12 +100,37 @@ export class TerrainEKG {
     });
     device.queue.writeBuffer(this.vbuf, 0, verts);
 
+    // --- fill curtains: per row, (cols-1) quads = 2 tris = 6 verts each. ---
+    // each vertex: xFrac(1) + rowDepth(1) + topFlag(1) = 3 floats. topFlag 1=ridge, 0=baseline.
+    // A quad spans [xA,xB] horizontally, ridge-top down to baseline vertically (vertical curtain).
+    this.fillVertexCount = this.rows * segsPerRow * 6;
+    const fverts = new Float32Array(this.fillVertexCount * FPV);
+    let fi = 0;
+    const pushFV = (x: number, d: number, top: number) => {
+      fverts[fi++] = x; fverts[fi++] = d; fverts[fi++] = top;
+    };
+    for (let r = 0; r < this.rows; r++) {
+      const rowDepth = this.rowStart + r * this.rowSpacing;
+      for (let c = 0; c < segsPerRow; c++) {
+        const xA = (c / segsPerRow) * 2 - 1;
+        const xB = ((c + 1) / segsPerRow) * 2 - 1;
+        // tri 1: topA, topB, botA   tri 2: botA, topB, botB
+        pushFV(xA, rowDepth, 1); pushFV(xB, rowDepth, 1); pushFV(xA, rowDepth, 0);
+        pushFV(xA, rowDepth, 0); pushFV(xB, rowDepth, 1); pushFV(xB, rowDepth, 0);
+      }
+    }
+    this.fillBuf = device.createBuffer({
+      size: fverts.byteLength,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(this.fillBuf, 0, fverts);
+
     // --- uniform buffer (std140-aligned, 128 bytes / 32 floats):
     //   [0..16)  mat4 viewProj
     //   [16,17]  camGround.xz   [18] halfWidth   [19] maxDist
     //   [20,21]  camFwd.xz      [22,23] camRight.xz
     //   [24..27) fogColor.rgb   [27] fogDensity
-    //   [28..31) eye.xyz        [31] pad
+    //   [28..31) eye.xyz        [31] baseline (fill curtain bottom, world-y)
     this.uniformHost = new ArrayBuffer(32 * 4);
     this.uniformData = new Float32Array(this.uniformHost);
     this.ubuf = device.createBuffer({
@@ -101,26 +138,38 @@ export class TerrainEKG {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
-    // --- pipeline: line-list, depthStencil, additive blend for neon glow ---
     const module = device.createShaderModule({ code: shader });
-    this.pipeline = device.createRenderPipeline({
+    // shared vertex layout: 3 floats (xFrac, rowDepth, flag) — flag is rowFade for lines, topFlag for fill.
+    const vbLayout: GPUVertexBufferLayout = {
+      arrayStride: FPV * 4,
+      attributes: [
+        { shaderLocation: 0, offset: 0, format: "float32x2" }, // xFrac, rowDepth
+        { shaderLocation: 1, offset: 8, format: "float32" },   // rowFade / topFlag
+      ],
+    };
+
+    // --- FILL pipeline: opaque SKY curtains, triangle-list, depthWrite ON (owns the depth buffer). ---
+    this.fillPipeline = device.createRenderPipeline({
       layout: "auto",
-      vertex: {
-        module,
-        entryPoint: "vs",
-        buffers: [
-          {
-            arrayStride: FPV * 4,
-            attributes: [
-              { shaderLocation: 0, offset: 0, format: "float32x2" }, // xFrac, rowDepth
-              { shaderLocation: 1, offset: 8, format: "float32" },   // rowFade
-            ],
-          },
-        ],
-      },
+      vertex: { module, entryPoint: "vsFill", buffers: [vbLayout] },
       fragment: {
         module,
-        entryPoint: "fs",
+        entryPoint: "fsFill",
+        targets: [{ format: colorFormat }], // no blend → opaque
+      },
+      primitive: { topology: "triangle-list", cullMode: "none" },
+      depthStencil: { depthWriteEnabled: true, depthCompare: "less", format: "depth24plus" },
+    });
+
+    // --- LINE pipeline: additive neon glow, depthCompare less-equal, depthWrite OFF. ---
+    // less-equal lets a line sit on its own curtain top edge; nearer curtains (strictly smaller
+    // depth, written by the fill pass) still occlude it → hidden-line removal without z-fighting.
+    this.pipeline = device.createRenderPipeline({
+      layout: "auto",
+      vertex: { module, entryPoint: "vsLine", buffers: [vbLayout] },
+      fragment: {
+        module,
+        entryPoint: "fsLine",
         targets: [
           {
             format: colorFormat,
@@ -132,10 +181,16 @@ export class TerrainEKG {
         ],
       },
       primitive: { topology: "line-list", cullMode: "none" },
-      depthStencil: { depthWriteEnabled: true, depthCompare: "less", format: "depth24plus" },
+      depthStencil: { depthWriteEnabled: false, depthCompare: "less-equal", format: "depth24plus" },
     });
+
+    // separate bind group per pipeline (layout:"auto" → distinct layouts), both pointing at ubuf.
     this.bindGroup = device.createBindGroup({
       layout: this.pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: this.ubuf } }],
+    });
+    this.fillBindGroup = device.createBindGroup({
+      layout: this.fillPipeline.getBindGroupLayout(0),
       entries: [{ binding: 0, resource: { buffer: this.ubuf } }],
     });
   }
@@ -189,7 +244,7 @@ export class TerrainEKG {
     u[20] = camFwd[0]; u[21] = camFwd[1];                            // camFwd.xz
     u[22] = camRight[0]; u[23] = camRight[1];                        // camRight.xz
     u[24] = this.fogColor[0]; u[25] = this.fogColor[1]; u[26] = this.fogColor[2]; u[27] = this.fogDensity;
-    u[28] = eye[0]; u[29] = eye[1]; u[30] = eye[2]; u[31] = 0;       // eye + pad
+    u[28] = eye[0]; u[29] = eye[1]; u[30] = eye[2]; u[31] = this.baseline; // eye + fill baseline
     this.device.queue.writeBuffer(this.ubuf, 0, this.uniformHost);
 
     const pass = encoder.beginRenderPass({
@@ -203,6 +258,12 @@ export class TerrainEKG {
         depthStoreOp: "store",
       },
     });
+    // FILL FIRST: opaque SKY curtains write depth → near rows occlude far lines (hidden-line removal).
+    pass.setPipeline(this.fillPipeline);
+    pass.setBindGroup(0, this.fillBindGroup);
+    pass.setVertexBuffer(0, this.fillBuf);
+    pass.draw(this.fillVertexCount);
+    // LINES SECOND: additive neon, depth-test less-equal against the curtains, no depth-write.
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, this.bindGroup);
     pass.setVertexBuffer(0, this.vbuf);

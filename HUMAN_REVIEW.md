@@ -1,5 +1,46 @@
 # Human Review Steps
 
+## Bird3D — depth-to-ground cues for dramatic swoops (adaptive cam + FOV kick + plumb-line)
+**Date:** 2026-06-11
+**Commit:** working tree on top of 768af6f
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done
+- ALTITUDE-ADAPTIVE CHASE CAM (`src/host/bird-main.ts`): clearance ≤25 m → eye drops to 10 m above the bird, look flattens to 8° (ground rushes); clearance ≥160 m → exact v3/v4 framing (55 m / 28°), linear blend between, smoothed by the existing cam easing. High-altitude capture harnesses are unaffected.
+- SPEED FOV KICK: FOV eases 60°→76° as airspeed runs trim→maxSpeed — dives visibly widen the view.
+- GROUND PLUMB-LINE (`src/host/gpu/marker.ts` + `src/host/shaders/marker.wgsl`, new): dashed neon drop-line bird→terrain-below (one dash ≈ 9 m — the dash count IS the altimeter) + pulsing ground diamond at its foot. Additive, depth-tested (ridges occlude it = extra parallax), depth-write off. Drawn last in the frame encoder.
+
+### Pre-conditions
+```
+cd /Users/god/projects/ai-jank/vector-system
+npm run dev
+```
+
+### Verify: typecheck clean + page boots headless
+```
+node node_modules/typescript/bin/tsc --noEmit
+node .ai/tmp/bird-boot-probe.mjs
+```
+Expected: no tsc output; `booted: true`, `PROBE_OK`, exit 0.
+
+### Verify: eyes-on screenshots (high vs low MUST look different)
+```
+node .ai/tmp/marker-shot.mjs
+```
+Expected: `errors: []`. `.ai/tmp/marker-high.png` (≈190 m: long dashed plumb-line spanning the frame, god-view framing) vs `.ai/tmp/marker-low.png` (≈6 m: stub line + diamond under the wingtips, camera near the deck, ridge ahead at eye level).
+
+### Verify: FLY THE SWOOP (the actual gate)
+Open http://localhost:5173/index-bird.html:
+- [ ] Cruise high: long dashed drop-line below; count of dashes shrinks as you descend.
+- [ ] Full dive toward a valley: FOV widens with speed, camera sinks toward the bird, terrain lines accelerate past — the ground RUSHES.
+- [ ] Pull up at the deck (<25 m): diamond right under you, camera low and flat, near-ridge crests cross above the bird — then zoom-climb out and the god-view eases back.
+- [ ] No pop: camera height/angle and FOV all ease, never snap.
+
+### Watch for
+- The plumb-line samples terrain via `bird.lastClearance` (same sampleHeight as physics) — if bird and line ever disagree visually, suspect a terrain mesh/sampleHeight divergence, not the marker.
+- Marker tunables are constants in `marker.wgsl` (DASH_M=9, diamond scale 7±1.5) and `bird-main.ts` (CAM_LOW/CAM_HIGH, FOV_KICK 16°) — adjust there if the feel is close-but-not-quite.
+- `.ai/tmp/marker-shot.mjs` is a verification artifact (gitignored), not a deliverable.
+
 ## Bird 3D v3 (EKG lines-only + ground-locked cam + glide)
 **Date:** 2026-06-11
 **Commit:** 4783a31
