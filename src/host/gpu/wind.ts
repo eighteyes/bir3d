@@ -207,22 +207,30 @@ export class Wind {
     // up/over ridges, but mild relaxation pulls them back so the field doesn't deplete or pile at a ceiling.
     this.clearance = p.clearance ?? 55;
     this.minClear = p.minClear ?? 14;   // hard floor above terrain (never sink into the ridge)
-    this.maxClear = p.maxClear ?? 180;  // soft ceiling above terrain (stay in the readable band)
-    // liftGain amplifies the vertical pour so the climb over windward slopes reads from the chase cam.
-    this.liftGain = p.liftGain ?? 9.0;
-    this.relax = p.relax ?? 0.35;       // per-second pull of height back toward nominal clearance
+    this.maxClear = p.maxClear ?? 100;  // soft ceiling above terrain — kept below the ridge silhouette so
+                                        // motes don't float into the star band; the pour reads as the
+                                        // height BAND of many motes climbing the windward face, not a ceiling.
+    // liftGain matches the bird's ridge-lift order (v5 set bird liftGain 1.2): a mote crossing an ~80m
+    // windward slope climbs tens of meters (reads against ~120m relief) then sinks in the lee — the pour.
+    // Higher (~9) rocketed every mote vertically and pinned them at the ceiling; 2.2 keeps the tail along
+    // the horizontal streamline so its terrain-shaped CURVE reads.
+    this.liftGain = p.liftGain ?? 3.2;
+    this.relax = p.relax ?? 0.1;        // gentle pull back toward nominal clearance (τ~10s) — anti-deplete
+                                        // without damping the multi-second pour-over transient.
     this.deflect = p.deflect ?? 0.9;    // strong into-slope removal → flow bends around/over, not through
-    // CURVED long tails: segments × segStep seconds of flow integrated backward = the comet arc. Longer
-    // than v8 (whose straight streak was ~one windDir step); here ~7 × 0.10s of real flow curves over ridges.
-    this.segments = p.segments ?? 7;
-    this.segStep = p.segStep ?? 0.10;
+    // CURVED long tails: segments × segStep seconds of flow integrated backward = the comet arc. Much
+    // longer than v8: 10 × 0.5s ≈ 5s of real flow (~35-50m near/mid-field) so the arc spans the deflection
+    // zone near a ridge and the curve is unmistakable. segStep is the cheap length knob (no extra verts).
+    this.segments = p.segments ?? 10;
+    this.segStep = p.segStep ?? 0.5;
     // small head: many tiny motes, not star-like blobs.
     this.dotPx = p.dotPx ?? 2.6;
     // calmest-air segment step = 25% (short stubby arc); fast air = full step (long arc). Kept LOW so the
     // speed contrast stays steep.
     this.tailFloor = p.tailFloor ?? 0.25;
-    // even the calmest air keeps ~20% of motes visible → wind EVERYWHERE, just sparse where slow.
-    this.densityFloor = p.densityFloor ?? 0.2;
+    // even the calmest air keeps ~30% of motes visible → wind EVERYWHERE, just sparse where slow. Raised
+    // from 0.2 so the full-frame read stays populated (the curved tails are sparser per-mote than v8 dots).
+    this.densityFloor = p.densityFloor ?? 0.3;
     // calibrated to the field's real |windAt| distribution (sampled min ~0.03, max ~16.5, mean ~8.5):
     // smoothstep(2,15) stretches the contrast across the bulk so calm→fast spans the full 0..1.
     this.speedLo = p.speedLo ?? 2.0;
