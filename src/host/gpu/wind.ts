@@ -8,18 +8,21 @@
 //     (src/host/gpu/fluid.ts), which is compute-only and would need frame-laggy async readback +
 //     a grid→world mapping and STILL need a closed form for advection/overlay; the analytic field
 //     keeps one coherent, arbitrarily-sampleable source so the field you SEE is the field that PUSHES.
-//   - Wind: a render pipeline (wind.wgsl) that draws drifting neon COMET motes over the terrain,
-//     organized into CLUSTERS (gusts). The field is NOT a uniform speckle (that reads like a
-//     starfield); instead a set of cluster CENTERS is scattered across the camera span, each carrying
-//     several motes seeded within a small radius. Every mote's WORLD position is PERSISTED and advected
-//     every frame by windAt (p += w*dt) — both centers and members ride the SAME field — so each gust
-//     drifts as a coherent packet (curl wavelength ≫ cluster radius → members stay together). A cluster
-//     is recycled AS A UNIT (reseeded ahead + members re-scattered) when its center ages out or leaves
-//     the span — members never recycle individually, which would bleed the packets back into speckle.
-//     Each mote is a small comet — a quad stretched along the screen-space wind direction with a bright
-//     head and a long fading tail — so drift + direction read even in a still frame and the motes stay
-//     distinct from the sky stars. Rendered as additive billboards, depth-tested against terrain
-//     (ridges occlude them). NOT regenerated each frame — persistence is what makes them move.
+//     FROZEN: windAt/thermalAt/potential/DEFAULTS drive the bird flight physics — do NOT retune them.
+//   - Wind: a render pipeline (wind.wgsl) that draws drifting neon COMET motes over the terrain.
+//     v8 model — wind EVERYWHERE with SPEED encoded by density + tail length (supersedes v7 clusters):
+//     motes are seeded UNIFORMLY across the whole camera-relative wedge (no clustering, no hard empty
+//     gaps), and every mote's WORLD position is PERSISTED and advected each frame by windAt (p += w*dt)
+//     — windAt is divergence-free, so a uniform seed STAYS uniform under advection (no clumping). Motes
+//     that leave the wedge are boundary-WRAPPED (exit behind → reseed ahead, exit a side → reseed the
+//     opposite side) so coverage stays full with no mid-view pop-in. SPEED is read two ways, both
+//     scaling with local |windAt|: (1) DENSITY — the shader fades out a speed-dependent fraction of
+//     motes (faint short stubs survive everywhere even in calm air, but fast air shows MANY more); and
+//     (2) TAIL LENGTH — each mote's comet tail scales with its local speed (long streaks in fast air,
+//     short stubs in calm). speedFrac is calibrated via smoothstep over the field's real min/max so
+//     calm→fast spans the full 0..1 range and the contrast reads. Rendered as additive billboards,
+//     depth-tested against terrain (ridges occlude them). NOT regenerated each frame — persistence
+//     is what makes them move.
 //   - thermalAt(x,z,t): explicit vertical updraft (m/s) the bird rides — a few broad thermals so the
 //     vario reads clearly positive somewhere, independent of ridge-lift geometry.
 
@@ -94,39 +97,38 @@ export function thermalAt(
 // --- dot-particle overlay pipeline ---
 
 interface DotParams {
-  numClusters?: number;     // number of drifting gust packets
-  motesPerCluster?: number; // motes scattered within each cluster
-  clusterRadius?: number;   // half-width (m) members are scattered around their center
+  numMotes?: number;  // total motes seeded uniformly across the camera-relative wedge
   spanAhead?: number; // how far ahead of the camera ground point the field reaches (m)
-  spanBehind?: number;// margin behind the camera before a cluster is recycled (m)
-  spanWide?: number;  // half-width of the camera-relative field (m)
+  spanBehind?: number;// margin behind the camera before a mote is wrapped to the front (m)
+  spanWide?: number;  // half-width of the camera-relative field at the far edge (m)
   clearance?: number; // meters above terrain the motes float
   dotPx?: number;     // on-screen comet head diameter (px) — converted to NDC half-width per frame
-  tailMul?: number;   // streak length as a multiple of the head width (comet tail length)
+  tailMul?: number;   // base streak length as a multiple of the head width (max comet tail, fast air)
+  tailFloor?: number; // tail length fraction in the calmest air (0..1 of the base tail)
+  densityFloor?: number; // fraction of motes that survive the speed-fade even in the calmest air (0..1)
+  speedLo?: number;   // |windAt| (m/s) mapped to speedFrac 0 (calm) — calibrated to the field min
+  speedHi?: number;   // |windAt| (m/s) mapped to speedFrac 1 (fast) — calibrated to the field max
 }
 
 export class Wind {
   private cfg: Required<WindConfig>;
-  private numClusters: number;
-  private motesPerCluster: number;
-  private clusterRadius: number;
-  private count: number;          // numClusters * motesPerCluster (total motes)
+  private count: number;          // total motes
   private spanAhead: number;
   private spanBehind: number;
   private spanWide: number;
   private clearance: number;
   private dotPx: number;
   private tailMul: number;
+  private tailFloor: number;
+  private densityFloor: number;
+  private speedLo: number;
+  private speedHi: number;
 
   // PERSISTENT world-space particle state (NOT regenerated each frame — that is what makes them drift).
-  // Motes are laid out cluster-major: cluster k owns indices [k*motesPerCluster, (k+1)*motesPerCluster).
+  // v8: a flat UNIFORM field (no clusters). windAt is divergence-free so the uniform seed stays uniform.
   private px: Float32Array;   // world x (per mote)
   private pz: Float32Array;   // world z (per mote)
-  private speedFrac: Float32Array; // cached 0..1 wind speed at the mote (for color/brightness)
-  // PERSISTENT cluster-center state — advected as a unit; drives whole-cluster recycle.
-  private cx: Float32Array;   // cluster center world x
-  private cz: Float32Array;   // cluster center world z
-  private cage: Float32Array; // cluster age (seconds) — aged-out clusters recycle as a safety net
+  private speedFrac: Float32Array; // cached 0..1 wind speed at the mote (for color/density/tail)
 
   private vbuf: GPUBuffer;     // per-vertex instanced quad data, rebuilt from particle state each frame
   private vertexCount: number; // count * 6 (two triangles per quad)
@@ -139,7 +141,7 @@ export class Wind {
   private bindGroup: GPUBindGroup;
 
   private lastTime = -1;       // for per-frame dt derivation from bird.simTime
-  private seeded = false;      // first draw seeds the field around the camera span
+  private seeded = false;      // first draw seeds the field uniformly across the wedge
 
   // floats/vertex: center.xyz(3) + corner.xy(2) + speedFrac(1) + windDir.xy(2) = 8
   private static FPV = 8;
@@ -158,11 +160,9 @@ export class Wind {
     p: DotParams = {}
   ) {
     this.cfg = { ...DEFAULTS, ...cfg };
-    // GUST packets: many tiny motes grouped into drifting clusters (NOT a uniform speckle/starfield).
-    this.numClusters = p.numClusters ?? 70;
-    this.motesPerCluster = p.motesPerCluster ?? 60; // 70*60 = 4200 motes
-    this.clusterRadius = p.clusterRadius ?? 28;      // members scattered within ~28 m of the center
-    this.count = this.numClusters * this.motesPerCluster;
+    // v8: ONE uniform field of motes across the whole wedge (no clusters → no hard empty gaps). 4200
+    // matches the v7 total; the wedge seeding spreads them over the visible airspace.
+    this.count = p.numMotes ?? 4200;
     // spanAhead matches the terrain maxDist (~950) so every mote lives in the DRAWN terrain band —
     // dots past the cutoff floated over a void and read as detached sky specks, not wind in the scene.
     this.spanAhead = p.spanAhead ?? 950;
@@ -172,17 +172,22 @@ export class Wind {
     // occlude low dots) but LOW enough to hug the ridges — too high lifts them into the pure-sky band
     // above the terrain silhouette where they conflict with the starfield. 55 is the readable middle.
     this.clearance = p.clearance ?? 55;
-    // smaller head than v6 (5 → 2.6): many tiny motes per gust, not star-like blobs.
+    // small head: many tiny motes, not star-like blobs.
     this.dotPx = p.dotPx ?? 2.6;
-    // long tail (≫ head) → streak + drift direction read clearly even in a still frame.
-    this.tailMul = p.tailMul ?? 11;
+    // v8: LONGER base tail than v7 (11 → 16); per-mote tail scales DOWN from this in calm air.
+    this.tailMul = p.tailMul ?? 16;
+    // calmest-air tail = 25% of base (short stub); fast air = full base tail (long streak).
+    this.tailFloor = p.tailFloor ?? 0.25;
+    // even the calmest air keeps ~18% of motes visible → wind EVERYWHERE, just sparse where slow.
+    this.densityFloor = p.densityFloor ?? 0.18;
+    // calibrated to the field's real |windAt| distribution (sampled min ~0.03, max ~16.5, mean ~8.5):
+    // smoothstep(2,15) stretches the contrast across the bulk so calm→fast spans the full 0..1.
+    this.speedLo = p.speedLo ?? 2.0;
+    this.speedHi = p.speedHi ?? 15.0;
 
     this.px = new Float32Array(this.count);
     this.pz = new Float32Array(this.count);
     this.speedFrac = new Float32Array(this.count);
-    this.cx = new Float32Array(this.numClusters);
-    this.cz = new Float32Array(this.numClusters);
-    this.cage = new Float32Array(this.numClusters);
 
     this.vertexCount = this.count * 6;
     this.vertBytes = new ArrayBuffer(this.vertexCount * Wind.FPV * 4);
@@ -193,7 +198,7 @@ export class Wind {
     });
 
     // uniform: mat4 viewProj(16) + eye.xyz(3) + aspect(1) + fogColor.rgb(3) + fogDensity(1)
-    //          + dotSize(1) + tailLen(1) + pad(2) = 28
+    //          + dotSize(1) + tailLen(1) + tailFloor(1) + densityFloor(1) = 28
     this.uniformHost = new ArrayBuffer(28 * 4);
     this.uniformF32 = new Float32Array(this.uniformHost);
     this.ubuf = device.createBuffer({
@@ -242,51 +247,41 @@ export class Wind {
     });
   }
 
-  // Place cluster k's CENTER at a fresh world position within the camera-relative span and scatter its
-  // members tightly around it (so the cluster reads as one gust packet). Used to seed the field at start
-  // and to recycle a whole cluster that drifts out. aheadMin lets recycle reseed near the far edge.
-  private spawnCluster(
-    k: number,
+  // Place mote i at a fresh world position UNIFORMLY within the camera-relative wedge. ahead is drawn in
+  // [aheadMin, spanAhead]; lateral spread widens with distance so the wedge matches the view frustum
+  // (near motes land on-screen, not off to the sides). Used to seed the whole field and to wrap motes
+  // that drift out. A nonzero aheadMin (recycle) reseeds nearer the far edge to refill as the cam moves.
+  private seedMote(
+    i: number,
     camGround: [number, number],
     camFwd: [number, number],
     camRight: [number, number],
-    aheadMin: number
+    aheadMin: number,
+    lateralSign: number // 0 = either side; ±1 = force this side (for side-exit wrap)
   ): void {
     const ahead = aheadMin + Math.random() * (this.spanAhead - aheadMin);
-    // Seed into the camera's view WEDGE: lateral spread scales with distance so near/mid clusters land
-    // on-screen instead of off to the sides (a flat ±spanWide wastes most clusters in the side frustum,
-    // leaving only far horizon clusters visible → the sparse high-band concentration we are fixing).
     const wedge = Math.min(1, Math.max(0.15, ahead / this.spanAhead));
-    const lateral = (Math.random() * 2 - 1) * this.spanWide * wedge;
-    const ccx = camGround[0] + camFwd[0] * ahead + camRight[0] * lateral;
-    const ccz = camGround[1] + camFwd[1] * ahead + camRight[1] * lateral;
-    this.cx[k] = ccx;
-    this.cz[k] = ccz;
-    this.cage[k] = 0;
-    // scatter members in a disc around the center (uniform-area: r = R*sqrt(u)).
-    const base = k * this.motesPerCluster;
-    for (let m = 0; m < this.motesPerCluster; m++) {
-      const ang = Math.random() * Math.PI * 2;
-      const r = this.clusterRadius * Math.sqrt(Math.random());
-      this.px[base + m] = ccx + Math.cos(ang) * r;
-      this.pz[base + m] = ccz + Math.sin(ang) * r;
-    }
+    let lat = Math.random();             // 0..1 magnitude fraction
+    let sign = lateralSign;
+    if (sign === 0) sign = Math.random() < 0.5 ? -1 : 1;
+    const lateral = sign * lat * this.spanWide * wedge;
+    this.px[i] = camGround[0] + camFwd[0] * ahead + camRight[0] * lateral;
+    this.pz[i] = camGround[1] + camFwd[1] * ahead + camRight[1] * lateral;
   }
 
-  // Advect every mote by windAt (p += w*dt), recycle ones that leave the camera-relative span, then
-  // rebuild the billboard vertex buffer from the PERSISTED positions. dt is derived from sim time and
-  // clamped so the first frame and any tab-stall don't fling the motes.
+  // Advect every mote by windAt (p += w*dt), boundary-WRAP ones that leave the camera-relative wedge,
+  // then rebuild the billboard vertex buffer from the PERSISTED positions. dt is derived from sim time
+  // and clamped so the first frame and any tab-stall don't fling the motes.
   private step(
     camGround: [number, number],
     camFwd: [number, number],
     camRight: [number, number],
     t: number
   ): void {
-    // seed once: scatter cluster CENTERS across the whole span (members tight around each) so frame-0
-    // is already populated as discrete gusts and mid-flow.
+    // seed once: scatter ALL motes uniformly across the whole wedge so frame-0 is already full coverage.
     if (!this.seeded) {
-      for (let k = 0; k < this.numClusters; k++) {
-        this.spawnCluster(k, camGround, camFwd, camRight, -this.spanBehind);
+      for (let i = 0; i < this.count; i++) {
+        this.seedMote(i, camGround, camFwd, camRight, -this.spanBehind, 0);
       }
       this.seeded = true;
     }
@@ -296,43 +291,31 @@ export class Wind {
     if (dt < 0) dt = 0;
     if (dt > 0.05) dt = 0.05; // clamp stalls
 
-    // Age-out is a SAFETY NET only. The camera closes the ~950 m span at ~24 m/s (>30 s traversal), so
-    // lifetime must exceed that — otherwise clusters age out mid-flight and respawn at the far edge,
-    // trapping them near the horizon so none ever stream through the foreground. Span-exit dominates.
-    const clusterLifetime = 45;
-
-    // PASS 1 — clusters: advect each center by windAt; recycle the WHOLE cluster (center + members) if
-    // it ages out or leaves the span. Recycling as a unit is what keeps gusts discrete (no speckle).
-    for (let k = 0; k < this.numClusters; k++) {
-      const [wx, wz] = windAt(this.cx[k]!, this.cz[k]!, t, this.cfg);
-      this.cx[k]! += wx * dt;
-      this.cz[k]! += wz * dt;
-      this.cage[k]! += dt;
-      const rx = this.cx[k]! - camGround[0];
-      const rz = this.cz[k]! - camGround[1];
-      const fwdDist = rx * camFwd[0] + rz * camFwd[1];
-      const sideDist = rx * camRight[0] + rz * camRight[1];
-      if (
-        this.cage[k]! > clusterLifetime ||
-        fwdDist < -this.spanBehind ||
-        fwdDist > this.spanAhead ||
-        Math.abs(sideDist) > this.spanWide
-      ) {
-        // reseed the whole cluster near the FAR edge so the field stays full as the camera advances.
-        this.spawnCluster(k, camGround, camFwd, camRight, this.spanAhead * 0.55);
-      }
-    }
-
-    // PASS 2 — members: advect each mote by its own windAt (gives BOTH the position update and the
-    // per-mote windDir/speedFrac the shader consumes) and build the billboard vertex buffer. Members
-    // are NEVER recycled individually — only as part of their cluster (pass 1).
-    const refSpeed = this.cfg.curlAmp + this.cfg.driftAmp; // for speedFrac normalization
+    const lo = this.speedLo;
+    const hi = this.speedHi;
     const v = this.vertHost;
     const corners = Wind.CORNERS;
     let vi = 0;
     for (let i = 0; i < this.count; i++) {
-      const x0 = this.px[i]!;
-      const z0 = this.pz[i]!;
+      let x0 = this.px[i]!;
+      let z0 = this.pz[i]!;
+
+      // Boundary-WRAP: if the mote has left the wedge, reseed it back into the opposite boundary so
+      // coverage stays full with no persistent gap and no mid-view pop-in (reseeds happen at the edges).
+      const rx = x0 - camGround[0];
+      const rz = z0 - camGround[1];
+      const fwdDist = rx * camFwd[0] + rz * camFwd[1];
+      const sideDist = rx * camRight[0] + rz * camRight[1];
+      if (fwdDist < -this.spanBehind || fwdDist > this.spanAhead) {
+        // exited front/back → reseed near the far-ahead edge (refills as the camera advances).
+        this.seedMote(i, camGround, camFwd, camRight, this.spanAhead * 0.6, 0);
+        x0 = this.px[i]!; z0 = this.pz[i]!;
+      } else if (Math.abs(sideDist) > this.spanWide) {
+        // exited a side → reseed on the OPPOSITE side at a fresh distance (wedge stays balanced).
+        this.seedMote(i, camGround, camFwd, camRight, -this.spanBehind, sideDist > 0 ? -1 : 1);
+        x0 = this.px[i]!; z0 = this.pz[i]!;
+      }
+
       const [wx, wz] = windAt(x0, z0, t, this.cfg);
       const x = x0 + wx * dt;
       const z = z0 + wz * dt;
@@ -340,7 +323,9 @@ export class Wind {
       this.pz[i] = z;
 
       const wspeed = Math.hypot(wx, wz);
-      const sp = Math.min(1, wspeed / (refSpeed * 1.4));
+      // calibrated smoothstep(lo,hi): calm→fast spans the full 0..1 so density+tail contrast reads.
+      const u = Math.min(1, Math.max(0, (wspeed - lo) / (hi - lo)));
+      const sp = u * u * (3 - 2 * u);
       this.speedFrac[i] = sp;
       const y = this.sampleHeight(x, z) + this.clearance;
       // unit wind direction (world XZ) → orients the comet streak in screen space (VS projects it).
@@ -384,7 +369,7 @@ export class Wind {
     //  reference width baked here.) Use viewport-independent sizing: half-extent = dotPx / refWidth.
     const REF_W = 1000; // reference canvas width the dotPx was tuned against
     const dotSize = this.dotPx / REF_W;          // NDC half-width of the comet head
-    const tailLen = dotSize * this.tailMul;      // NDC streak length (head → tail)
+    const tailLen = dotSize * this.tailMul;      // NDC base (fast-air, max) streak length
 
     const u = this.uniformF32;
     u.set(viewProj, 0);
@@ -393,7 +378,9 @@ export class Wind {
     u[20] = fogColor[0]; u[21] = fogColor[1]; u[22] = fogColor[2];
     u[23] = fogDensity;
     u[24] = dotSize;                              // NDC half-width
-    u[25] = tailLen;                              // NDC streak length
+    u[25] = tailLen;                              // NDC base streak length (scaled per-mote by speed)
+    u[26] = this.tailFloor;                       // calm-air tail fraction
+    u[27] = this.densityFloor;                    // calm-air surviving-mote fraction
     this.device.queue.writeBuffer(this.ubuf, 0, this.uniformHost);
 
     const pass = encoder.beginRenderPass({
