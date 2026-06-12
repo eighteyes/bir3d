@@ -30,11 +30,22 @@ Open the saved pair and confirm by eye:
 - Each mote is a tiny cyan COMET with a long fading tail, all oriented along the wind.
 - The gust field visibly SHIFTS between frame 0 and frame 1.
 
-### Verify: distribution is patchy (quantitative gust check)
+### Verify: clustering actually reads (decisive A/B — do NOT use a grid CV/occupancy stat)
+A single-frame grid CV / cell-occupancy number does NOT discriminate gusts from a uniform field:
+sky-band emptiness + distance fog + perspective concentration alone produce occupancy ~65-75% and
+CV ~1.6-1.7 with ZERO clustering (verified — the uniform control scored 74% / 1.58 vs the clustered
+65% / 1.72). Use a relative A/B instead:
 ```
-cd /Users/god/projects/ai-jank/vector-system/.ai/tmp && python3 -c "from PIL import Image; import numpy as np; im=np.asarray(Image.open('v7-final-0.png').convert('RGB')).astype(int); R,G,B=im[...,0],im[...,1],im[...,2]; m=((G>45)&(B>55)&(G>=R)).astype(float); m[0:110,0:520]=0; m[480:,820:]=0; H,W=m.shape; c=np.array([m[j*H//8:(j+1)*H//8,i*W//12:(i+1)*W//12].sum() for j in range(8) for i in range(12)]); print('occupied=%.0f%% CV=%.2f'%( (c>0).mean()*100, c.std()/(c.mean()+1e-9)))"
+# temporarily make members scatter field-wide (= uniform control), shoot, then revert
+sed -i '' 's/p.clusterRadius ?? 28/p.clusterRadius ?? 900/' src/host/gpu/wind.ts
+node .ai/tmp/myshot-v7-final.mjs    # this overwrites v7-final-*.png with the UNIFORM control
+git checkout src/host/gpu/wind.ts   # restore clustered defaults
+node .ai/tmp/myshot-v7-final.mjs    # re-shoot the real CLUSTERED frames
 ```
-Expected: `occupied` well under 100% and `CV` greater than ~1 (patchy gusts). A uniform speckle would be ~100% / CV~0.
+Crop both (`(40,360,520,600)`, NEAREST 3×) and compare by eye: the clustered crop must be visibly
+KNOTTIER (multiple streaks bunched together) with LARGER empty gaps than the evenly-spread uniform
+control. If they look the same, clustering is not reading — tune (`numClusters` down, `clusterRadius`
+down, `motesPerCluster` up to hold density) and re-shoot.
 
 ### Verify: prior wins intact
 - Small gliding-V bird dwarfed by the big EKG ridgeline terrain (chase cam keeps it centered).
