@@ -62,7 +62,7 @@ async function boot() {
   const terrain = new TerrainEKG(device, terrainShader, format, {
     rows: 64,         // stacked EKG depth rows
     cols: 256,        // samples per row (polyline resolution)
-    rowSpacing: 65,   // m between rows
+    rowSpacing: 36,   // m between rows — tight stack so the lower frame fills with EKG traces
     rowStart: -150,   // BEHIND the bird. The camera sits ~followDist behind the bird, so rows must
                       // extend back past the camera; otherwise the near-ground between camera and the
                       // first row is empty and fills the lower frame with black. Negative start fills it.
@@ -83,7 +83,7 @@ async function boot() {
     followDist: 120,
     followHeight: 55, // above the bird → look down on its back (the V reads)
     lookAhead: 160,
-    lookPitch: (16 * Math.PI) / 180, // fixed ~16° down; altitude-independent ground lock
+    lookPitch: (28 * Math.PI) / 180, // fixed ~28° down; steeper → EKG stack spreads down the frame
     smooth: 0.14,
   });
 
