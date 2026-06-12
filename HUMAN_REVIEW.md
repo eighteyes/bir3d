@@ -41,6 +41,12 @@ node .ai/tmp/myshot-bird3d.mjs
 ```
 Expected: `connected: …5174/index-bird.html`, `hero pitch (deg): 40`, overlay dump with `fps: 60`, `=== errors ===` empty. Writes `.ai/tmp/v3b-final.png` (gliding V over EKG stack, pitch 40°, ground filling the lower frame), plus `v3b-motion-0/1.png` (streaming pair) and `v3b-bank.png`.
 
+### Verify: lift-sustain (climbs on lift WITHOUT diving)
+```
+node .ai/tmp/probe-lift.mjs
+```
+Expected: a `LIFT-SUSTAIN FRAME` line with `ridge lift >0`, `vario >0`, `pitch >= 0` (e.g. lift +1.2, vario +3.2, pitch +8°, airspeed steady ~25) and `.ai/tmp/v3b-lift.png`. This is the soar — rising on the updraft, not trading airspeed in a dive/zoom. (The +40° hero frame proves ground-lock, NOT lift; in that frame the climb is a zoom-climb with airspeed bleeding and ridge lift 0.)
+
 ### Watch for
 - KNOWN LIMITATION (ship-A decision): the EKG rows are world-X-locked (built from `camOffset` only, not camera heading). At heading ~0 they read as clean horizontal stacked lines; while BANKING/TURNING they skew diagonally (`v3b-bank.png`) — geometrically-correct perspective on a world-locked feature, not a regression. If the diagonal-on-turn look is undesirable, the fix is camera-relative rows (lay each row perpendicular to camForward) — deferred pending live feedback.
 - The mid-distance line tangle is inherent to the no-fill constraint (no hidden-line removal without a fill); the only lever is far-row fade, already applied. Do not add fill.
