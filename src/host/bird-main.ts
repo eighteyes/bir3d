@@ -30,7 +30,7 @@ import { FrameLoop } from "./frameloop";
 
 // AUTOPILOT MODE (this pass): manual controls OFF — the AutoPilot flies, proving autonomous
 // soaring (find lift, ride it, never touch the ground) before flapping/controls return.
-const AUTOPILOT = true;
+let autopilot = false; // default MANUAL — YOU fly and feel the wind; press P to hand it to the autopilot
 
 const FOV_Y = (60 * Math.PI) / 180;
 const FOV_KICK = (16 * Math.PI) / 180; // extra FOV at dive ceiling — speed reads as widening view
@@ -81,19 +81,19 @@ async function boot() {
 
   const terrainShader = await fetch("/src/host/shaders/terrain_ekg.wgsl").then((r) => r.text());
   const terrain = new TerrainEKG(device, terrainShader, format, {
-    rows: 256,        // stacked EKG depth rows — enough to cover maxDist at the 4× spacing below
-    cols: 512,        // samples per row — finer ridge profiles
-    rowSpacing: 4.5,  // m between rows (18→4.5): 4× line density — ~245 visible rows inside maxDist
+    rows: 512,        // stacked EKG depth rows — covers the 2× maxDist at the same 4× spacing
+    cols: 768,        // samples per row — holds ridge detail at the wider halfWidth below
+    rowSpacing: 4.5,  // m between rows: 4× line density — ~455 visible rows inside maxDist
     rowStart: -150,   // BEHIND the camera ground point. Rows are built ahead of the camera; start a
                       // little behind so the near-ground under the camera isn't empty black.
-    halfWidth: 1500,  // horizontal extent per row (m)
-    maxDist: 950,     // CLEAN HORIZON: hard cutoff — drop rows past ~950 m so the far stack never
-                      // tangles into a horizon mess (user is fine losing far detail). ~60 visible rows.
+    halfWidth: 2400,  // horizontal extent per row (m) — at 1900 m depth the 76° dive-FOV frustum is
+                      // ~2300 m half-wide; 1500 would expose naked row ends near the new horizon.
+    maxDist: 1900,    // CLEAN HORIZON moved out 2× with the fog (950→1900) — fog still dissolves
+                      // rows before this cutoff so the far edge never shows as a shelf.
     baseline: -300,   // fill curtains drop to this world-y (occlusion only; below the frame).
     fogColor: SKY,
-    fogDensity: 1 / 550, // stronger fog (v5 700→550): far rows dissolve before they compress at the
-                         // horizon — at 2× density adjacent rows have near-zero height delta so their
-                         // curtains barely self-occlude; the fog kills the residual far-stack tangle.
+    fogDensity: 1 / 1100, // FOG EXPANDED 2× (1/550→1/1100): visibility doubles; far ridges read
+                          // much deeper before dissolving into the haze band.
   });
 
   const birdShader = await fetch("/src/host/shaders/bird3d.wgsl").then((r) => r.text());
@@ -112,8 +112,9 @@ async function boot() {
   const markerShader = await fetch("/src/host/shaders/marker.wgsl").then((r) => r.text());
   const marker = new GroundMarker(device, markerShader, format);
 
-  // hands-off soaring controller (AUTOPILOT mode) — emits the same BirdInput the mouse did.
-  const auto = new AutoPilot(terrain);
+  // hands-off flight controller (AUTOPILOT mode) — emits the same BirdInput the mouse did.
+  // "straight" policy = bird-vs-wind eval: locked heading, trim glide, deviate only near ground.
+  const auto = new AutoPilot(terrain, "straight");
 
   // Chase cam follows the bird POSITION + HEADING only (world-up, ground-locked aim). Looks DOWN
   // on the bird's back at a FIXED angle so the ground ALWAYS fills the lower frame, whatever the
@@ -156,6 +157,7 @@ async function boot() {
     if (e.code === "KeyT") {
       tunePanel.style.display = tunePanel.style.display === "none" ? "block" : "none";
     }
+    if (e.code === "KeyP") autopilot = !autopilot; // toggle hands-off autopilot <-> manual
   });
 
   // --- compass overlay canvas: large heading-vs-ground-track-vs-wind vectors (the felt-wind proof) ---
@@ -188,7 +190,7 @@ async function boot() {
 
   // Scripted pitch wobble (THIS task): auto nose up/down so the screenshot proves the camera keeps
   // the ground framed no matter how hard the BIRD pitches. Off in AUTOPILOT mode (the pilot flies).
-  (window as any).__autoWobble = !AUTOPILOT;
+  (window as any).__autoWobble = !autopilot;
   let wobbleT = 0;
 
   let frame = 0;
@@ -198,7 +200,7 @@ async function boot() {
     fps = fps * 0.9 + (1 / Math.max(dt, 1e-3)) * 0.1;
 
     // map input: AUTOPILOT flies (manual controls OFF this pass); else mouse-steer.
-    if (AUTOPILOT) {
+    if (autopilot) {
       const cmd = auto.update(bird, dt);
       input.yawRate = cmd.yawRate;
       input.pitchTarget = cmd.pitchTarget;
@@ -211,7 +213,7 @@ async function boot() {
     // scripted pitch wobble drives the bird hard up/down; the camera must NOT follow the pitch.
     // PITCH ONLY (no yaw) → heading stays 0 so the world-axis EKG rows render as clean horizontal
     // stacked lines; the wobble is purely the ground-lock proof. (manual mode only)
-    if (!AUTOPILOT && (window as any).__autoWobble) {
+    if (!autopilot && (window as any).__autoWobble) {
       wobbleT += dt;
       input.pitchTarget = Math.sin(wobbleT * 1.1) * 0.65; // sweeps near the full attitude range
       input.yawRate = 0;
@@ -228,8 +230,13 @@ async function boot() {
 
     // camera follows the bird
     cam.target = [bird.pos[0], bird.pos[1], bird.pos[2]];
-    const fwd = bird.forwardVec();
-    cam.forward = [fwd[0], fwd[1], fwd[2]];
+    // Follow the GROUND-TRACK (actual travel dir), not heading — so when wind drifts the bird it
+    // visibly CRABS in frame (nose cocked into the wind). The most legible "wind is shoving me" cue.
+    // Blend 70% toward track (shortest arc); world-up ground-lock preserved.
+    let dTrk = bird.lastGroundTrack - bird.heading;
+    dTrk = Math.atan2(Math.sin(dTrk), Math.cos(dTrk));
+    const camYaw = bird.heading + dTrk * 0.7;
+    cam.forward = [Math.sin(camYaw), 0, Math.cos(camYaw)];
     cam.update();
 
     // speed FOV kick: diving widens the view (eases, never snaps).
@@ -257,7 +264,7 @@ async function boot() {
     // wind pass: loads color+depth (no clear); drifting neon DOT motes over the ridges (depth-tested,
     // no depth-write) — advected by the bird's sim time so the drawn field matches the field that pushes.
     wind.draw(enc, colorView, depthView, viewProj, camGround, camFwd, camRight, eye,
-      bird.simTime, SKY, 1 / 700, pxW / pxH);
+      bird.simTime, SKY, 1 / 1400, pxW / pxH); // fog expanded 2× alongside the terrain's
     // bird pass: loads color+depth, depth-tested → ridges occlude the bird.
     bird.draw(enc, colorView, depthView, viewProj);
     // altitude plumb-line + ground diamond under the bird (depth-tested → ridges occlude it).
@@ -283,7 +290,7 @@ async function boot() {
     const varioStr = `${vario >= 0 ? "+" : ""}${vario.toFixed(1)}`;
     const windSpeed = Math.hypot(bird.lastWind[0], bird.lastWind[1]);
     overlay.textContent =
-      `vector-system — bird3d (soaring glider chase)${AUTOPILOT ? `   AUTO: ${auto.mode}` : ""}\n` +
+      `vector-system — bird3d (soaring glider chase)${autopilot ? `   AUTO: ${auto.mode}` : "   MANUAL (P=autopilot)"}\n` +
       `alt over terrain: ${bird.lastClearance.toFixed(0)} m   air: ${bird.lastSpeed.toFixed(0)} m/s\n` +
       `vario: ${varioStr} m/s ${vario > 0.5 ? "▲" : vario < -0.5 ? "▼" : "—"}   updraft: +${bird.lastUpdraft.toFixed(1)} m/s\n` +
       `heading: ${headingDeg.toFixed(0)}°   ground-track: ${trackDeg.toFixed(0)}°   DRIFT: ${drift >= 0 ? "+" : ""}${drift.toFixed(0)}°\n` +
