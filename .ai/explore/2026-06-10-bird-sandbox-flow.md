@@ -152,4 +152,14 @@ v7's hard clustering left big empty gaps. New model (supersedes the gaps):
 - **Longer tails overall** (lengthen the base tail beyond v7's).
 Still advected by the shared windAt; only wind.ts/wind.wgsl change. Bird/terrain/camera/physics untouched.
 
-**Done (v8):** wind fills the airspace everywhere; you read its speed from how dense and how long-tailed the streaks are — fast lanes dense and streaky, calm air faint and short.
+**Done (v8):** wind fills the airspace everywhere; you read its speed from how dense and how long-tailed the streaks are — fast lanes dense and streaky, calm air faint and short. Also fixed flight feel (4958d39): gentler sink, crisper steering, findable+capped lift.
+
+---
+
+## v9 (2026-06-12) — wind FELT on the bird + curved longer trails
+
+- **Wind INTERACTS WITH TERRAIN (the headline).** User: "i'd like to feel like the wind is interacting with the terrain." Today windAt is independent of the landscape. Make the mote flow TERRAIN-AWARE (wind.ts, which already gets sampleHeight): (a) VERTICAL — motes RISE over windward slopes and sink in lees (a vertical flow w = horizontalWind · uphill-gradient, the same ridge-lift the bird rides), so you SEE air pour up and over the ridges; (b) HORIZONTAL DEFLECTION — reduce the into-slope component near steep terrain so flow bends AROUND peaks/over crests rather than through them; optional speed-up over crests. The motes should visibly hug and climb the ridgelines. (The bird already rides this via ridge lift; the buffet below makes it felt.)
+- **Trails longer + CURVED, following the terrain-shaped flow.** User: "make the trails even longer and give them some curve." wind.ts/wind.wgsl ONLY: each mote's tail becomes a CURVED multi-segment polyline integrated along the (now terrain-shaped) flow over several steps — long curved comets that arc over the ridges and around peaks, not straight lines; even longer than v8.
+- **Wind FELT on the bird (buffeting).** User: "doesn't feel like the wind is really impacting the bird." The drift is large but STEADY, so it's not noticed. Add BUFFETING (bird3d.ts ONLY): a turbulence term that ROCKS the bird's bank (±~6-8°), BOBS it vertically (±~1.5 m/s), and SHOVES it laterally in gusts so flying feels like moving air; plus a visible LEAN/crab into the cross-wind. Keep it controllable. Verify: flying straight with no input, bank + vario OSCILLATE (buffet active) where before they were near-constant.
+
+**Done (v9):** the wind visibly pours over and around the ridges (terrain interaction); its streaks are long curved comets following that flow; and the bird rocks/bobs/crabs so you feel the moving air.

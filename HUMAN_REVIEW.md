@@ -1,5 +1,49 @@
 # Human Review Steps
 
+## Bird 3D v9 (wind↔terrain + curved tails + felt buffeting)
+**Date:** 2026-06-12
+**Commit:** 65fafdd (v9 code: wind a5eb19d/65fafdd, buffet 0d58e74); this docs-only entry committed on top
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done
+- **Wind ↔ TERRAIN.** `flowAt(x,z,t)` wraps the FROZEN `windAt` (untouched — bird import intact): (a) VERTICAL pour `w = liftGain·(horizontalWind · uphill-gradient)` from finite-diff of the Wind class's `sampleHeight` → motes rise over windward slopes, sink in lees; (b) into-slope HORIZONTAL deflection so flow bends around peaks/over crests. Each mote persists a 3D height; motes visibly hug and climb the ridgelines.
+- **Curved longer tails.** Each comet tail is a multi-segment polyline integrated along the terrain-shaped `flowAt` over ~10 steps (`tailStep` 0.5) → long curved comets arcing over ridges, not straight lines.
+- **Felt buffeting (`bird3d.ts`).** A turbulence term ROCKS render-bank ±~7°, BOBS `vel[1]` ±~1.5 m/s (vario oscillates), pulses a lateral gust SHOVE, and holds a steady CRAB lean into the cross-wind. Controllable. Exposes `window.__birdBank`.
+- **v9 tune (65fafdd):** vertical lift gain 9→3.2, tail `step` 0.1→0.5 × 10 seg, `relax` 0.1, `maxClear` 100, `densityFloor` 0.3. The pour survived this cut — verified still visible (see screenshots).
+- **Note (scope):** a pre-existing working-tree change to `src/host/bird-main.ts` (terrain EKG density: `rows` 128→256, `rowSpacing` 18→4.5 = 4× line density) is present but REMAINS UNCOMMITTED — this gate was bounded to docs only, staging the source was blocked by the scope guard, and it was NOT reverted (destructive, needs the user's decision). It is NOT a v9 wind/buffet change; it sharpens the ridge profiles and reads clean (no tangle). The captures were taken against the working tree, so they match what `npm run dev` shows today. Flagged for the user to keep or drop.
+
+### Pre-conditions
+```
+cd /Users/god/projects/ai-jank/vector-system
+```
+
+### Verify: typecheck clean
+```
+npx tsc --noEmit
+```
+Expected: exit 0, no output. (Verified 2026-06-12.)
+
+### Verify: live in browser
+```
+npm run dev
+```
+Open http://localhost:5174/index-bird.html (vite falls back to 5173 if 5174 is taken). Mouse = steer; the glider sinks by default and you hunt lift.
+
+### Verify: the look reads (fly a moment, cursor near screen-center)
+- Wind motes POUR up and over / around the ridgelines — curved streaks arc over the crests (terrain interaction), not straight horizontal lines.
+- Comet tails are LONG and CURVED, following the terrain-shaped flow.
+- The bird ROCKS/BOBS/CRABS with no input: flying straight, bank oscillates ±~7° and vario oscillates (buffet active); a steady crab lean into the cross-wind shows DRIFT (~+26°) on the compass (heading cyan vs ground-track vs wind magenta).
+- Prior wins intact: SMALL gliding-V bird dwarfed by LARGE rolling EKG ridges; ridges OCCLUDE the motes; elevation color (teal/blue valleys → magenta/white peaks); good flight (~60fps, default sink ~−2.7 m/s so you hunt lift).
+- 60fps; no `[WebGPU lost]` / `pageerror` / `console.error`.
+
+### Captured proof (this gate)
+- Driver: `.ai/tmp/myshot-bird3d-v9.mjs` (Playwright + Metal WebGPU flags, port 5174 then 5173; waits `window.__birdBooted`; pair ~0.8s apart, mouse held screen-center = no input).
+- Pair: `.ai/tmp/v9-final-0.png` / `.ai/tmp/v9-final-1.png`. Between frames the terrain streams, motes advect, and bank/vario/drift move — world is alive. Zero page errors.
+
+### Watch for
+- The pour and curved tails read best in MOTION; a still shows the curve + density but not the live climb.
+- `liftGain` (now 3.2) drives the vertical pour AND the bird's ridge-lift — lowering it further would flatten the pour toward invisible.
+
 ## Bird 3D v7 (grouped wind gusts)
 **Date:** 2026-06-11
 **Commit:** 65d811b (v7 wind code); HUMAN_REVIEW + spec on top
