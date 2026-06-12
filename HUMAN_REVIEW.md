@@ -562,3 +562,50 @@ Fly a moment with the cursor near screen-center, then confirm:
 - The wind-dot drift is invisible in a single still frame — judge the flow in MOTION (a frozen PNG shows position + density only). Sky-band dots above the terrain silhouette read as specks when frozen but as flow when moving.
 - Dot `clearance` below ~50 risks re-bunching motes under the near fill curtains (they get depth-occluded) — 55 is the readable floor now that span/glow are fixed.
 - Screenshot driver: `.ai/tmp/myshot-v5-final.mjs` (Playwright + Metal WebGPU flags, port 5174 then 5173); waits `window.__birdBooted`; final frame at `.ai/tmp/v5-final.png`.
+
+---
+
+## Bird 3D v8 (wind everywhere, speed-driven density+tail)
+**Date:** 2026-06-12
+**Commit:** 8b35b60
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done
+- **Wind EVERYWHERE (no clusters).** Dropped v7's hard mote-clustering that left big empty dark gaps. Motes (`numMotes` 4200) are now seeded UNIFORMLY across the whole camera-relative wedge (`seedMote`), so the entire airspace shows airflow. `windAt` is divergence-free, so a uniform seed STAYS uniform under advection — no clumping, no gaps. Motes that leave the wedge are boundary-WRAPPED (front/back exit → reseed near the far edge; side exit → reseed the opposite side) so coverage stays full with no mid-view pop-in.
+- **DENSITY ∝ SPEED.** Each mote gets a stable per-mote hash rank (0..1) in the shader; it survives the speed-fade only if `rank < densityFloor + (1-densityFloor)·speedFrac`. Fast air (high `|windAt|`) keeps far more motes; calm air keeps a faint floor (`densityFloor` 0.18 → ~18% survive) so wind reads EVERYWHERE, just sparser where slow. The cutoff is smoothstepped so motes fade in/out across speed contours instead of popping.
+- **TAIL LENGTH ∝ SPEED + longer base tail.** Each comet tail scales from a calm-air stub (`tailFloor` 0.2 × base) up to the full base tail in fast air. Base tail lengthened well beyond v7 (`tailMul` 40, vs v7's ~11–16) so fast lanes read as clear on-screen streaks (~52px) while calm air stays short stubs. `speedFrac` is a calibrated `smoothstep(speedLo 2, speedHi 15)` over the field's real `|windAt|` min/max so calm→fast spans the full 0..1 and the contrast reads.
+- **Net read:** fast air = dense long bright streaks; calm air = sparse faint short stubs — viewer reads SPEED off density + tail length, everywhere.
+- Same advection by the shared `windAt`; depth-test vs terrain (ridges occlude motes), additive neon, overlay compass, 60fps. NO synchronous readback in the frame loop.
+- ONLY `wind.ts` / `wind.wgsl` changed. Bird flight, camera, and terrain were NOT touched.
+
+### Pre-conditions
+```
+cd /Users/god/projects/ai-jank/vector-system
+```
+
+### Verify: typecheck clean
+```
+npx tsc --noEmit
+```
+Expected: exit 0, no output.
+
+### Verify: live in browser
+```
+npm run dev
+```
+Open http://localhost:5174/index-bird.html (vite falls back to 5173 if 5174 is taken). Mouse = steer; the glider sinks by default and you hunt lift.
+
+### Verify: the look reads
+Fly a moment with the cursor near screen-center, then confirm:
+- Wind motes fill the WHOLE airspace — left to right, near to far — with NO large empty dark regions (the v7 gap failure is gone).
+- Speed reads off the field: FAST air shows DENSE clusters of LONG bright streaks; CALM air shows SPARSE faint SHORT stubs. Density and tail length both track local wind speed.
+- Tails are clearly longer than v5/v7 — comet streaks, not dots.
+- Streaks drift in MOTION (advected by `windAt`); the compass shows heading (cyan) vs ground-track (yellow) gap with a DRIFT readout (~+27°), and the scene shifts laterally between frames.
+- Prior wins intact: small gliding-V bird against large rolling EKG ridges; ridges OCCLUDE the motes; elevation color (teal/blue valleys → magenta/white peaks); the good flight.
+- 60fps; no `[WebGPU lost]` / `pageerror` / `console.error`.
+
+### Watch for
+- The mote drift is most legible in MOTION; a single still frame shows density + tail length + direction (enough to read SPEED) but not the live flow.
+- `tailFloor` / `densityFloor` are the calm-air floors — raising them flattens the speed contrast (calm air starts to look as busy as fast air); lowering `densityFloor` toward 0 reintroduces empty gaps.
+- `speedLo` / `speedHi` are calibrated to the current `windAt` (sampled min ~0.03, max ~16.5, mean ~8.5); retuning the field (`curlAmp`/`driftAmp`) would require recalibrating these for the contrast to stay full-range.
+- Screenshot driver: `.ai/tmp/v8b-shot.mjs` (Playwright + Metal WebGPU flags, port 5174 then 5173); waits `window.__birdBooted`; captures a pair ~0.8s apart at `.ai/tmp/v8b-final-0.png` / `.ai/tmp/v8b-final-1.png`.

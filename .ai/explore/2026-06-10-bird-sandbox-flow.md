@@ -141,3 +141,15 @@ On top of v6 (bird scale done — do NOT change it). Refine ONLY the wind motes:
 - **LONGER comet tails** — lengthen the fading tails so the streaking/direction reads clearly.
 
 **Done (v7):** wind reads as drifting CLUSTERS of many tiny long-tailed motes — gusts streaking through the scene, unmistakably wind, not stars.
+
+---
+
+## v8 (2026-06-12) — wind EVERYWHERE, speed-driven density + tail length
+
+v7's hard clustering left big empty gaps. New model (supersedes the gaps):
+- **Wind EVERYWHERE** — motes cover the whole view; no large empty dark regions. The whole airspace shows airflow.
+- **density + tail length = SPEED.** BOTH encode local wind speed (`|windAt|`): where the wind is FAST → MORE motes (denser) AND LONGER tails; where SLOW → sparser AND shorter. So fast air reads as dense long streaks, slow air as faint short stubs — you read speed off the field directly. The natural spatial variation of windAt then creates gust-like structure WITHOUT hard empty gaps.
+- **Longer tails overall** (lengthen the base tail beyond v7's).
+Still advected by the shared windAt; only wind.ts/wind.wgsl change. Bird/terrain/camera/physics untouched.
+
+**Done (v8):** wind fills the airspace everywhere; you read its speed from how dense and how long-tailed the streaks are — fast lanes dense and streaky, calm air faint and short.
