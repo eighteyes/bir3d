@@ -128,4 +128,16 @@ v3 RESULT: landed well (no-fill EKG ridges, ground-locked cam, readable gliding-
 - **Wind dots → smaller + TAILS.** v5 dots read like a starfield when frozen. Make each mote SMALLER (dotPx ~11 → ~4-6) and give it a short fading COMET TAIL along the wind direction / its recent path (a few dot-widths). Motion + direction then read even in a still, and they're distinct from the sky stars. Still advected by the shared windAt.
 - **Bird-vs-terrain SCALE.** User: "the bird seems HUGE compared to the terrain." The bird is ~36 m wingspan against ~120 m relief, so it dominates the frame. Shrink the bird's world size (wingspan ~36 m → ~14-18 m) AND pull the chase camera in proportionally (reduce followDist) so the bird stays readable but is clearly a SMALL glider in a VAST landscape — the terrain should dominate, the bird a small soaring thing within it. Tune by screenshot until the proportion feels right.
 
-**Done (v6):** wind reads as small tailed motes streaking on the breeze; the bird is a small glider dwarfed by big ridgelines.
+**Done (v6):** wind reads as small tailed motes streaking on the breeze; the bird is a small glider dwarfed by big ridgelines. (Committed 0a3b3f6: bird halved + camera pulled in, dots smaller+tailed.)
+
+---
+
+## v7 (2026-06-11) — wind particles: more, smaller, GROUPED, longer tails
+
+On top of v6 (bird scale done — do NOT change it). Refine ONLY the wind motes:
+- **MORE** particles (raise the count substantially).
+- **SMALLER** (smaller than v6's already-shrunk dots).
+- **GROUPED** — cluster the motes into gusts/eddies (a set of cluster centers, each with several motes scattered in a small radius; advect clusters + members by windAt; recycle/reseed clusters ahead). The field should read as discrete gusts/packets drifting through, NOT a uniform even speckle (which read like a starfield).
+- **LONGER comet tails** — lengthen the fading tails so the streaking/direction reads clearly.
+
+**Done (v7):** wind reads as drifting CLUSTERS of many tiny long-tailed motes — gusts streaking through the scene, unmistakably wind, not stars.

@@ -1,5 +1,51 @@
 # Human Review Steps
 
+## Bird 3D v7 (grouped wind gusts)
+**Date:** 2026-06-11
+**Commit:** 65d811b (v7 wind code); HUMAN_REVIEW + spec on top
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done
+- WIND MOTES ONLY (`src/host/gpu/wind.ts`, `src/host/shaders/wind.wgsl`); bird/camera/terrain/physics untouched.
+- GROUPED INTO GUSTS: motes organized as drifting CLUSTERS — `numClusters=70` cluster centers seeded across the camera-relative span (view-wedge lateral spread), each carrying `motesPerCluster=60` motes scattered within `clusterRadius=28 m` (4200 motes total). Both centers and members advect by the SHARED `windAt`; a cluster recycles AS A UNIT (reseeded ahead, members re-scattered) when its center ages out (45 s) or leaves the span — members never recycle individually, so packets stay discrete instead of bleeding into an even speckle.
+- MORE + SMALLER: ~4200 motes (up from v6) at `dotPx=2.6` (smaller than v6's head).
+- LONGER TAILS: `tailMul=11` → comet streak ≈ 11× head width; drift direction reads in a still.
+- Keeps: advection by the same `windAt` the bird flies, depth-test against terrain (ridges occlude motes), additive neon, overlay compass. No synchronous readback in the frame loop.
+
+### Pre-conditions
+```
+cd /Users/god/projects/ai-jank/vector-system
+npm run dev
+```
+
+### Verify: page boots, 60fps, zero errors
+```
+node .ai/tmp/myshot-v7-final.mjs
+```
+Expected: `connected: ...`, telemetry lines, `=== errors === \n none`, exit 0. Saves `.ai/tmp/v7-final-0.png` and `.ai/tmp/v7-final-1.png` ~0.8s apart.
+
+### Verify: wind reads as drifting GUSTS, not a starfield
+Open the saved pair and confirm by eye:
+- Motes CLUMP into discrete gusts with dark gaps between — NOT an even all-over speckle.
+- Each mote is a tiny cyan COMET with a long fading tail, all oriented along the wind.
+- The gust field visibly SHIFTS between frame 0 and frame 1.
+
+### Verify: distribution is patchy (quantitative gust check)
+```
+cd /Users/god/projects/ai-jank/vector-system/.ai/tmp && python3 -c "from PIL import Image; import numpy as np; im=np.asarray(Image.open('v7-final-0.png').convert('RGB')).astype(int); R,G,B=im[...,0],im[...,1],im[...,2]; m=((G>45)&(B>55)&(G>=R)).astype(float); m[0:110,0:520]=0; m[480:,820:]=0; H,W=m.shape; c=np.array([m[j*H//8:(j+1)*H//8,i*W//12:(i+1)*W//12].sum() for j in range(8) for i in range(12)]); print('occupied=%.0f%% CV=%.2f'%( (c>0).mean()*100, c.std()/(c.mean()+1e-9)))"
+```
+Expected: `occupied` well under 100% and `CV` greater than ~1 (patchy gusts). A uniform speckle would be ~100% / CV~0.
+
+### Verify: prior wins intact
+- Small gliding-V bird dwarfed by the big EKG ridgeline terrain (chase cam keeps it centered).
+- Near ridge crests OCCLUDE motes and far ridge rows behind them; elevation color teal-to-magenta.
+- Glider sinks by default (`vario` negative); compass shows heading / ground-track / wind with a drift readout.
+
+### Watch for
+- A frozen PNG shows position + density only — judge cluster MOTION across the pair (or live), not a single still.
+- If motes ever read as an even speckle again: fewer clusters (`numClusters` down) for more separation, keep density via `motesPerCluster` up, tighten `clusterRadius`.
+- Screenshot driver: `.ai/tmp/myshot-v7-final.mjs` (Playwright + Metal WebGPU flags, port 5174 then 5173); waits `window.__birdBooted`.
+
 ## Bird3D — depth-to-ground cues for dramatic swoops (adaptive cam + FOV kick + plumb-line)
 **Date:** 2026-06-11
 **Commit:** working tree on top of 768af6f
