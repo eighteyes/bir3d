@@ -72,3 +72,22 @@ The v1 above was the wrong vision (flat top-down toy). User correction: **"this 
 **Architecture notes (v2):** perspective render pipeline (hand-rolled mat4 perspective/lookAt, MVP uniform, depth buffer; WebGPU NDC z∈[0,1]); ridges as true-3D walls in world space at recycling Z distances (camera perspective makes the depth); bird physics may be CPU (one bird, proto) sampling wind via async readback — no synchronous in-loop readback; GPU-aero is the scale path. Entry stays `/index-bird.html` (replaced).
 
 **Done (v2):** open `/index-bird.html` — a flapping-V neon bird flies (chase cam) over layered ridgelines receding into haze with real 3D depth; the wind nudges its flight; 60fps; no errors. Confirm the LOOK, then re-add controls/tuning.
+
+---
+
+## v3 (2026-06-11) — look dial-in: ground-locked camera, EKG terrain, glide-not-flap
+
+v2 result: terrain DEPTH read well (good) but two corrections from the user looking at it live:
+- "it looked REALLY good for a moment, then the terrain flew out of camera" → the camera lost the ground when the bird pitched.
+- "less topographic, more like a series of EKG lines indicating terrain. more stylized."
+- "lets start with a glide, no flapping, i should be able to glide."
+
+**Camera rule (hard):** the BIRD can change orientation freely (pitch/roll/bank — its mesh orients), but **the CAMERA ALWAYS SHOWS THE GROUND.** Implementation: chase cam behind+above, **world-up always** (never rolls with the bird), follows the bird's POSITION and HEADING (yaw) ONLY — it IGNORES the bird's pitch/roll for camera aim. Clamp the camera pitch so terrain always fills the lower portion of the frame; it never points at sky-only. The "terrain flew out" bug = the camera was inheriting the bird's pitch; decouple them.
+
+**Terrain restyle — EKG/waveform, not topographic. NO FILL — LINES ONLY.** Render the terrain as a **series of stacked horizontal neon trace lines** (Joy Division "Unknown Pleasures" / oscilloscope look), NOT contour iso-lines, and with **NO filled or shaded terrain surface AT ALL** — the ground is dark/empty and the terrain exists PURELY as glowing neon lines on it. The filled terrain mesh from v2 is REMOVED, not drawn-under the lines (the fill is what looked bad). Just lines on the dark ground. Each line = a horizontal polyline across the view at a fixed depth row ahead of the camera, vertically displaced by the terrain height profile along that row (the "EKG spike"). ~30–60 rows receding; near rows brighter/taller, far rows compress and fade into haze on near-black. Rows scroll/recycle as the camera advances. The SAME fBm heightfield underneath drives both the line displacement and the bird's ridge-lift — only the rendering style changes. More stylized, less map-like.
+
+**Two hard checks (user, 2026-06-11):** (a) **the horizontal lines ARE the ridges** — each line's spikes are the actual terrain ridge crests (driven by fBm), not flat/decorative scanlines. (b) **the terrain MOVES, never static** — as the glider flies forward the ridge-lines continuously STREAM toward the camera and recycle at the horizon (one continuous scrolling world). Verify motion with TWO captured frames, not one.
+
+**Bird — GLIDE, no flap:** a clean **gliding V** (wings held OUT, no flap cycle), bolder/brighter/readable than v2's hairline (thick neon ribbons, real wingspan), banks (rolls) into turns. **Flight = soaring glide, no flap thrust:** gravity + airspeed-lift (keeps it aloft) + ridge-lift/thermals (so you can sustain/gain altitude — "i should be able to glide"); steer pitch + bank with the mouse. Subtle wing flex is fine; NO flapping beats and NO flap input this pass. The new ground-locked camera (looking down at the bird's back) also makes the V read.
+
+**Done (v3):** open `/index-bird.html` — a readable gliding-V neon bird soars over stacked EKG ridgeline terrain receding into haze; the camera always keeps the ground in frame no matter how the bird pitches; you can steer and sustain a glide on lift; 60fps; no errors.

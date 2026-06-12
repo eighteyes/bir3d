@@ -1,9 +1,12 @@
 // bird3d.ts — Bird3D: one CPU-integrated 3D bird + neon flapping-V render pipeline (depth-tested).
 // Responsibilities:
-//   - Hold bird state {pos:vec3, vel:vec3, heading, pitch, bank}; integrate(dt, input, terrain):
-//     forward glide + drag, flap thrust+lift, gravity -Y, horizontal wind push (analytic curl-noise
-//     this pass — FLAGGED; fluid sampling needs async readback, deferred), RIDGE LIFT from the
-//     terrain uphill gradient (finite-diff of Terrain3D.sampleHeight), altitude clamp above ground.
+//   - Hold bird state {pos:vec3, speed (scalar airspeed), heading, pitch, bank}; integrate(dt, input):
+//     energy-exchange glider — pitch trades airspeed for altitude (dive to gain speed, pull up to
+//     zoom-climb), drag relaxes speed toward trim, base sink rate (mushes when slow), RIDGE LIFT as
+//     vertical AIR MOTION the bird rides (wind · uphill gradient, finite-diff of sampleHeight),
+//     horizontal wind drift (analytic curl-noise — FLAGGED stand-in for fluid sampling), flap as a
+//     decaying boost (speed kick + vertical surge), altitude clamp above ground.
+//   - Expose public `tuning` (live-writable) so a host overlay can slide feel parameters at runtime.
 //   - Build a procedural V mesh (body + two swept dihedral wing ribbons) as triangle strips packed
 //     to a triangle list; each vertex carries (signed spanFrac, wingFlag, edgeFrac) for shader flap.
 //   - Own the bird uniform + vertex buffer + render pipeline (bird3d.wgsl) WITH depthStencil
@@ -12,24 +15,26 @@
 //     that LOADS the terrain color+depth (no clear) — terrain must already be drawn this encoder.
 //   - forwardVec()/heading expose the chase convention (+Z forward) for the camera.
 
-import type { Terrain3D } from "./terrain";
+import type { TerrainEKG } from "./terrain";
 
 export interface BirdInput {
   yawRate: number;   // rad/s, from mouse-x offset
   pitchRate: number; // rad/s, from mouse-y offset
-  flap: boolean;     // click/Space → flap impulse this frame
 }
 
 export interface BirdTuning {
-  glideSpeed?: number;   // baseline forward airspeed (m/s)
-  drag?: number;         // velocity damping per second
-  gravity?: number;      // m/s^2 downward
-  flapThrust?: number;   // forward+up impulse per flap (m/s)
-  flapLift?: number;     // vertical component of a flap (m/s)
+  glideSpeed?: number;   // trim airspeed (m/s) — drag relaxes speed toward this
+  minSpeed?: number;     // stall floor (m/s)
+  maxSpeed?: number;     // dive ceiling (m/s)
+  dragK?: number;        // per-second relaxation of airspeed toward trim
+  divePower?: number;    // scale on gravity-along-path energy exchange (dive↔zoom)
+  gravity?: number;      // m/s^2 — only enters via sin(pitch) energy exchange + sink
+  sinkRate?: number;     // base sink at trim speed (m/s); scales (trim/speed)^2 when slow
   windGain?: number;     // analytic wind push scale
-  liftGain?: number;     // ridge-lift scale
-  flapHz?: number;       // wingbeat frequency
-  flapAmp?: number;      // max flap angle (rad)
+  windDrift?: number;    // fraction of horizontal wind the bird drifts with
+  liftGain?: number;     // ridge updraft scale (vertical air-motion m/s per unit wind·slope)
+  flexHz?: number;       // subtle wing-flex frequency (NOT a flap beat)
+  flexAmp?: number;      // subtle wing-flex amplitude (rad) — wings held OUT, no flap cycle
   minClearance?: number; // min meters above terrain
 }
 
@@ -41,26 +46,20 @@ const UNIFORM_BYTES = 96;  // mat4(64) + pos(12)+flapPhase(4) + heading,bank,fla
 export class Bird3D {
   pos: Vec3;
   vel: Vec3 = [0, 0, 18];
+  speed = 26;    // scalar airspeed (m/s) — the energy store
   heading = 0;   // yaw, +Z forward at 0
   pitch = 0;     // radians, + = nose up
   bank = 0;      // roll, banks into turns
   private time = 0;
 
-  private glideSpeed: number;
-  private drag: number;
-  private gravity: number;
-  private flapThrust: number;
-  private flapLift: number;
-  private windGain: number;
-  private liftGain: number;
-  private flapHz: number;
-  private flapAmp: number;
-  private minClearance: number;
+  tuning: Required<BirdTuning>;
 
   // latest derived telemetry for the overlay
   lastWind: [number, number] = [0, 0];
   lastSpeed = 0;
   lastClearance = 0;
+  lastVario = 0;   // vertical speed (m/s)
+  lastUpdraft = 0; // ridge updraft being ridden (m/s)
 
   private vbuf: GPUBuffer;
   private vertexCount: number;
@@ -74,21 +73,26 @@ export class Bird3D {
     private device: GPUDevice,
     shader: string,
     colorFormat: GPUTextureFormat,
-    private terrain: Terrain3D,
+    private terrain: TerrainEKG,
     startPos: Vec3 = [0, 200, 0],
     t: BirdTuning = {}
   ) {
     this.pos = startPos;
-    this.glideSpeed = t.glideSpeed ?? 26;
-    this.drag = t.drag ?? 0.6;
-    this.gravity = t.gravity ?? 9.0;
-    this.flapThrust = t.flapThrust ?? 14;
-    this.flapLift = t.flapLift ?? 16;
-    this.windGain = t.windGain ?? 6;
-    this.liftGain = t.liftGain ?? 0.5;
-    this.flapHz = t.flapHz ?? 2.4;
-    this.flapAmp = t.flapAmp ?? 0.55; // shallower beat → reads as a flapping V, not a deep U
-    this.minClearance = t.minClearance ?? 20;
+    this.tuning = {
+      glideSpeed: t.glideSpeed ?? 26,
+      minSpeed: t.minSpeed ?? 13,
+      maxSpeed: t.maxSpeed ?? 55,
+      dragK: t.dragK ?? 0.4,
+      divePower: t.divePower ?? 0.9,
+      gravity: t.gravity ?? 9.0,
+      sinkRate: t.sinkRate ?? 1.4,
+      windGain: t.windGain ?? 6,
+      windDrift: t.windDrift ?? 1.0,
+      liftGain: t.liftGain ?? 2.2,
+      flexHz: t.flexHz ?? 0.6,   // slow, subtle flex — wings stay OUT (no flap beat)
+      flexAmp: t.flexAmp ?? 0.06, // tiny → static gliding V
+      minClearance: t.minClearance ?? 6,
+    };
 
     const meshArr = buildVMesh(); // number[]
     this.vertexCount = meshArr.length / FLOATS_PER_VERT;
@@ -161,12 +165,13 @@ export class Bird3D {
     // wind = curl of scalar potential = (dPot/dz, -dPot/dx)
     const dz = (pot(x, z + e) - pot(x, z - e)) / (2 * e);
     const dx = (pot(x + e, z) - pot(x - e, z)) / (2 * e);
-    return [dz * this.windGain * 200, -dx * this.windGain * 200];
+    return [dz * this.tuning.windGain * 200, -dx * this.tuning.windGain * 200];
   }
 
-  integrate(dt: number, input: BirdInput, _terrain?: Terrain3D): void {
+  integrate(dt: number, input: BirdInput): void {
     this.time += dt;
     const clamped = Math.min(dt, 1 / 20);
+    const T = this.tuning;
 
     // --- steering: mouse offsets drive yaw & pitch rate; bank eases toward yaw rate ---
     this.heading += input.yawRate * clamped;
@@ -176,64 +181,54 @@ export class Bird3D {
     this.bank += (targetBank - this.bank) * Math.min(1, clamped * 4);
 
     const fwd = this.forwardVec();
-
-    // --- forward glide toward target airspeed along heading+pitch ---
     const dir: Vec3 = [
       fwd[0] * Math.cos(this.pitch),
       Math.sin(this.pitch),
       fwd[2] * Math.cos(this.pitch),
     ];
-    // accelerate velocity toward glide along the look direction
-    const accel = 6;
-    this.vel[0] += (dir[0] * this.glideSpeed - this.vel[0]) * Math.min(1, clamped * accel * 0.16);
-    this.vel[1] += (dir[1] * this.glideSpeed - this.vel[1]) * Math.min(1, clamped * accel * 0.16);
-    this.vel[2] += (dir[2] * this.glideSpeed - this.vel[2]) * Math.min(1, clamped * accel * 0.16);
 
-    // --- flap: forward thrust + vertical lift impulse ---
-    if (input.flap) {
-      this.vel[0] += dir[0] * this.flapThrust;
-      this.vel[2] += dir[2] * this.flapThrust;
-      this.vel[1] += this.flapLift;
-    }
+    // --- airspeed energy exchange: gravity along the flight path + drag toward trim ---
+    // pitch down → speed builds; pull up → speed bleeds into climb (zoom). This is the soar.
+    this.speed +=
+      (-T.gravity * Math.sin(this.pitch) * T.divePower -
+        T.dragK * (this.speed - T.glideSpeed)) *
+      clamped;
 
-    // --- gravity ---
-    this.vel[1] -= this.gravity * clamped;
+    // GLIDE, NO FLAP: no thrust input this pass. Airspeed is sustained by the dive↔zoom energy
+    // exchange above and bled by drag toward trim; lift comes from glide + ridge updraft below.
+    this.speed = Math.max(T.minSpeed, Math.min(T.maxSpeed, this.speed));
 
-    // --- horizontal wind push (analytic curl-noise, FLAGGED) ---
+    // --- wind + ridge updraft: vertical air motion the bird RIDES ---
     const [wx, wz] = this.windAt(this.pos[0], this.pos[2]);
     this.lastWind = [wx, wz];
-    this.vel[0] += wx * clamped;
-    this.vel[2] += wz * clamped;
-
-    // --- RIDGE LIFT: wind into an uphill slope → upward velocity ---
     const eps = 6;
     const hC = this.terrain.sampleHeight(this.pos[0], this.pos[2]);
     const hX = this.terrain.sampleHeight(this.pos[0] + eps, this.pos[2]);
     const hZ = this.terrain.sampleHeight(this.pos[0], this.pos[2] + eps);
-    // uphill gradient (points toward rising terrain)
-    const gx = (hX - hC) / eps;
+    const gx = (hX - hC) / eps; // uphill gradient
     const gz = (hZ - hC) / eps;
     const into = wx * gx + wz * gz; // wind · uphill
-    const lift = Math.max(0, into) * this.liftGain;
-    this.vel[1] += lift * clamped;
+    const updraft = Math.max(0, into) * T.liftGain;
+    this.lastUpdraft = updraft;
 
-    // --- drag ---
-    const d = Math.max(0, 1 - this.drag * clamped);
-    this.vel[0] *= d; this.vel[1] *= d; this.vel[2] *= d;
+    // --- sink: minimal at trim, mushes quadratically when slow (stall teaches itself) ---
+    const sink = T.sinkRate * (T.glideSpeed / this.speed) ** 2;
 
-    // --- integrate position ---
+    // --- compose velocity: flight path + horizontal wind drift + ridge updraft − sink ---
+    this.vel[0] = dir[0] * this.speed + wx * T.windDrift;
+    this.vel[1] = dir[1] * this.speed + updraft - sink;
+    this.vel[2] = dir[2] * this.speed + wz * T.windDrift;
+
     this.pos[0] += this.vel[0] * clamped;
     this.pos[1] += this.vel[1] * clamped;
     this.pos[2] += this.vel[2] * clamped;
 
     // --- altitude clamp above terrain ---
-    const floorY = hC + this.minClearance;
-    if (this.pos[1] < floorY) {
-      this.pos[1] = floorY;
-      if (this.vel[1] < 0) this.vel[1] = 0;
-    }
+    const floorY = hC + T.minClearance;
+    if (this.pos[1] < floorY) this.pos[1] = floorY;
 
-    this.lastSpeed = Math.hypot(this.vel[0], this.vel[1], this.vel[2]);
+    this.lastSpeed = this.speed;
+    this.lastVario = this.vel[1];
     this.lastClearance = this.pos[1] - hC;
   }
 
@@ -246,11 +241,11 @@ export class Bird3D {
     const u = this.uniformF32;
     u.set(viewProj, 0);                 // [0..16)
     u[16] = this.pos[0]; u[17] = this.pos[1]; u[18] = this.pos[2];
-    u[19] = this.time * this.flapHz * Math.PI * 2; // flapPhase
+    u[19] = this.time * this.tuning.flexHz * Math.PI * 2; // flexPhase (subtle, not a flap beat)
     u[20] = this.heading;
     u[21] = this.bank;
-    u[22] = this.flapHz;
-    u[23] = this.flapAmp;
+    u[22] = this.tuning.flexHz;
+    u[23] = this.tuning.flexAmp;
     this.device.queue.writeBuffer(this.ubuf, 0, this.uniformHost);
 
     // SECOND pass: LOAD terrain color+depth (no clear) so the bird composites over the ridges
@@ -275,12 +270,12 @@ export class Bird3D {
 // Local frame: +X right, +Y up, +Z forward (heading). Wings sweep back (-Z) toward the tips.
 function buildVMesh(): number[] {
   const verts: number[] = [];
-  const SPAN = 12;     // half-wingspan (m) → ~24m tip-to-tip, reads at followDist 80
-  const SWEEP = 5;     // how far back the tip sits (-Z)
-  const DIHEDRAL = 7;  // tip rise (m) at full span → clear static V even mid-flap
-  const RIBBON = 1.8;  // ribbon half-width (m)
-  const BODY_LEN = 8;  // body spine length (m)
-  const BODY_W = 1.2;
+  const SPAN = 18;     // half-wingspan (m) → ~36m tip-to-tip, bold + readable at followDist 120
+  const SWEEP = 6;     // how far back the tip sits (-Z)
+  const DIHEDRAL = 9;  // tip rise (m) at full span → clear static gliding V
+  const RIBBON = 3.2;  // ribbon half-width (m) — bold neon, not a hairline
+  const BODY_LEN = 11; // body spine length (m)
+  const BODY_W = 2.0;
 
   // push a quad (two tris) as a ribbon between two centerline points pA,pB.
   // attr = (signed spanFrac, wingFlag, edgeFrac); edgeFrac 0/1 marks ribbon edges.

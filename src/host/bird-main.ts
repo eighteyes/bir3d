@@ -1,16 +1,19 @@
-// bird-main.ts — 3D flapping-V bird over the neon ridgeline terrain. Entry for /index-bird.html.
+// bird-main.ts — 3D gliding bird over the neon ridgeline terrain. Entry for /index-bird.html.
 // Responsibilities:
 //   - Acquire device; configure canvas color + matching depth target (recreate on resize).
-//   - Build Terrain3D (neon ridgeline) and Bird3D (CPU-integrated flapping-V); ChaseCamera follows
+//   - Build TerrainEKG (neon ridgeline) and Bird3D (CPU-integrated glider); ChaseCamera follows
 //     the BIRD: target=bird.pos, forward=bird.forwardVec(), camOffset=(bird.x,bird.z) so the terrain
 //     grid recenters under the bird.
-//   - ONE control: mouse-steer (cursor offset from screen-center → yaw+pitch rate); click/Space=flap.
+//   - ONE control: mouse-steer (cursor offset from screen-center → yaw+pitch rate). Pure glide —
+//     dive to gain speed, pull up to zoom-climb, ride ridge lift to stay aloft. No flap input.
 //   - Per frame (one encoder, one submit): read input → bird.integrate → camera follow → viewProj;
 //     terrain.draw (clears color+depth) → bird.draw (LOADS color+depth, second pass, depth-tested).
-//   - Overlay: altitude-over-terrain, speed, heading, wind, fps. Expose window.__birdBooted.
+//   - Overlay: altitude-over-terrain, airspeed, vario (climb m/s), ridge lift, heading, wind, fps.
+//   - Tuning panel ('T' toggles): live sliders writing straight into bird.tuning (feel dial-in).
+//   - Expose window.__birdBooted.
 
 import { acquireDevice } from "./gpu/device";
-import { Terrain3D } from "./gpu/terrain";
+import { TerrainEKG } from "./gpu/terrain";
 import { Bird3D, type BirdInput } from "./gpu/bird3d";
 import { ChaseCamera } from "./gpu/camera";
 import { perspective, multiply } from "./gpu/mat4";
@@ -20,10 +23,9 @@ const FOV_Y = (60 * Math.PI) / 180;
 const NEAR = 1;
 const FAR = 12000;
 
-// Dark hazy-horizon sky / fog color. Terrain fog mixes toward this; clear color == fog color.
-// Dim indigo (not pure black) so receding ridges dissolve into a visible haze band at the horizon
-// and the grid's far edge is hidden. Kept low to respect the brightness cap (fills the screen).
-const SKY: [number, number, number] = [0.06, 0.05, 0.12];
+// Near-black ground/haze. Clear color == fog color. The terrain exists PURELY as glowing lines on
+// this dark ground (NO fill); far lines fade into this haze. Very dark so the neon lines read.
+const SKY: [number, number, number] = [0.01, 0.012, 0.03];
 
 // Mouse-steer gains: cursor offset from screen-center (normalized -1..1) → rate.
 const YAW_GAIN = 1.1;   // rad/s at full deflection
@@ -56,12 +58,15 @@ async function boot() {
     usage: GPUTextureUsage.RENDER_ATTACHMENT,
   });
 
-  const terrainShader = await fetch("/src/host/shaders/terrain3d.wgsl").then((r) => r.text());
-  const terrain = new Terrain3D(device, terrainShader, format, {
-    n: 201,
-    cellSize: 24,
+  const terrainShader = await fetch("/src/host/shaders/terrain_ekg.wgsl").then((r) => r.text());
+  const terrain = new TerrainEKG(device, terrainShader, format, {
+    rows: 56,         // stacked EKG depth rows
+    cols: 256,        // samples per row (polyline resolution)
+    rowSpacing: 70,   // m between rows
+    rowStart: 30,     // nearest row just ahead
+    halfWidth: 1500,  // horizontal extent per row (m)
     fogColor: SKY,
-    fogDensity: 1 / 700, // denser: far ridges haze into the horizon band sooner (hide grid edge)
+    fogDensity: 1 / 1400, // far lines dissolve into the dark haze
   });
 
   const birdShader = await fetch("/src/host/shaders/bird3d.wgsl").then((r) => r.text());
@@ -69,34 +74,46 @@ async function boot() {
   // start moderately low so near crests can cross in front of the bird (occlusion reads).
   const bird = new Bird3D(device, birdShader, format, terrain, [0, startH + 55, 0]);
 
-  // Chase cam follows the bird: behind + slightly above, looking ahead/slightly down.
+  // Chase cam follows the bird POSITION + HEADING only (world-up, ground-locked aim). Looks DOWN
+  // on the bird's back at a FIXED angle so the ground ALWAYS fills the lower frame, whatever the
+  // bird's pitch — this is the v3 ground-lock fix.
   const cam = new ChaseCamera({
-    followDist: 110, // crest more often sits between camera and bird (occlusion); <140 keeps eye clear
-    followHeight: 9, // low eye → flat sightline so foreground crests cross above the bird (occlusion)
-    lookAhead: 140,
+    followDist: 120,
+    followHeight: 55, // above the bird → look down on its back (the V reads)
+    lookAhead: 160,
+    lookPitch: (16 * Math.PI) / 180, // fixed ~16° down; altitude-independent ground lock
     smooth: 0.14,
-    cruiseHeight: 0, // unused: target set explicitly to bird.pos each frame
-    lookDrop: 6,     // near-level pitch
   });
 
-  // --- input: mouse-steer + flap ---
-  const input: BirdInput = { yawRate: 0, pitchRate: 0, flap: false };
+  // --- input: mouse-steer only (pure glide) ---
+  const input: BirdInput = { yawRate: 0, pitchRate: 0 };
   // normalized cursor offset from screen-center (-1..1); start centered (no steer before first move).
   let mouseX = 0, mouseY = 0;
-  let flapHeld = false;
-  let flapTap = false;
 
   canvas.addEventListener("mousemove", (e) => {
     const r = canvas.getBoundingClientRect();
     mouseX = ((e.clientX - r.left) / r.width) * 2 - 1;  // -1..1
     mouseY = ((e.clientY - r.top) / r.height) * 2 - 1;  // -1..1
   });
-  canvas.addEventListener("mousedown", () => { flapTap = true; flapHeld = true; });
-  window.addEventListener("mouseup", () => { flapHeld = false; });
+
+  // --- tuning panel: sliders write straight into bird.tuning; 'T' toggles visibility ---
+  const tunePanel = buildTunePanel(bird.tuning, [
+    ["glideSpeed", 14, 40, 0.5],
+    ["sinkRate", 0.3, 4, 0.1],
+    ["divePower", 0.2, 2, 0.05],
+    ["dragK", 0.1, 1.5, 0.05],
+    ["liftGain", 0, 6, 0.1],
+    ["windGain", 0, 15, 0.5],
+    ["windDrift", 0, 2, 0.1],
+    ["minSpeed", 8, 20, 0.5],
+    ["maxSpeed", 30, 80, 1],
+  ]);
+  document.body.appendChild(tunePanel);
   window.addEventListener("keydown", (e) => {
-    if (e.code === "Space") { e.preventDefault(); flapTap = true; flapHeld = true; }
+    if (e.code === "KeyT") {
+      tunePanel.style.display = tunePanel.style.display === "none" ? "block" : "none";
+    }
   });
-  window.addEventListener("keyup", (e) => { if (e.code === "Space") flapHeld = false; });
 
   const applyDead = (v: number) =>
     Math.abs(v) < DEADZONE ? 0 : (v - Math.sign(v) * DEADZONE) / (1 - DEADZONE);
@@ -115,6 +132,11 @@ async function boot() {
   };
   window.addEventListener("resize", resize);
 
+  // Scripted pitch wobble (THIS task): auto nose up/down so the screenshot proves the camera keeps
+  // the ground framed no matter how hard the BIRD pitches. window.__autoWobble defaults on.
+  (window as any).__autoWobble = true;
+  let wobbleT = 0;
+
   let frame = 0;
   let fps = 0;
   const loop = new FrameLoop((dt) => {
@@ -123,8 +145,13 @@ async function boot() {
     // map input
     input.yawRate = applyDead(mouseX) * YAW_GAIN;
     input.pitchRate = -applyDead(mouseY) * PITCH_GAIN; // mouse-up = nose-up
-    input.flap = flapTap || flapHeld;
-    flapTap = false;
+
+    // scripted pitch wobble drives the bird hard up/down; the camera must NOT follow the pitch.
+    if ((window as any).__autoWobble) {
+      wobbleT += dt;
+      input.pitchRate = Math.sin(wobbleT * 1.1) * PITCH_GAIN * 1.6; // exceeds manual range → hard pitch
+      input.yawRate = Math.sin(wobbleT * 0.37) * YAW_GAIN * 0.4;    // gentle weave so depth/bank read
+    }
 
     bird.integrate(dt, input);
 
@@ -155,16 +182,54 @@ async function boot() {
     (window as any).__birdPos = bird.pos;
     frame++;
     const headingDeg = ((bird.heading * 180) / Math.PI) % 360;
+    const vario = bird.lastVario;
+    const varioStr = `${vario >= 0 ? "+" : ""}${vario.toFixed(1)}`;
     overlay.textContent =
-      `vector-system — bird3d (flapping-V chase)\n` +
-      `alt over terrain: ${bird.lastClearance.toFixed(0)} m   speed: ${bird.lastSpeed.toFixed(0)} m/s\n` +
+      `vector-system — bird3d (soaring glider chase)\n` +
+      `alt over terrain: ${bird.lastClearance.toFixed(0)} m   air: ${bird.lastSpeed.toFixed(0)} m/s\n` +
+      `vario: ${varioStr} m/s ${vario > 0.5 ? "▲" : vario < -0.5 ? "▼" : "—"}   ridge lift: +${bird.lastUpdraft.toFixed(1)} m/s\n` +
       `heading: ${headingDeg.toFixed(0)}°   pitch: ${((bird.pitch * 180) / Math.PI).toFixed(0)}°   bank: ${((bird.bank * 180) / Math.PI).toFixed(0)}°\n` +
       `wind: ${bird.lastWind[0].toFixed(1)}, ${bird.lastWind[1].toFixed(1)} m/s\n` +
-      `fps: ${fps.toFixed(0)}   frame ${frame}   (mouse=steer, click/Space=flap)`;
+      `fps: ${fps.toFixed(0)}   frame ${frame}   (mouse=steer: down=dive/speed, up=zoom-climb, T=tuning)`;
   });
 
   loop.start();
   (window as any).__birdBooted = true;
+}
+
+// Build a floating slider panel bound directly to a live tuning object.
+// rows: [key, min, max, step][] — each slider writes tuning[key] on input.
+function buildTunePanel(
+  tuning: Record<string, number>,
+  rows: [string, number, number, number][]
+): HTMLDivElement {
+  const panel = document.createElement("div");
+  panel.id = "tune";
+  panel.style.cssText =
+    "position:fixed;right:12px;top:12px;display:none;padding:10px 12px;" +
+    "background:rgba(8,6,20,0.85);border:1px solid #3a3360;border-radius:6px;" +
+    "font:12px/1.6 monospace;color:#9fe8ff;z-index:10;min-width:240px;";
+  for (const [key, min, max, step] of rows) {
+    const row = document.createElement("div");
+    const label = document.createElement("span");
+    const val = document.createElement("span");
+    const slider = document.createElement("input");
+    slider.type = "range";
+    slider.min = String(min);
+    slider.max = String(max);
+    slider.step = String(step);
+    slider.value = String(tuning[key]);
+    slider.style.cssText = "width:110px;vertical-align:middle;margin:0 6px;";
+    label.textContent = key.padEnd(11);
+    val.textContent = String(tuning[key]);
+    slider.addEventListener("input", () => {
+      tuning[key] = Number(slider.value);
+      val.textContent = slider.value;
+    });
+    row.append(label, slider, val);
+    panel.appendChild(row);
+  }
+  return panel;
 }
 
 boot().catch((e) => {

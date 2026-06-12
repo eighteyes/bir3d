@@ -1,26 +1,28 @@
-// camera.ts — ChaseCamera: smooth deadzone follow behind+above a target, looking forward.
+// camera.ts — ChaseCamera: ground-locked follow behind+above a target, world-up always.
 // Responsibilities:
-//   - Hold a target world position + forward heading; per FACTS compute
-//     eye = target - forward*followDist + worldUp*followHeight,
-//     lookAt = target + forward*lookAhead (worldUp = (0,1,0)).
-//   - Smooth: lerp eye/lookTarget toward their goals each frame (deadzone lets the subject drift).
-//   - For THIS task: autoAdvance(dt) walks the target forward over the terrain so the shot shows
-//     depth/motion. camOffset() returns (target.x, target.z) for the terrain grid recentering.
-//   - viewMatrix(): lookAt(eye, lookTarget, up); the host multiplies proj*view.
+//   - Decouple from the bird's pitch/roll: camForward = horizontal(yaw only) = (sin(yaw),0,cos(yaw)).
+//     The camera follows the target POSITION and HEADING only; it ignores bird pitch/roll.
+//   - eye = target - camForward*followDist + worldUp*followHeight (worldUp = (0,1,0) ALWAYS).
+//   - Aim DOWN at a FIXED downward angle (lookPitch) independent of the bird's altitude so the
+//     ground ALWAYS fills the lower frame and the camera NEVER points at sky-only:
+//     aimY = eye.y - lookAhead*tan(lookPitch).
+//   - Smooth: lerp eye/lookTarget toward their goals each frame.
+//   - camOffset() returns (target.x, target.z) for the terrain grid/heightfield recentering.
+//   - viewMatrix(): lookAt(eye, lookTarget, worldUp); the host multiplies proj*view.
 
 import { lookAt, lerp, type Mat4, type Vec3 } from "./mat4";
 
 export interface ChaseParams {
   followDist?: number;
   followHeight?: number;
-  lookAhead?: number;
+  lookAhead?: number;     // horizontal distance ahead the aim point sits
+  lookPitch?: number;     // fixed downward look angle (rad); altitude-independent ground lock
   smooth?: number;        // 0..1 lerp factor per frame
-  cruiseHeight?: number;  // target rides at this world y (≈ crest height) so the look stays level
-  lookDrop?: number;      // how far below cruise the look-target sits (sets the small downward pitch)
 }
 
 export class ChaseCamera {
   target: Vec3 = [0, 0, 0];
+  // forward is set by the host from the bird HEADING only (yaw); it is horizontal by construction.
   forward: Vec3 = [0, 0, 1]; // +z = north
   private eye: Vec3 = [0, 100, -120];
   private lookTarget: Vec3 = [0, 0, 200];
@@ -28,50 +30,47 @@ export class ChaseCamera {
   followDist: number;
   followHeight: number;
   lookAhead: number;
+  lookPitch: number;
   smooth: number;
-  cruiseHeight: number;
-  lookDrop: number;
-  speed = 55; // m/s forward auto-advance for the shot
 
   constructor(p: ChaseParams = {}) {
     this.followDist = p.followDist ?? 120;
-    this.followHeight = p.followHeight ?? 70;
-    this.lookAhead = p.lookAhead ?? 200;
-    this.smooth = p.smooth ?? 0.12;
-    this.cruiseHeight = p.cruiseHeight ?? 200;
-    this.lookDrop = p.lookDrop ?? 60;
-    this.target = [0, this.cruiseHeight, 0];
+    this.followHeight = p.followHeight ?? 55;
+    this.lookAhead = p.lookAhead ?? 160;
+    this.lookPitch = p.lookPitch ?? (16 * Math.PI) / 180; // ~16° down → ground fills lower ~75% of frame
+    this.smooth = p.smooth ?? 0.14;
   }
 
-  // Walk the target forward over the terrain (this-task auto motion).
-  autoAdvance(dt: number): void {
-    this.target = [
-      this.target[0] + this.forward[0] * this.speed * dt,
-      this.target[1],
-      this.target[2] + this.forward[2] * this.speed * dt,
-    ];
-  }
-
-  // Recompute goal eye/lookTarget and ease toward them.
+  // Recompute goal eye/lookTarget (world-up, fixed downward angle) and ease toward them.
   update(): void {
-    const up: Vec3 = [0, 1, 0];
+    // camForward is horizontal (yaw only); flatten any stray Y and renormalize defensively.
+    const fx = this.forward[0];
+    const fz = this.forward[2];
+    const fl = Math.hypot(fx, fz) || 1;
+    const hx = fx / fl;
+    const hz = fz / fl;
+
     const goalEye: Vec3 = [
-      this.target[0] - this.forward[0] * this.followDist,
+      this.target[0] - hx * this.followDist,
       this.target[1] + this.followHeight,
-      this.target[2] - this.forward[2] * this.followDist,
+      this.target[2] - hz * this.followDist,
     ];
+
+    // Aim at a point lookAhead in front of the EYE (horizontal), dropped by a FIXED angle.
+    // This is independent of the bird's altitude, so the ground stays framed no matter the pitch.
+    const drop = this.lookAhead * Math.tan(this.lookPitch);
     const goalLook: Vec3 = [
-      this.target[0] + this.forward[0] * this.lookAhead,
-      this.target[1] - this.lookDrop, // small downward pitch toward the ridge field
-      this.target[2] + this.forward[2] * this.lookAhead,
+      goalEye[0] + hx * this.lookAhead,
+      goalEye[1] - drop,
+      goalEye[2] + hz * this.lookAhead,
     ];
+
     this.eye = lerp(this.eye, goalEye, this.smooth);
     this.lookTarget = lerp(this.lookTarget, goalLook, this.smooth);
-    void up;
   }
 
   viewMatrix(): Mat4 {
-    return lookAt(this.eye, this.lookTarget, [0, 1, 0]);
+    return lookAt(this.eye, this.lookTarget, [0, 1, 0]); // world-up ALWAYS
   }
 
   getEye(): Vec3 { return [this.eye[0], this.eye[1], this.eye[2]]; }
