@@ -8,12 +8,14 @@
 //     (src/host/gpu/fluid.ts), which is compute-only and would need frame-laggy async readback +
 //     a grid→world mapping and STILL need a closed form for advection/overlay; the analytic field
 //     keeps one coherent, arbitrarily-sampleable source so the field you SEE is the field that PUSHES.
-//   - Wind: a render pipeline (wind.wgsl) that draws a field of drifting neon DOT particles over the
+//   - Wind: a render pipeline (wind.wgsl) that draws a field of drifting neon COMET motes over the
 //     terrain. Each mote's WORLD position is PERSISTED and advected every frame by windAt (p += w*dt),
-//     so the dots literally drift on the wind (motion + density = the flow). Motes that age out or
-//     leave the camera-relative span are recycled ahead. Rendered as additive billboard quads,
-//     depth-tested against terrain (ridges occlude them). NOT regenerated each frame — that would
-//     freeze them in place; persistence is what makes them move.
+//     so the dots literally drift on the wind (motion + density = the flow). Each mote is a small
+//     comet — a quad stretched along the screen-space wind direction with a bright head and a fading
+//     tail — so drift + direction read even in a still frame and the motes stay distinct from the sky
+//     stars. Motes that age out or leave the camera-relative span are recycled ahead. Rendered as
+//     additive billboards, depth-tested against terrain (ridges occlude them). NOT regenerated each
+//     frame — that would freeze them in place; persistence is what makes them move.
 //   - thermalAt(x,z,t): explicit vertical updraft (m/s) the bird rides — a few broad thermals so the
 //     vario reads clearly positive somewhere, independent of ridge-lift geometry.
 
@@ -93,7 +95,8 @@ interface DotParams {
   spanBehind?: number;// margin behind the camera before a mote is recycled (m)
   spanWide?: number;  // half-width of the camera-relative field (m)
   clearance?: number; // meters above terrain the motes float
-  dotPx?: number;     // on-screen dot diameter (px) — converted to NDC half-extent per frame
+  dotPx?: number;     // on-screen comet head diameter (px) — converted to NDC half-width per frame
+  tailMul?: number;   // streak length as a multiple of the head width (comet tail length)
 }
 
 export class Wind {
@@ -104,6 +107,7 @@ export class Wind {
   private spanWide: number;
   private clearance: number;
   private dotPx: number;
+  private tailMul: number;
 
   // PERSISTENT world-space particle state (NOT regenerated each frame — that is what makes them drift).
   private px: Float32Array;   // world x
@@ -123,8 +127,8 @@ export class Wind {
   private lastTime = -1;       // for per-frame dt derivation from bird.simTime
   private seeded = false;      // first draw seeds the field around the camera span
 
-  // floats/vertex: center.xyz(3) + corner.xy(2) + speedFrac(1) = 6
-  private static FPV = 6;
+  // floats/vertex: center.xyz(3) + corner.xy(2) + speedFrac(1) + windDir.xy(2) = 8
+  private static FPV = 8;
   // fixed quad corners (two tris) reused for every mote.
   private static CORNERS: ReadonlyArray<[number, number]> = [
     [-1, -1], [1, -1], [1, 1],
@@ -150,7 +154,10 @@ export class Wind {
     // occlude low dots) but LOW enough to hug the ridges — too high lifts them into the pure-sky band
     // above the terrain silhouette where they conflict with the starfield. 55 is the readable middle.
     this.clearance = p.clearance ?? 55;
-    this.dotPx = p.dotPx ?? 11;
+    // smaller head than v5 (11 → 5) so motes read as streaking comets, not star-like blobs.
+    this.dotPx = p.dotPx ?? 5;
+    // tail a few head-widths long → drift direction reads even in a still frame.
+    this.tailMul = p.tailMul ?? 5;
 
     this.px = new Float32Array(this.count);
     this.pz = new Float32Array(this.count);
@@ -165,7 +172,7 @@ export class Wind {
     });
 
     // uniform: mat4 viewProj(16) + eye.xyz(3) + aspect(1) + fogColor.rgb(3) + fogDensity(1)
-    //          + dotSize(1) + pad(3) = 28
+    //          + dotSize(1) + tailLen(1) + pad(2) = 28
     this.uniformHost = new ArrayBuffer(28 * 4);
     this.uniformF32 = new Float32Array(this.uniformHost);
     this.ubuf = device.createBuffer({
@@ -184,8 +191,9 @@ export class Wind {
             arrayStride: Wind.FPV * 4,
             attributes: [
               { shaderLocation: 0, offset: 0, format: "float32x3" },  // world center
-              { shaderLocation: 1, offset: 12, format: "float32x2" }, // quad corner ±1
+              { shaderLocation: 1, offset: 12, format: "float32x2" }, // quad corner ±1 (along, perp)
               { shaderLocation: 2, offset: 20, format: "float32" },   // speedFrac
+              { shaderLocation: 3, offset: 24, format: "float32x2" }, // windDir.xz at the mote
             ],
           },
         ],
@@ -278,16 +286,22 @@ export class Wind {
         this.pz[i] = z;
       }
 
-      const sp = Math.min(1, Math.hypot(wx, wz) / (refSpeed * 1.4));
+      const wspeed = Math.hypot(wx, wz);
+      const sp = Math.min(1, wspeed / (refSpeed * 1.4));
       this.speedFrac[i] = sp;
       const y = this.sampleHeight(x, z) + this.clearance;
+      // unit wind direction (world XZ) → orients the comet streak in screen space (VS projects it).
+      const inv = wspeed > 1e-4 ? 1 / wspeed : 0;
+      const wdx = wx * inv;
+      const wdz = wz * inv;
 
-      // emit two triangles (6 verts) — same world center, four corners.
+      // emit two triangles (6 verts) — same world center+windDir, four corners.
       for (let c = 0; c < 6; c++) {
         const [cx, cy] = corners[c]!;
         v[vi++] = x; v[vi++] = y; v[vi++] = z;
         v[vi++] = cx; v[vi++] = cy;
         v[vi++] = sp;
+        v[vi++] = wdx; v[vi++] = wdz;
       }
     }
     this.device.queue.writeBuffer(this.vbuf, 0, this.vertBytes);
@@ -316,15 +330,17 @@ export class Wind {
     // (pxW is recovered as aspect maps x/y; pass an effective px width via aspect = pxW/pxH and a fixed
     //  reference width baked here.) Use viewport-independent sizing: half-extent = dotPx / refWidth.
     const REF_W = 1000; // reference canvas width the dotPx was tuned against
-    const dotSize = this.dotPx / REF_W;
+    const dotSize = this.dotPx / REF_W;          // NDC half-width of the comet head
+    const tailLen = dotSize * this.tailMul;      // NDC streak length (head → tail)
 
     const u = this.uniformF32;
     u.set(viewProj, 0);
     u[16] = eye[0]; u[17] = eye[1]; u[18] = eye[2];
-    u[19] = aspect;                               // pxW/pxH for round dots
+    u[19] = aspect;                               // pxW/pxH for un-skewed streaks
     u[20] = fogColor[0]; u[21] = fogColor[1]; u[22] = fogColor[2];
     u[23] = fogDensity;
-    u[24] = dotSize;                              // NDC half-extent
+    u[24] = dotSize;                              // NDC half-width
+    u[25] = tailLen;                              // NDC streak length
     this.device.queue.writeBuffer(this.ubuf, 0, this.uniformHost);
 
     const pass = encoder.beginRenderPass({

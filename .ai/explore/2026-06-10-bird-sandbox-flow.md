@@ -120,3 +120,12 @@ v3 RESULT: landed well (no-fill EKG ridges, ground-locked cam, readable gliding-
 **Wind (v5): DOTS, not lines.** Replace the streamline comet *lines* with drifting neon DOT particles advected by the SAME `windAt` field — a field of motes carried by the wind, showing flow through their motion and density (recycle as they age/leave). Over the terrain, depth-tested, additive glow.
 
 **Done (v5):** denser EKG terrain with black-fill hidden-line occlusion (clean, no tangle) + elevation-tinted lines; wind shown as drifting dots; and the glider sinks by default, soaring only on found lift.
+
+---
+
+## v6 (2026-06-11) — dot tails + smaller, and fix bird-vs-terrain scale
+
+- **Wind dots → smaller + TAILS.** v5 dots read like a starfield when frozen. Make each mote SMALLER (dotPx ~11 → ~4-6) and give it a short fading COMET TAIL along the wind direction / its recent path (a few dot-widths). Motion + direction then read even in a still, and they're distinct from the sky stars. Still advected by the shared windAt.
+- **Bird-vs-terrain SCALE.** User: "the bird seems HUGE compared to the terrain." The bird is ~36 m wingspan against ~120 m relief, so it dominates the frame. Shrink the bird's world size (wingspan ~36 m → ~14-18 m) AND pull the chase camera in proportionally (reduce followDist) so the bird stays readable but is clearly a SMALL glider in a VAST landscape — the terrain should dominate, the bird a small soaring thing within it. Tune by screenshot until the proportion feels right.
+
+**Done (v6):** wind reads as small tailed motes streaking on the breeze; the bird is a small glider dwarfed by big ridgelines.

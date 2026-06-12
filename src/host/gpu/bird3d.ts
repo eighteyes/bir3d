@@ -280,12 +280,15 @@ export class Bird3D {
 // Local frame: +X right, +Y up, +Z forward (heading). Wings sweep back (-Z) toward the tips.
 function buildVMesh(): number[] {
   const verts: number[] = [];
-  const SPAN = 18;     // half-wingspan (m) → ~36m tip-to-tip, bold + readable at followDist 120
-  const SWEEP = 6;     // how far back the tip sits (-Z)
-  const DIHEDRAL = 9;  // tip rise (m) at full span → clear static gliding V
-  const RIBBON = 3.2;  // ribbon half-width (m) — bold neon, not a hairline
-  const BODY_LEN = 11; // body spine length (m)
-  const BODY_W = 2.0;
+  // v6: halved vs v5 (SPAN 18→9 etc.) — a SMALL glider dwarfed by the ~120 m ridge relief. Same V
+  // shape, just smaller; the chase camera is pulled in proportionally (camera.ts followDist/Height)
+  // so it stays a clear readable V while the terrain dominates the frame.
+  const SPAN = 9;      // half-wingspan (m) → ~18 m tip-to-tip
+  const SWEEP = 3;     // how far back the tip sits (-Z)
+  const DIHEDRAL = 4.5; // tip rise (m) at full span → clear static gliding V
+  const RIBBON = 1.7;  // ribbon half-width (m) — neon, not a hairline
+  const BODY_LEN = 5.5; // body spine length (m)
+  const BODY_W = 1.0;
 
   // push a quad (two tris) as a ribbon between two centerline points pA,pB.
   // attr = (signed spanFrac, wingFlag, edgeFrac); edgeFrac 0/1 marks ribbon edges.

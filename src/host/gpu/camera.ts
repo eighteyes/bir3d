@@ -34,8 +34,12 @@ export class ChaseCamera {
   smooth: number;
 
   constructor(p: ChaseParams = {}) {
-    this.followDist = p.followDist ?? 120;
-    this.followHeight = p.followHeight ?? 55;
+    // v6: pulled in proportionally to the halved bird (SPAN 18→9) so it stays a readable V while the
+    // big ridges dominate. followHeight is the real "terrain looms" lever (lower eye → ridges rise
+    // against the sky); followDist holds the bird's screen size. lookAhead is direction-only (lookAt
+    // normalizes), so it doesn't change framing — left at 160.
+    this.followDist = p.followDist ?? 60;
+    this.followHeight = p.followHeight ?? 28;
     this.lookAhead = p.lookAhead ?? 160;
     this.lookPitch = p.lookPitch ?? (16 * Math.PI) / 180; // ~16° down → ground fills lower ~75% of frame
     this.smooth = p.smooth ?? 0.14;
