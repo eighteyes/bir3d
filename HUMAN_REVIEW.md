@@ -464,7 +464,7 @@ Fly low and near-level so the camera looks ACROSS the ridge field (not down from
 
 ## Bird 3D v5 (denser occluding terrain + elevation color + wind dots)
 **Date:** 2026-06-11
-**Commit:** d9325e7
+**Commit:** 95b6859
 **Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
 
 ### What was done
