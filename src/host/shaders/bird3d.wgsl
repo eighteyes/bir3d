@@ -1,21 +1,21 @@
-// bird3d.wgsl — neon flapping-V bird (WebGPU 3D, depth-tested so terrain ridges occlude it).
+// bird3d.wgsl — neon gliding-V bird (WebGPU 3D, depth-tested so terrain ridges occlude it).
 // Responsibilities:
-//   - Vertex: take a procedural bird mesh in LOCAL space (x=span lateral, y=0, z=chord forward),
-//     flap the wings about the local forward (Z) axis via sin(time*flapHz); the wingtip LAGS
-//     (phase ∝ |span|) so it reads floppy. Apply model = T(pos) * Ryaw(heading) * Rroll(bank),
-//     then U.viewProj. Body verts (|span| small) do not flap.
-//   - Fragment: bright emissive neon ribbons on the dark scene; brightness tapers along the
+//   - Vertex: take a procedural bird mesh in LOCAL space (x=span lateral, y=0, z=chord forward).
+//     Wings are held OUT (no flap cycle); a SUBTLE flex about the local forward (Z) axis via
+//     sin(time*flexHz)*flexAmp (tiny) reads as a living glide, NOT a flap beat. Apply
+//     model = T(pos) * Ryaw(heading) * Rroll(bank), then U.viewProj. Body verts do not flex.
+//   - Fragment: bold emissive neon ribbons on the dark scene; brightness tapers along the
 //     wing so tips glow hot. Depth-tested (less) against the stored terrain depth → occlusion.
 //   - Local axes match the world chase convention: +Z = forward (heading), +X = right, +Y = up.
 
 struct Uniforms {
   viewProj : mat4x4<f32>,
   pos : vec3<f32>,        // bird world position
-  flapPhase : f32,        // time * flapHz (radians)
+  flexPhase : f32,        // time * flexHz (radians) — subtle living flex, NOT a flap beat
   heading : f32,          // yaw about +Y (atan2 forward.x, forward.z)
   bank : f32,             // roll about local +Z (banks into turns)
-  flapHz : f32,           // unused in shader (kept for parity)
-  flapAmp : f32,          // max flap angle (radians)
+  flexHz : f32,           // unused in shader (kept for parity)
+  flexAmp : f32,          // subtle flex angle (radians) — wings held OUT, no flap cycle
 };
 
 @group(0) @binding(0) var<uniform> U : Uniforms;
@@ -47,12 +47,13 @@ fn vs(@location(0) local : vec3<f32>, @location(1) attr : vec3<f32>) -> VSOut {
 
   var p = local;
 
-  // Flap: rotate wing verts about local forward (Z). Tip lags by phase ∝ |spanFrac| (floppy).
+  // GLIDE, NO FLAP: wings held OUT. A SUBTLE flex about local forward (Z) reads as a living
+  // glide, not a flap beat. Tip lags by phase ∝ |spanFrac| so the flex feels organic.
   if (isWing > 0.5) {
     let lag = abs(spanFrac) * 1.4;                 // wingtip phase offset
-    let flap = sin(U.flapPhase - lag) * U.flapAmp; // dihedral flap angle
-    // both wings rise together: rotate +span up, -span up → sign by side, magnitude by |span|.
-    let ang = flap * sign(spanFrac);
+    let flex = sin(U.flexPhase - lag) * U.flexAmp; // tiny dihedral wobble (flexAmp small)
+    // both wings flex together: rotate +span up, -span up → sign by side, magnitude by |span|.
+    let ang = flex * sign(spanFrac);
     p = rotZ(ang) * p;
   }
 
