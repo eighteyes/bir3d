@@ -68,7 +68,7 @@ async function boot() {
                       // first row is empty and fills the lower frame with black. Negative start fills it.
     halfWidth: 1500,  // horizontal extent per row (m)
     fogColor: SKY,
-    fogDensity: 1 / 1400, // far lines dissolve into the dark haze
+    fogDensity: 1 / 1100, // far lines dissolve into the dark haze before they tangle (no-fill stack)
   });
 
   const birdShader = await fetch("/src/host/shaders/bird3d.wgsl").then((r) => r.text());
@@ -186,6 +186,7 @@ async function boot() {
 
     (window as any).__camPos = eye;
     (window as any).__birdPos = bird.pos;
+    (window as any).__birdPitch = bird.pitch; // live pitch (rad) — capture harness waits for hard nose-up
     frame++;
     const headingDeg = ((bird.heading * 180) / Math.PI) % 360;
     const vario = bird.lastVario;
