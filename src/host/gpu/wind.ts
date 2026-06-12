@@ -28,7 +28,7 @@ const DEFAULTS: Required<WindConfig> = {
   curlAmp: 7.0,
   driftDir: (35 * Math.PI) / 180, // prevailing wind toward ~ENE
   driftAmp: 6.0,
-  thermalAmp: 3.0,
+  thermalAmp: 4.0,
 };
 
 // Closed-form curl-noise potential. Sum of sines → smooth scalar field; wind = curl(potential)
@@ -77,8 +77,10 @@ export function thermalAt(
   // moving bump field — overlapping broad gaussians via a sine lattice raised to a power.
   const a = Math.sin(x * s + 0.05 * t) * Math.sin(z * s * 1.1 - 0.04 * t);
   const b = Math.sin((x + z) * s * 0.6 + 0.03 * t);
-  const m = Math.max(0, a) * 0.7 + Math.max(0, b) * 0.5;
-  return m * cfg.thermalAmp;
+  // SPARSE columns: product of both lobes raised to a power → ~0 across most of the world and
+  // strong only in narrow rising cores you must HUNT for (a glider sinks by default; lift is local).
+  const core = Math.max(0, a) * Math.max(0, b);
+  return Math.pow(core, 2.2) * cfg.thermalAmp;
 }
 
 // --- streamline overlay pipeline ---

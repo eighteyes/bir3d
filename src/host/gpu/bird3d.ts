@@ -88,10 +88,10 @@ export class Bird3D {
       dragK: t.dragK ?? 0.4,
       divePower: t.divePower ?? 0.9,
       gravity: t.gravity ?? 9.0,
-      sinkRate: t.sinkRate ?? 1.4,
+      sinkRate: t.sinkRate ?? 2.2,
       windGain: t.windGain ?? 1.6,  // multiplier on the shared windAt field (CRANKED)
       windDrift: t.windDrift ?? 1.0, // fraction of horizontal wind the glider drifts with
-      liftGain: t.liftGain ?? 2.2,
+      liftGain: t.liftGain ?? 1.2,
       flexHz: t.flexHz ?? 0.6,   // slow, subtle flex — wings stay OUT (no flap beat)
       flexAmp: t.flexAmp ?? 0.06, // tiny → static gliding V
       minClearance: t.minClearance ?? 6,
@@ -169,6 +169,11 @@ export class Bird3D {
     // --- steering: mouse offsets drive yaw & pitch rate; bank eases toward yaw rate ---
     this.heading += input.yawRate * clamped;
     this.pitch += input.pitchRate * clamped;
+    // hands-off auto-trim: with ~no pitch input, ease toward a gentle glide attitude (slightly
+    // nose-down) so the glider settles into a steady DESCENT instead of holding a climb.
+    if (Math.abs(input.pitchRate) < 1e-3) {
+      this.pitch += (-0.03 - this.pitch) * Math.min(1, clamped * 0.8);
+    }
     this.pitch = Math.max(-0.7, Math.min(0.7, this.pitch));
     const targetBank = -input.yawRate * 0.5; // roll into the turn
     this.bank += (targetBank - this.bank) * Math.min(1, clamped * 4);
@@ -208,7 +213,7 @@ export class Bird3D {
     const gz = (hZ - hC) / eps;
     const into = wx * gx + wz * gz; // wind · uphill → ridge lift
     const ridge = Math.max(0, into) * T.liftGain;
-    const thermal = thermalAt(this.pos[0], this.pos[2], this.time) * T.windGain;
+    const thermal = thermalAt(this.pos[0], this.pos[2], this.time); // vertical lift is NOT scaled by the horizontal-wind crank
     const updraft = ridge + thermal; // total vertical air motion the bird rides
     this.lastUpdraft = updraft;
 
