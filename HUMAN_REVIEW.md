@@ -1,5 +1,59 @@
 # Human Review Steps
 
+## Bird3D v11 — AUTOPILOT: autonomous soaring, manual controls off
+**Date:** 2026-06-12
+**Commit:** working tree
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done
+- NEW `src/host/autopilot.ts`: hands-off soaring controller emitting the SAME BirdInput the mouse used (physics untouched, controls swap at the wire). Mode priority: AVOID (clearance <45 m or predicted <35 m at a 2.5 s velocity look-ahead → climb hard if airspeed allows + turn toward the lower shoulder) > SOAR (net lift here → orbit gently, ride it) > ENERGY (slow → nose down, airspeed first) > CLIMB/DESCEND (90–260 m band) > CRUISE (steer toward the best of 8 lift probes at 140 m). Commands eased; `[auto]` telemetry to console every ~2 s.
+- `src/host/gpu/bird3d.ts`: exported `updraftAt(x,z,t,terrain,T)` — the EXACT ridge+thermal+cap math integrate applies — so the autopilot senses the same air the bird rides.
+- `src/host/bird-main.ts`: `AUTOPILOT=true` — mouse steering + wobble disabled; overlay shows `AUTO: <mode>`; `window.__autoMode` exposed. Set AUTOPILOT=false to restore manual flight (everything still wired).
+
+### Verify: typecheck + 90 s autonomous soak (the gate)
+```
+node node_modules/typescript/bin/tsc --noEmit
+node .ai/tmp/auto-soak.mjs
+```
+Expected: `SOAK_PASS` — min clearance >10 m (measured 39 m), lastAvg >40 m (measured 138 m), zero page errors; relayed `[auto]` lines show SOAR/CRUISE/ENERGY/AVOID transitions and recoveries. Saves `.ai/tmp/auto-soak.png`.
+
+### Verify: WATCH IT (eyes-on)
+Open http://localhost:5173/index-bird.html and touch nothing:
+- [ ] Overlay shows `AUTO: <mode>`; bird banks, hunts, and circles in lift (vario positive in SOAR).
+- [ ] It sinks in still air, dives to rebuild speed (ENERGY), and climbs away from ridges (AVOID).
+- [ ] Minutes pass; it never grinds along the terrain floor.
+
+### Watch for
+- `bestProbe` saturates at the 5.5 updraft cap almost everywhere — probe ranking barely discriminates; if heading choice looks aimless, rank probes on UNCAPPED ridge+thermal in `updraftAt` (return both) before tuning anything else.
+- Flapping comes next: a thrust impulse the autopilot (then the player) can spend when lift fails — slot it where ENERGY mode dives today.
+
+## Bird3D v10 — holdable pitch attitude (mouse-y = nose angle) + dive payout
+**Date:** 2026-06-12
+**Commit:** working tree
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done
+- PITCH IS NOW ATTITUDE, NOT RATE (`src/host/gpu/bird3d.ts` BirdInput.pitchTarget + `bird-main.ts` mapping): cursor height = nose angle (±0.6 rad at full deflection), nose eases toward it at 3.5/s and STAYS — park the cursor, hold the attitude. Centered cursor = gentle glide trim (-0.03 rad), which REPLACES the old hands-off auto-trim (deleted — it dragged the nose down whenever the mouse rested in the deadzone: the "can't hold a pitch" complaint). Yaw unchanged (rate-based).
+- DIVE PAYOUT: divePower default 0.9→1.1 (dives build speed visibly faster). sinkRate left at the 1.4 already set.
+- Scripted wobble now sweeps pitchTarget ±0.65 (same visual proof, new contract).
+
+### Verify: typecheck + attitude HOLDS headless
+```
+node node_modules/typescript/bin/tsc --noEmit
+node .ai/tmp/hold-probe.mjs
+```
+Expected: no tsc output; `pitch after 1.5s: ~12° — after 3.5s: ~12°` then `HOLDS`.
+
+### Verify: FLY IT
+- [ ] Park cursor above center: nose sets to a steady climb angle and STAYS — no slump-back.
+- [ ] Center the cursor: gentle settling glide (~-1.4 m/s vario), hands-off stable.
+- [ ] Cursor low: committed dive, airspeed builds noticeably; pull to center-high: zoom-climb.
+- [ ] The dive→zoom→hold-attitude loop feels like flying, not negotiating.
+
+### Watch for
+- Attitude ease rate is the `3.5` in bird3d.ts integrate(); raise for snappier nose, lower for heavier bird.
+- PITCH_RANGE 0.6 / GLIDE_TRIM -0.03 live at the top of bird-main.ts.
+
 ## Bird 3D v10 (near-dense wind + terrain-hugging pour)
 **Date:** 2026-06-12
 **Commit:** b1df7d3 (v10 wind code); this docs-only entry committed on top

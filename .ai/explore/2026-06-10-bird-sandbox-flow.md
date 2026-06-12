@@ -162,4 +162,14 @@ Still advected by the shared windAt; only wind.ts/wind.wgsl change. Bird/terrain
 - **Trails longer + CURVED, following the terrain-shaped flow.** User: "make the trails even longer and give them some curve." wind.ts/wind.wgsl ONLY: each mote's tail becomes a CURVED multi-segment polyline integrated along the (now terrain-shaped) flow over several steps — long curved comets that arc over the ridges and around peaks, not straight lines; even longer than v8.
 - **Wind FELT on the bird (buffeting).** User: "doesn't feel like the wind is really impacting the bird." The drift is large but STEADY, so it's not noticed. Add BUFFETING (bird3d.ts ONLY): a turbulence term that ROCKS the bird's bank (±~6-8°), BOBS it vertically (±~1.5 m/s), and SHOVES it laterally in gusts so flying feels like moving air; plus a visible LEAN/crab into the cross-wind. Keep it controllable. Verify: flying straight with no input, bank + vario OSCILLATE (buffet active) where before they were near-constant.
 
-**Done (v9):** the wind visibly pours over and around the ridges (terrain interaction); its streaks are long curved comets following that flow; and the bird rocks/bobs/crabs so you feel the moving air.
+**Done (v9):** the wind visibly pours over and around the ridges (terrain interaction); its streaks are long curved comets following that flow; and the bird rocks/bobs/crabs so you feel the moving air. (v9 result: curved tails + buffet landed; terrain-interaction too subtle; drift +61° maybe too strong.)
+
+---
+
+## v10 (2026-06-12) — density near the bird; terrain interaction must HUG and POUR
+
+wind.ts/wind.wgsl ONLY (do NOT touch bird physics/camera/terrain).
+- **Density: DENSE near the bird, SPARSE far.** v9 seeds motes uniformly in world space, so perspective makes the FAR field look densest and the near field thin — the OPPOSITE of what's wanted. Bias the mote distribution toward the near field (concentrate around the bird/camera ground point; fewer + fading motes with distance) so the wind is thickest right around the bird and thins into the distance.
+- **Terrain interaction must HUG + POUR (it's still too weak).** v9 motes float in a flat layer ~45-55 m ABOVE the ridges, so they don't visibly relate to the terrain. Fix: motes HUG the terrain surface (much lower clearance, follow the contour up and over each ridge) AND a STRONGER vertical pour over windward slopes (raise the lift the motes ride; brighten/accelerate motes that are climbing) so the airflow OBVIOUSLY conforms to and pours over the landscape — you should clearly see wind streaming up the windward faces and spilling over the crests, not floating in a flat sheet.
+
+**Done (v10):** the wind is a thick cloud of streaks right around the bird thinning into the distance, and it visibly hugs the terrain — pouring up the windward ridges and spilling over the crests.
