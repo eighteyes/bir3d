@@ -60,10 +60,12 @@ async function boot() {
 
   const terrainShader = await fetch("/src/host/shaders/terrain_ekg.wgsl").then((r) => r.text());
   const terrain = new TerrainEKG(device, terrainShader, format, {
-    rows: 56,         // stacked EKG depth rows
+    rows: 64,         // stacked EKG depth rows
     cols: 256,        // samples per row (polyline resolution)
-    rowSpacing: 70,   // m between rows
-    rowStart: 30,     // nearest row just ahead
+    rowSpacing: 65,   // m between rows
+    rowStart: -150,   // BEHIND the bird. The camera sits ~followDist behind the bird, so rows must
+                      // extend back past the camera; otherwise the near-ground between camera and the
+                      // first row is empty and fills the lower frame with black. Negative start fills it.
     halfWidth: 1500,  // horizontal extent per row (m)
     fogColor: SKY,
     fogDensity: 1 / 1400, // far lines dissolve into the dark haze
@@ -94,6 +96,8 @@ async function boot() {
     const r = canvas.getBoundingClientRect();
     mouseX = ((e.clientX - r.left) / r.width) * 2 - 1;  // -1..1
     mouseY = ((e.clientY - r.top) / r.height) * 2 - 1;  // -1..1
+    // a real player moved the mouse → the scripted wobble yields control immediately.
+    (window as any).__autoWobble = false;
   });
 
   // --- tuning panel: sliders write straight into bird.tuning; 'T' toggles visibility ---
@@ -147,10 +151,12 @@ async function boot() {
     input.pitchRate = -applyDead(mouseY) * PITCH_GAIN; // mouse-up = nose-up
 
     // scripted pitch wobble drives the bird hard up/down; the camera must NOT follow the pitch.
+    // PITCH ONLY (no yaw) → heading stays 0 so the world-axis EKG rows render as clean horizontal
+    // stacked lines; the wobble is purely the ground-lock proof.
     if ((window as any).__autoWobble) {
       wobbleT += dt;
       input.pitchRate = Math.sin(wobbleT * 1.1) * PITCH_GAIN * 1.6; // exceeds manual range → hard pitch
-      input.yawRate = Math.sin(wobbleT * 0.37) * YAW_GAIN * 0.4;    // gentle weave so depth/bank read
+      input.yawRate = 0;
     }
 
     bird.integrate(dt, input);

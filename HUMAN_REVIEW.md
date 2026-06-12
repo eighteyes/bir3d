@@ -1,5 +1,47 @@
 # Human Review Steps
 
+## Bird3D — soaring glider physics (energy-exchange model + live tuning panel)
+**Date:** 2026-06-11
+**Commit:** working tree on top of d0ca3c3
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done
+- Replaced the velocity-servo flight model in `src/host/gpu/bird3d.ts` with an energy-exchange glider: scalar airspeed; pitch trades speed for altitude (dive to gain, pull up to zoom-climb); ONE-SIDED drag (only bleeds speed above trim — no free thrust back toward trim, so sustained climbs are impossible without lift); sink minimal at trim (~1.4 m/s, L/D ≈ 18), rising CUBICALLY when slow so a stalled nose-up falls instead of levitating; ridge updraft is vertical air motion the bird rides (wind · uphill gradient × liftGain 2.2 — now perceptible vs the old ~5%-of-gravity).
+- Reconciled `bird-main.ts` to the glide-no-flap contract (d0ca3c3): TerrainEKG import, no flap input, scripted `__autoWobble` now yields to the player on first mousemove.
+- New HUD lines: `vario ±x.x m/s ▲/▼/—` and `ridge lift +x.x m/s`. New tuning panel ('T'): 9 sliders writing live into `bird.tuning` (glideSpeed, sinkRate, divePower, dragK, liftGain, windGain, windDrift, minSpeed, maxSpeed).
+
+### Pre-conditions
+```
+cd /Users/god/projects/ai-jank/vector-system
+npm run dev
+```
+
+### Verify: typecheck + unit tests green
+```
+node node_modules/typescript/bin/tsc --noEmit
+node node_modules/vitest/vitest.mjs run
+```
+Expected: no tsc output; 3 test files / 3 tests pass.
+
+### Verify: page boots headless, integrator alive
+```
+node .ai/tmp/bird-boot-probe.mjs
+```
+Expected: `booted: true`, moved ≥10 m, overlay dump, `PROBE_OK`, exit 0. (Headless = no mouse, so the wobble flies it — pitch pegged ±40° is expected there.)
+
+### Verify: FLY IT (the actual gate — feel, eyes + hands)
+Open http://localhost:5173/index-bird.html and fly with the mouse only:
+- [ ] Level glide sinks gently (~-1.4 m/s vario), not a brick.
+- [ ] Mouse-down (dive): airspeed climbs toward 40-55; mouse-up after a dive: zoom-climb, vario strongly positive, speed bleeding off.
+- [ ] Hold full nose-up: speed mushes to ~13 m/s and the bird FALLS (no levitation) — stall teaches itself.
+- [ ] Cross a windward ridge: `ridge lift` reads >0 and the vario goes positive without diving — circling/tracking the lift band gains altitude. THIS is the soar.
+- [ ] Press `T`: sliders move feel live (try liftGain up for stronger soaring, sinkRate up for harsher glide).
+
+### Watch for
+- Ridge lift depends on the analytic curl-noise wind (FLAGGED stand-in for the GPU fluid) — lift bands exist where wind blows into uphill slopes; if lift feels too rare, raise windGain or liftGain before judging the model.
+- `minClearance` is 6 m and the altitude clamp silently floors the bird — no crash state yet (game layer, not this pass).
+- `.ai/tmp/bird-boot-probe.mjs` is a verification artifact (gitignored), not a deliverable.
+
 ## Bird sandbox flow (vertical slice) — final SHOW gate
 **Date:** 2026-06-10
 **Commit:** cba5feb

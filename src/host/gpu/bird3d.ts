@@ -187,11 +187,13 @@ export class Bird3D {
       fwd[2] * Math.cos(this.pitch),
     ];
 
-    // --- airspeed energy exchange: gravity along the flight path + drag toward trim ---
-    // pitch down → speed builds; pull up → speed bleeds into climb (zoom). This is the soar.
+    // --- airspeed energy exchange: gravity along the flight path + one-sided drag ---
+    // pitch down → speed builds; pull up → speed bleeds into climb (zoom). Drag only bleeds
+    // speed ABOVE trim (parasitic): a pure glider gets no free thrust back toward trim —
+    // speed lost to a climb is recovered only by diving. This is the soaring energy contract.
     this.speed +=
       (-T.gravity * Math.sin(this.pitch) * T.divePower -
-        T.dragK * (this.speed - T.glideSpeed)) *
+        T.dragK * Math.max(0, this.speed - T.glideSpeed)) *
       clamped;
 
     // GLIDE, NO FLAP: no thrust input this pass. Airspeed is sustained by the dive↔zoom energy
@@ -211,8 +213,9 @@ export class Bird3D {
     const updraft = Math.max(0, into) * T.liftGain;
     this.lastUpdraft = updraft;
 
-    // --- sink: minimal at trim, mushes quadratically when slow (stall teaches itself) ---
-    const sink = T.sinkRate * (T.glideSpeed / this.speed) ** 2;
+    // --- sink: minimal at trim, mushes CUBICALLY when slow — at minSpeed full-nose-up the
+    // sink exceeds sin(pitch)*speed, so a stalled climb falls instead of levitating ---
+    const sink = T.sinkRate * (T.glideSpeed / this.speed) ** 3;
 
     // --- compose velocity: flight path + horizontal wind drift + ridge updraft − sink ---
     this.vel[0] = dir[0] * this.speed + wx * T.windDrift;
