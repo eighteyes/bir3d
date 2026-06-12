@@ -74,9 +74,9 @@ async function boot() {
 
   const terrainShader = await fetch("/src/host/shaders/terrain_ekg.wgsl").then((r) => r.text());
   const terrain = new TerrainEKG(device, terrainShader, format, {
-    rows: 128,        // stacked EKG depth rows (2× v4) — spacing halved so ~2× actually render
-    cols: 512,        // samples per row (2× v4) — finer ridge profiles
-    rowSpacing: 18,   // m between rows (v4 36→18): ~2× visible rows inside maxDist for finer ridges
+    rows: 256,        // stacked EKG depth rows — enough to cover maxDist at the 4× spacing below
+    cols: 512,        // samples per row — finer ridge profiles
+    rowSpacing: 4.5,  // m between rows (18→4.5): 4× line density — ~245 visible rows inside maxDist
     rowStart: -150,   // BEHIND the camera ground point. Rows are built ahead of the camera; start a
                       // little behind so the near-ground under the camera isn't empty black.
     halfWidth: 1500,  // horizontal extent per row (m)
