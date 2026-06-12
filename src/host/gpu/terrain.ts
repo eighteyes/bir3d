@@ -3,10 +3,13 @@
 //   - Build a STACK of ~rows horizontal polylines (line-list). Each row is a fixed depth ahead of
 //     the camera; each vertex is (xFrac in [-1,1], rowDepth in meters) + rowFade. Segments are
 //     emitted as line-list pairs (no strip restart). There is NO filled surface — lines only.
+//   - CAMERA-RELATIVE ROWS (v4): the WGSL builds each world sample as camGround + camFwd*depth +
+//     camRight*(xFrac*halfWidth). Rows are perpendicular to camForward → screen-horizontal at every
+//     heading (v3 locked rows to world-East, so turning skewed them diagonally; fixed here).
 //   - Create the render pipeline from terrain_ekg.wgsl, topology "line-list", WITH depthStencil
 //     (depth24plus, less, write on) so terrain lines occlude the bird, and additive blend for glow.
-//   - Own the uniform buffer (viewProj, camOffset, halfWidth, fog, eye); upload per draw. The
-//     heightfield slides under the fixed rows via camOffset → rows scroll/recycle for free.
+//   - Own the uniform buffer (viewProj, camGround, halfWidth, maxDist, camFwd, camRight, fog, eye);
+//     upload per draw. maxDist gives a hard horizon cutoff in the fragment shader (clean horizon).
 //   - sampleHeight(x,z): TS mirror of the WGSL fBm (same constants/hash) for the bird ridge-lift.
 //   - draw(...): record one line-list draw that CLEARS color+depth (first pass of the frame).
 
@@ -22,6 +25,7 @@ export interface TerrainParams {
   rowSpacing?: number; // world meters between rows (depth step)
   rowStart?: number;   // depth of the nearest row ahead of the camera (m)
   halfWidth?: number;  // half horizontal extent of each row (m)
+  maxDist?: number;    // hard draw-distance cutoff (m) → clean horizon
   fogColor?: [number, number, number];
   fogDensity?: number;
 }
@@ -32,6 +36,7 @@ export class TerrainEKG {
   readonly rowSpacing: number;
   readonly rowStart: number;
   readonly halfWidth: number;
+  readonly maxDist: number;
 
   private vbuf: GPUBuffer;
   private vertexCount: number;
@@ -55,6 +60,8 @@ export class TerrainEKG {
     this.rowSpacing = p.rowSpacing ?? 70;
     this.rowStart = p.rowStart ?? 40;
     this.halfWidth = p.halfWidth ?? 1400;
+    // hard horizon cutoff. Default: just past the last row so the full stack draws.
+    this.maxDist = p.maxDist ?? (this.rowStart + this.rows * this.rowSpacing);
     this.fogColor = p.fogColor ?? [0.01, 0.012, 0.03];
     this.fogDensity = p.fogDensity ?? 1 / 1600;
 
@@ -81,9 +88,13 @@ export class TerrainEKG {
     });
     device.queue.writeBuffer(this.vbuf, 0, verts);
 
-    // --- uniform buffer: mat4(64) + camOffset(8)+halfWidth(4)+pad(4) + fogColor(12)+density(4)
-    //     + eye(12)+pad(4) = 112 bytes ---
-    this.uniformHost = new ArrayBuffer(28 * 4);
+    // --- uniform buffer (std140-aligned, 128 bytes / 32 floats):
+    //   [0..16)  mat4 viewProj
+    //   [16,17]  camGround.xz   [18] halfWidth   [19] maxDist
+    //   [20,21]  camFwd.xz      [22,23] camRight.xz
+    //   [24..27) fogColor.rgb   [27] fogDensity
+    //   [28..31) eye.xyz        [31] pad
+    this.uniformHost = new ArrayBuffer(32 * 4);
     this.uniformData = new Float32Array(this.uniformHost);
     this.ubuf = device.createBuffer({
       size: this.uniformData.byteLength,
@@ -165,16 +176,20 @@ export class TerrainEKG {
     colorView: GPUTextureView,
     depthView: GPUTextureView,
     viewProj: Float32Array,
-    camOffset: [number, number],
+    camGround: [number, number],            // camera ground (x,z) the stack is built around
+    camFwd: [number, number],               // horizontal camera forward (x,z), unit
+    camRight: [number, number],             // horizontal camera right (x,z), unit
     eye: [number, number, number],
     clearColor: GPUColor
   ): void {
     const u = this.uniformData;
     u.set(viewProj, 0);                                              // [0..16) mat4
-    u[16] = camOffset[0]; u[17] = camOffset[1];                      // camOffset
-    u[18] = this.halfWidth; u[19] = 0;                              // halfWidth + pad
-    u[20] = this.fogColor[0]; u[21] = this.fogColor[1]; u[22] = this.fogColor[2]; u[23] = this.fogDensity;
-    u[24] = eye[0]; u[25] = eye[1]; u[26] = eye[2]; u[27] = 0;       // eye + pad
+    u[16] = camGround[0]; u[17] = camGround[1];                      // camGround.xz
+    u[18] = this.halfWidth; u[19] = this.maxDist;                   // halfWidth, maxDist
+    u[20] = camFwd[0]; u[21] = camFwd[1];                            // camFwd.xz
+    u[22] = camRight[0]; u[23] = camRight[1];                        // camRight.xz
+    u[24] = this.fogColor[0]; u[25] = this.fogColor[1]; u[26] = this.fogColor[2]; u[27] = this.fogDensity;
+    u[28] = eye[0]; u[29] = eye[1]; u[30] = eye[2]; u[31] = 0;       // eye + pad
     this.device.queue.writeBuffer(this.ubuf, 0, this.uniformHost);
 
     const pass = encoder.beginRenderPass({

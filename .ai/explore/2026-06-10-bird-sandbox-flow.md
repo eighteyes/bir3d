@@ -91,3 +91,17 @@ v2 result: terrain DEPTH read well (good) but two corrections from the user look
 **Bird — GLIDE, no flap:** a clean **gliding V** (wings held OUT, no flap cycle), bolder/brighter/readable than v2's hairline (thick neon ribbons, real wingspan), banks (rolls) into turns. **Flight = soaring glide, no flap thrust:** gravity + airspeed-lift (keeps it aloft) + ridge-lift/thermals (so you can sustain/gain altitude — "i should be able to glide"); steer pitch + bank with the mouse. Subtle wing flex is fine; NO flapping beats and NO flap input this pass. The new ground-locked camera (looking down at the bird's back) also makes the V read.
 
 **Done (v3):** open `/index-bird.html` — a readable gliding-V neon bird soars over stacked EKG ridgeline terrain receding into haze; the camera always keeps the ground in frame no matter how the bird pitches; you can steer and sustain a glide on lift; 60fps; no errors.
+
+v3 RESULT: landed well (no-fill EKG ridges, ground-locked cam, readable gliding-V, terrain streams). Three refinements from the user:
+
+---
+
+## v4 (2026-06-11) — camera-relative rows, clean horizon + higher start, FELT wind
+
+1. **Skew fix → EKG rows are CAMERA-RELATIVE (screen-horizontal at every heading).** v3 rows were locked to world-East, so turning tilted them diagonally. Fix: generate each row PERPENDICULAR to camForward — a line at distance d ahead spanning camera-Right (−W/2..W/2), height = fBm at those world XZ. The terrain content still comes from the same world fBm; only the line orientation follows the camera, so the stacked lines stay horizontal on screen no matter which way you fly.
+
+2. **Clean horizon + higher start.** User: "i'm ok occluding lines in the distance" + "i want to start higher from the ground." So: AGGRESSIVELY occlude/cull/fog-out the distant rows (accept losing far detail) to kill the horizon tangle — hard fog cutoff and/or a max draw distance and/or depth-occlude far lines behind near ridges. AND raise the bird's START altitude well above the terrain (more aerial; also pushes the tangle below the eyeline).
+
+3. **Make the WIND FELT.** User: "i'm not feeling the wind at all." The coupling is too weak and invisible. (a) CRANK wind coupling so the glide is visibly shoved/carried/lifted — gusts blow you off heading (you must correct), thermals/ridge-lift clearly carry you up. (b) Make it VISIBLE — exaggerated streamline ribbons / drifting wind traces over the terrain (§7.1 "stylized wind, more legible than literal") so you SEE the field you're feeling. (c) Wire the REAL GPU fluid as the wind source if it can be sampled cleanly (no in-loop sync readback); else keep strong curl-noise and FLAG it. The bird should visibly drift, lift, and fight the air; the overlay's wind vector should be large and clearly acting on the flight.
+
+**Done (v4):** open `/index-bird.html` — EKG ridge-lines stay horizontal on screen in every turn; the horizon is clean (far lines occluded); the bird starts high and aerial; and the WIND is unmistakable — visible streamlines + the glider is clearly pushed/lifted/carried by it.

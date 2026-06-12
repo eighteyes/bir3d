@@ -63,18 +63,20 @@ async function boot() {
     rows: 64,         // stacked EKG depth rows
     cols: 256,        // samples per row (polyline resolution)
     rowSpacing: 36,   // m between rows — tight stack so the lower frame fills with EKG traces
-    rowStart: -150,   // BEHIND the bird. The camera sits ~followDist behind the bird, so rows must
-                      // extend back past the camera; otherwise the near-ground between camera and the
-                      // first row is empty and fills the lower frame with black. Negative start fills it.
+    rowStart: -150,   // BEHIND the camera ground point. Rows are built ahead of the camera; start a
+                      // little behind so the near-ground under the camera isn't empty black.
     halfWidth: 1500,  // horizontal extent per row (m)
+    maxDist: 950,     // CLEAN HORIZON: hard cutoff — drop rows past ~950 m so the far stack never
+                      // tangles into a horizon mess (user is fine losing far detail). ~30 visible rows.
     fogColor: SKY,
-    fogDensity: 1 / 1100, // far lines dissolve into the dark haze before they tangle (no-fill stack)
+    fogDensity: 1 / 700, // strong fog: far rows dissolve well before the cutoff edge.
   });
 
   const birdShader = await fetch("/src/host/shaders/bird3d.wgsl").then((r) => r.text());
   const startH = terrain.sampleHeight(0, 0);
-  // start moderately low so near crests can cross in front of the bird (occlusion reads).
-  const bird = new Bird3D(device, birdShader, format, terrain, [0, startH + 55, 0]);
+  // HIGHER START (v4): begin well above terrain (~200 m clearance) so the flight is aerial from
+  // the first frame and the EKG stack sits below the eyeline (less horizon tangle).
+  const bird = new Bird3D(device, birdShader, format, terrain, [0, startH + 200, 0]);
 
   // Chase cam follows the bird POSITION + HEADING only (world-up, ground-locked aim). Looks DOWN
   // on the bird's back at a FIXED angle so the ground ALWAYS fills the lower frame, whatever the
@@ -176,8 +178,12 @@ async function boot() {
     const eye = cam.getEye();
 
     const enc = device.createCommandEncoder();
-    // terrain pass: clears color+depth.
-    terrain.draw(enc, colorView, depthView, viewProj, [bird.pos[0], bird.pos[2]], eye, {
+    // terrain pass: clears color+depth. CAMERA-RELATIVE rows — build them around the camera ground
+    // point using the SMOOTHED view basis (forward/right) so the stack stays screen-horizontal.
+    const camGround = cam.groundPos();
+    const camFwd = cam.forwardHoriz();
+    const camRight = cam.rightHoriz();
+    terrain.draw(enc, colorView, depthView, viewProj, camGround, camFwd, camRight, eye, {
       r: SKY[0], g: SKY[1], b: SKY[2], a: 1,
     });
     // bird pass: loads color+depth, depth-tested → ridges occlude the bird.
@@ -186,7 +192,9 @@ async function boot() {
 
     (window as any).__camPos = eye;
     (window as any).__birdPos = bird.pos;
-    (window as any).__birdPitch = bird.pitch; // live pitch (rad) — capture harness waits for hard nose-up
+    (window as any).__birdPitch = bird.pitch;     // live pitch (rad)
+    (window as any).__birdHeading = bird.heading; // live heading (rad) — capture harness waits for a real turn
+    (window as any).__birdWind = bird.lastWind;   // [wx,wz] m/s — overlay/diagnostics
     frame++;
     const headingDeg = ((bird.heading * 180) / Math.PI) % 360;
     const vario = bird.lastVario;

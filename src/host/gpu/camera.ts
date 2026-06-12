@@ -75,4 +75,24 @@ export class ChaseCamera {
 
   getEye(): Vec3 { return [this.eye[0], this.eye[1], this.eye[2]]; }
   camOffset(): [number, number] { return [this.target[0], this.target[2]]; }
+
+  // Horizontal camera basis used to build the CAMERA-RELATIVE terrain rows. Derived from the
+  // SMOOTHED eye→lookTarget (the same vectors the view matrix is built from) so the rows track the
+  // lerped view, never the instantaneous bird heading — otherwise a hard turn shows residual skew.
+  // groundPos() is the eye projected to the ground plane; rows are built ahead of it.
+  groundPos(): [number, number] { return [this.eye[0], this.eye[2]]; }
+  forwardHoriz(): [number, number] {
+    const dx = this.lookTarget[0] - this.eye[0];
+    const dz = this.lookTarget[2] - this.eye[2];
+    const l = Math.hypot(dx, dz) || 1;
+    return [dx / l, dz / l];
+  }
+  // right = forward × worldUp, kept horizontal. With up=(0,1,0): right = (fz, -fx) for a
+  // right-handed cross (fwd × up).x = fy*upz - fz*upy = -fz ... use lookAt convention: in a
+  // right-handed lookAt, camera-right = normalize(cross(forward, up)); here forward is the look dir.
+  rightHoriz(): [number, number] {
+    const [fx, fz] = this.forwardHoriz();
+    // cross(forward(fx,0,fz), up(0,1,0)) = (0*0 - fz*1, fz*0 - fx*0, fx*1 - 0*0) = (-fz, 0, fx)
+    return [-fz, fx];
+  }
 }
