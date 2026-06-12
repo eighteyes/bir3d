@@ -88,10 +88,10 @@ export class Bird3D {
       dragK: t.dragK ?? 0.4,
       divePower: t.divePower ?? 0.9,
       gravity: t.gravity ?? 9.0,
-      sinkRate: t.sinkRate ?? 2.2,
+      sinkRate: t.sinkRate ?? 1.4,   // v8: gentler sink (2.2→1.4) — glide efficiently, more time to find lift
       windGain: t.windGain ?? 1.6,  // multiplier on the shared windAt field (CRANKED)
       windDrift: t.windDrift ?? 1.0, // fraction of horizontal wind the glider drifts with
-      liftGain: t.liftGain ?? 1.2,
+      liftGain: t.liftGain ?? 2.5,   // v8: stronger ridge lift (1.2→2.5) — soaring the windward ridges sustains you
       flexHz: t.flexHz ?? 0.6,   // slow, subtle flex — wings stay OUT (no flap beat)
       flexAmp: t.flexAmp ?? 0.06, // tiny → static gliding V
       minClearance: t.minClearance ?? 6,
@@ -213,8 +213,8 @@ export class Bird3D {
     const gz = (hZ - hC) / eps;
     const into = wx * gx + wz * gz; // wind · uphill → ridge lift
     const ridge = Math.max(0, into) * T.liftGain;
-    const thermal = thermalAt(this.pos[0], this.pos[2], this.time); // vertical lift is NOT scaled by the horizontal-wind crank
-    const updraft = ridge + thermal; // total vertical air motion the bird rides
+    const thermal = thermalAt(this.pos[0], this.pos[2], this.time) * 1.8; // v8: stronger thermal cores (sparse but rewarding to find); NOT scaled by the horizontal-wind crank
+    const updraft = Math.min(5.5, ridge + thermal); // CAP: strong ridge/thermal lift sustains a soar without launching the bird (was spiking +25 on steep windward faces)
     this.lastUpdraft = updraft;
 
     // --- sink: minimal at trim, mushes CUBICALLY when slow — at minSpeed full-nose-up the

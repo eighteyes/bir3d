@@ -42,9 +42,9 @@ const CAM_HIGH = { clearance: 160, height: 55, pitchDeg: 28 };
 const SKY: [number, number, number] = [0.01, 0.012, 0.03];
 
 // Mouse-steer gains: cursor offset from screen-center (normalized -1..1) → rate.
-const YAW_GAIN = 1.1;   // rad/s at full deflection
-const PITCH_GAIN = 0.8; // rad/s at full deflection
-const DEADZONE = 0.06;
+const YAW_GAIN = 1.8;   // rad/s at full deflection (v8: crisper, less sluggish maneuvering)
+const PITCH_GAIN = 1.3; // rad/s at full deflection (v8: more responsive pitch)
+const DEADZONE = 0.05;
 
 async function boot() {
   const overlay = document.getElementById("overlay")!;
