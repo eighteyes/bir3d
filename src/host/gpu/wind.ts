@@ -1,17 +1,19 @@
-// wind.ts — shared analytic wind field + Wind streamline overlay (neon drifting traces).
+// wind.ts — shared analytic wind field + Wind DOT-particle overlay (drifting neon motes).
 // Responsibilities:
 //   - windAt(x,z,t): SINGLE SOURCE OF TRUTH for the wind vector at any world XZ + time. A
 //     divergence-free curl-noise flow plus a slow large-scale drift, CRANKED so the lateral
 //     component is unmistakable (~8-12 m/s vs the bird's ~26 m/s forward → clear cross-track).
-//     Closed-form so the SAME field drives the bird physics (CPU), this streamline overlay (CPU
-//     vertex build), and the overlay compass — zero GPU sync. FLAGGED: stand-in for the GPU fluid
+//     Closed-form so the SAME field drives the bird physics (CPU), this dot overlay (CPU advection),
+//     and the overlay compass — zero GPU sync. FLAGGED: stand-in for the GPU fluid
 //     (src/host/gpu/fluid.ts), which is compute-only and would need frame-laggy async readback +
-//     a grid→world mapping and STILL need a closed form for streamlines/overlay; the analytic field
+//     a grid→world mapping and STILL need a closed form for advection/overlay; the analytic field
 //     keeps one coherent, arbitrarily-sampleable source so the field you SEE is the field that PUSHES.
-//   - Wind: a render pipeline (wind.wgsl) that draws animated neon streamline "comet" ribbons over
-//     the terrain. Streamlines are integrated each frame from windAt along a camera-relative grid
-//     ahead of the camera (so they follow the flight like the v4 EKG rows); comets scroll along the
-//     static field lines to show direction + strength. Depth-tested against terrain, additive glow.
+//   - Wind: a render pipeline (wind.wgsl) that draws a field of drifting neon DOT particles over the
+//     terrain. Each mote's WORLD position is PERSISTED and advected every frame by windAt (p += w*dt),
+//     so the dots literally drift on the wind (motion + density = the flow). Motes that age out or
+//     leave the camera-relative span are recycled ahead. Rendered as additive billboard quads,
+//     depth-tested against terrain (ridges occlude them). NOT regenerated each frame — that would
+//     freeze them in place; persistence is what makes them move.
 //   - thermalAt(x,z,t): explicit vertical updraft (m/s) the bird rides — a few broad thermals so the
 //     vario reads clearly positive somewhere, independent of ridge-lift geometry.
 
@@ -83,36 +85,51 @@ export function thermalAt(
   return Math.pow(core, 2.2) * cfg.thermalAmp;
 }
 
-// --- streamline overlay pipeline ---
+// --- dot-particle overlay pipeline ---
 
-interface StreamParams {
-  lines?: number;    // streamlines across the width
-  steps?: number;    // integration steps per streamline (segments = steps-1)
-  spanAhead?: number;// how far ahead of the camera the seed grid starts (m)
-  spanWide?: number; // half-width of the seed grid (m)
-  stepLen?: number;  // world meters advanced per integration step
+interface DotParams {
+  count?: number;     // number of drifting motes
+  spanAhead?: number; // how far ahead of the camera ground point the field reaches (m)
+  spanBehind?: number;// margin behind the camera before a mote is recycled (m)
+  spanWide?: number;  // half-width of the camera-relative field (m)
+  clearance?: number; // meters above terrain the motes float
+  dotPx?: number;     // on-screen dot diameter (px) — converted to NDC half-extent per frame
 }
 
 export class Wind {
   private cfg: Required<WindConfig>;
-  private lines: number;
-  private steps: number;
+  private count: number;
   private spanAhead: number;
+  private spanBehind: number;
   private spanWide: number;
-  private stepLen: number;
+  private clearance: number;
+  private dotPx: number;
 
-  private vbuf: GPUBuffer;
-  private vertexCount: number;
-  private vertBytes: ArrayBuffer;  // backing buffer uploaded each frame
-  private vertHost: Float32Array;  // view over vertBytes, rebuilt each frame (camera-relative)
+  // PERSISTENT world-space particle state (NOT regenerated each frame — that is what makes them drift).
+  private px: Float32Array;   // world x
+  private pz: Float32Array;   // world z
+  private speedFrac: Float32Array; // cached 0..1 wind speed at the mote (for color/brightness)
+
+  private vbuf: GPUBuffer;     // per-vertex instanced quad data, rebuilt from particle state each frame
+  private vertexCount: number; // count * 6 (two triangles per quad)
+  private vertBytes: ArrayBuffer;
+  private vertHost: Float32Array;
   private ubuf: GPUBuffer;
   private uniformHost: ArrayBuffer;
   private uniformF32: Float32Array;
   private pipeline: GPURenderPipeline;
   private bindGroup: GPUBindGroup;
 
-  // floats/vertex: world.xyz(3) + arc(1, 0..1 along the streamline) + speedFrac(1) = 5
-  private static FPV = 5;
+  private lastTime = -1;       // for per-frame dt derivation from bird.simTime
+  private seeded = false;      // first draw seeds the field around the camera span
+
+  // floats/vertex: center.xyz(3) + corner.xy(2) + speedFrac(1) = 6
+  private static FPV = 6;
+  // fixed quad corners (two tris) reused for every mote.
+  private static CORNERS: ReadonlyArray<[number, number]> = [
+    [-1, -1], [1, -1], [1, 1],
+    [-1, -1], [1, 1], [-1, 1],
+  ];
 
   constructor(
     private device: GPUDevice,
@@ -120,17 +137,21 @@ export class Wind {
     colorFormat: GPUTextureFormat,
     private sampleHeight: (x: number, z: number) => number,
     cfg: WindConfig = {},
-    p: StreamParams = {}
+    p: DotParams = {}
   ) {
     this.cfg = { ...DEFAULTS, ...cfg };
-    this.lines = p.lines ?? 26;
-    this.steps = p.steps ?? 40;
-    this.spanAhead = p.spanAhead ?? -200;
-    this.spanWide = p.spanWide ?? 1300;
-    this.stepLen = p.stepLen ?? 36;
+    this.count = p.count ?? 900;
+    this.spanAhead = p.spanAhead ?? 1400;
+    this.spanBehind = p.spanBehind ?? 260;
+    this.spanWide = p.spanWide ?? 1400;
+    this.clearance = p.clearance ?? 45;
+    this.dotPx = p.dotPx ?? 7;
 
-    const segsPerLine = this.steps - 1;
-    this.vertexCount = this.lines * segsPerLine * 2; // line-list pairs
+    this.px = new Float32Array(this.count);
+    this.pz = new Float32Array(this.count);
+    this.speedFrac = new Float32Array(this.count);
+
+    this.vertexCount = this.count * 6;
     this.vertBytes = new ArrayBuffer(this.vertexCount * Wind.FPV * 4);
     this.vertHost = new Float32Array(this.vertBytes);
     this.vbuf = device.createBuffer({
@@ -138,8 +159,9 @@ export class Wind {
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
 
-    // uniform: mat4 viewProj(16) + eye.xyz(3) + phase(1) + fogColor.rgb(3) + fogDensity(1) = 24
-    this.uniformHost = new ArrayBuffer(24 * 4);
+    // uniform: mat4 viewProj(16) + eye.xyz(3) + aspect(1) + fogColor.rgb(3) + fogDensity(1)
+    //          + dotSize(1) + pad(3) = 28
+    this.uniformHost = new ArrayBuffer(28 * 4);
     this.uniformF32 = new Float32Array(this.uniformHost);
     this.ubuf = device.createBuffer({
       size: this.uniformHost.byteLength,
@@ -156,9 +178,9 @@ export class Wind {
           {
             arrayStride: Wind.FPV * 4,
             attributes: [
-              { shaderLocation: 0, offset: 0, format: "float32x3" },  // world xyz
-              { shaderLocation: 1, offset: 12, format: "float32" },   // arc 0..1
-              { shaderLocation: 2, offset: 16, format: "float32" },   // speedFrac
+              { shaderLocation: 0, offset: 0, format: "float32x3" },  // world center
+              { shaderLocation: 1, offset: 12, format: "float32x2" }, // quad corner ±1
+              { shaderLocation: 2, offset: 20, format: "float32" },   // speedFrac
             ],
           },
         ],
@@ -176,8 +198,8 @@ export class Wind {
           },
         ],
       },
-      primitive: { topology: "line-list", cullMode: "none" },
-      // depth-test (no write) so terrain ridges occlude the wind traces but traces don't z-fight.
+      primitive: { topology: "triangle-list", cullMode: "none" },
+      // depth-test (no write) so terrain ridges occlude the motes but they don't z-fight each other.
       depthStencil: { depthWriteEnabled: false, depthCompare: "less", format: "depth24plus" },
     });
     this.bindGroup = device.createBindGroup({
@@ -186,49 +208,88 @@ export class Wind {
     });
   }
 
-  // Build camera-relative streamlines by integrating windAt from a seed grid ahead of the camera.
-  // Each streamline rides ABOVE the terrain (clearance) so it reads as airflow, not a ground line.
-  private rebuild(
+  // Place one mote at a fresh world position within the camera-relative span (random ahead+lateral).
+  // Used to seed the whole field at start and to recycle motes that drift out.
+  private spawn(
+    i: number,
+    camGround: [number, number],
+    camFwd: [number, number],
+    camRight: [number, number],
+    aheadMin: number
+  ): void {
+    const ahead = aheadMin + Math.random() * (this.spanAhead - aheadMin);
+    const lateral = (Math.random() * 2 - 1) * this.spanWide;
+    this.px[i] = camGround[0] + camFwd[0] * ahead + camRight[0] * lateral;
+    this.pz[i] = camGround[1] + camFwd[1] * ahead + camRight[1] * lateral;
+  }
+
+  // Advect every mote by windAt (p += w*dt), recycle ones that leave the camera-relative span, then
+  // rebuild the billboard vertex buffer from the PERSISTED positions. dt is derived from sim time and
+  // clamped so the first frame and any tab-stall don't fling the motes.
+  private step(
     camGround: [number, number],
     camFwd: [number, number],
     camRight: [number, number],
     t: number
   ): void {
-    const v = this.vertHost;
-    const fpv = Wind.FPV;
-    const CLEAR = 45; // meters above terrain the streamlines float
+    // seed the field once, spread across the whole span so frame-0 is already populated and mid-flow.
+    if (!this.seeded) {
+      for (let i = 0; i < this.count; i++) {
+        this.spawn(i, camGround, camFwd, camRight, -this.spanBehind);
+      }
+      this.seeded = true;
+    }
+
+    let dt = this.lastTime < 0 ? 0 : t - this.lastTime;
+    this.lastTime = t;
+    if (dt < 0) dt = 0;
+    if (dt > 0.05) dt = 0.05; // clamp stalls
+
     const refSpeed = this.cfg.curlAmp + this.cfg.driftAmp; // for speedFrac normalization
+    const v = this.vertHost;
+    const corners = Wind.CORNERS;
     let vi = 0;
-    for (let l = 0; l < this.lines; l++) {
-      // seed across the camera-right axis, ahead of the camera ground point.
-      const lateralFrac = this.lines > 1 ? (l / (this.lines - 1)) * 2 - 1 : 0;
-      const lateral = lateralFrac * this.spanWide;
-      let x = camGround[0] + camFwd[0] * this.spanAhead + camRight[0] * lateral;
-      let z = camGround[1] + camFwd[1] * this.spanAhead + camRight[1] * lateral;
-      // integrate the streamline forward through the field.
-      let prevX = x, prevZ = z;
-      let prevY = this.sampleHeight(prevX, prevZ) + CLEAR;
-      let prevSpeed = Math.hypot(...windAt(prevX, prevZ, t, this.cfg));
-      for (let s = 1; s < this.steps; s++) {
-        const [wx, wz] = windAt(x, z, t, this.cfg);
-        const wl = Math.hypot(wx, wz) || 1;
-        x += (wx / wl) * this.stepLen;
-        z += (wz / wl) * this.stepLen;
-        const y = this.sampleHeight(x, z) + CLEAR;
-        const arcPrev = (s - 1) / (this.steps - 1);
-        const arc = s / (this.steps - 1);
-        const sp = Math.min(1, prevSpeed / (refSpeed * 1.6));
-        // segment prev→cur as a line-list pair
-        v[vi++] = prevX; v[vi++] = prevY; v[vi++] = prevZ; v[vi++] = arcPrev; v[vi++] = sp;
-        v[vi++] = x;     v[vi++] = y;     v[vi++] = z;     v[vi++] = arc;     v[vi++] = sp;
-        prevX = x; prevZ = z; prevY = y;
-        prevSpeed = Math.hypot(wx, wz);
+    for (let i = 0; i < this.count; i++) {
+      let x = this.px[i]!;
+      let z = this.pz[i]!;
+
+      // advect by the SAME shared field (no amplification — drift accumulates over the mote lifetime).
+      const [wx, wz] = windAt(x, z, t, this.cfg);
+      x += wx * dt;
+      z += wz * dt;
+
+      // recycle: project onto the camera-relative basis; respawn ahead if out of the span.
+      const rx = x - camGround[0];
+      const rz = z - camGround[1];
+      const fwdDist = rx * camFwd[0] + rz * camFwd[1];   // along view
+      const sideDist = rx * camRight[0] + rz * camRight[1]; // lateral
+      if (fwdDist < -this.spanBehind || fwdDist > this.spanAhead || Math.abs(sideDist) > this.spanWide) {
+        // reseed near the FAR edge of the span so the field stays full as the camera advances.
+        this.spawn(i, camGround, camFwd, camRight, this.spanAhead * 0.55);
+        x = this.px[i]!;
+        z = this.pz[i]!;
+      } else {
+        this.px[i] = x;
+        this.pz[i] = z;
+      }
+
+      const sp = Math.min(1, Math.hypot(wx, wz) / (refSpeed * 1.4));
+      this.speedFrac[i] = sp;
+      const y = this.sampleHeight(x, z) + this.clearance;
+
+      // emit two triangles (6 verts) — same world center, four corners.
+      for (let c = 0; c < 6; c++) {
+        const [cx, cy] = corners[c]!;
+        v[vi++] = x; v[vi++] = y; v[vi++] = z;
+        v[vi++] = cx; v[vi++] = cy;
+        v[vi++] = sp;
       }
     }
     this.device.queue.writeBuffer(this.vbuf, 0, this.vertBytes);
   }
 
-  // SECOND pass: LOAD terrain color+depth (no clear); draw streamline comets over the ridges.
+  // SECOND pass: LOAD terrain color+depth (no clear); draw the drifting dot motes over the ridges.
+  // Signature is UNCHANGED from the streamline version so the bird-main.ts call site is untouched.
   draw(
     encoder: GPUCommandEncoder,
     colorView: GPUTextureView,
@@ -240,16 +301,25 @@ export class Wind {
     eye: [number, number, number],
     time: number,
     fogColor: [number, number, number],
-    fogDensity: number
+    fogDensity: number,
+    aspect = 1
   ): void {
-    this.rebuild(camGround, camFwd, camRight, time);
+    this.step(camGround, camFwd, camRight, time);
+
+    // dotPx (screen px diameter) → NDC half-extent: full clip span is 2 across pxW. The VS scales the
+    // x offset by clip.w only and the y offset by clip.w*aspect, so this half-extent uses the X axis.
+    // (pxW is recovered as aspect maps x/y; pass an effective px width via aspect = pxW/pxH and a fixed
+    //  reference width baked here.) Use viewport-independent sizing: half-extent = dotPx / refWidth.
+    const REF_W = 1000; // reference canvas width the dotPx was tuned against
+    const dotSize = this.dotPx / REF_W;
 
     const u = this.uniformF32;
     u.set(viewProj, 0);
     u[16] = eye[0]; u[17] = eye[1]; u[18] = eye[2];
-    u[19] = time;                                 // comet scroll phase
+    u[19] = aspect;                               // pxW/pxH for round dots
     u[20] = fogColor[0]; u[21] = fogColor[1]; u[22] = fogColor[2];
     u[23] = fogDensity;
+    u[24] = dotSize;                              // NDC half-extent
     this.device.queue.writeBuffer(this.ubuf, 0, this.uniformHost);
 
     const pass = encoder.beginRenderPass({

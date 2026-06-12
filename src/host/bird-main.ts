@@ -235,10 +235,10 @@ async function boot() {
     terrain.draw(enc, colorView, depthView, viewProj, camGround, camFwd, camRight, eye, {
       r: SKY[0], g: SKY[1], b: SKY[2], a: 1,
     });
-    // wind pass: loads color+depth (no clear); neon streamline comets over the ridges (depth-tested,
-    // no depth-write) — uses the bird's sim time so the drawn field matches the field that pushes.
+    // wind pass: loads color+depth (no clear); drifting neon DOT motes over the ridges (depth-tested,
+    // no depth-write) — advected by the bird's sim time so the drawn field matches the field that pushes.
     wind.draw(enc, colorView, depthView, viewProj, camGround, camFwd, camRight, eye,
-      bird.simTime, SKY, 1 / 700);
+      bird.simTime, SKY, 1 / 700, pxW / pxH);
     // bird pass: loads color+depth, depth-tested → ridges occlude the bird.
     bird.draw(enc, colorView, depthView, viewProj);
     // altitude plumb-line + ground diamond under the bird (depth-tested → ridges occlude it).
