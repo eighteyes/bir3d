@@ -24,8 +24,13 @@ import { Bird3D, type BirdInput } from "./gpu/bird3d";
 import { Wind } from "./gpu/wind";
 import { GroundMarker } from "./gpu/marker";
 import { ChaseCamera } from "./gpu/camera";
+import { AutoPilot } from "./autopilot";
 import { perspective, multiply } from "./gpu/mat4";
 import { FrameLoop } from "./frameloop";
+
+// AUTOPILOT MODE (this pass): manual controls OFF — the AutoPilot flies, proving autonomous
+// soaring (find lift, ride it, never touch the ground) before flapping/controls return.
+const AUTOPILOT = true;
 
 const FOV_Y = (60 * Math.PI) / 180;
 const FOV_KICK = (16 * Math.PI) / 180; // extra FOV at dive ceiling — speed reads as widening view
@@ -41,9 +46,11 @@ const CAM_HIGH = { clearance: 160, height: 55, pitchDeg: 28 };
 // this dark ground (NO fill); far lines fade into this haze. Very dark so the neon lines read.
 const SKY: [number, number, number] = [0.01, 0.012, 0.03];
 
-// Mouse-steer gains: cursor offset from screen-center (normalized -1..1) → rate.
-const YAW_GAIN = 1.8;   // rad/s at full deflection (v8: crisper, less sluggish maneuvering)
-const PITCH_GAIN = 1.3; // rad/s at full deflection (v8: more responsive pitch)
+// Mouse-steer gains. Yaw: cursor offset → turn RATE. Pitch: cursor HEIGHT → nose ATTITUDE
+// (holdable — park the cursor, the nose stays put; center = gentle glide trim).
+const YAW_GAIN = 1.8;        // rad/s at full deflection (v8: crisper, less sluggish maneuvering)
+const PITCH_RANGE = 0.6;     // rad of nose angle at full vertical deflection
+const GLIDE_TRIM = -0.03;    // rad — centered-cursor attitude: a gentle settling descent
 const DEADZONE = 0.05;
 
 async function boot() {
@@ -105,6 +112,9 @@ async function boot() {
   const markerShader = await fetch("/src/host/shaders/marker.wgsl").then((r) => r.text());
   const marker = new GroundMarker(device, markerShader, format);
 
+  // hands-off soaring controller (AUTOPILOT mode) — emits the same BirdInput the mouse did.
+  const auto = new AutoPilot(terrain);
+
   // Chase cam follows the bird POSITION + HEADING only (world-up, ground-locked aim). Looks DOWN
   // on the bird's back at a FIXED angle so the ground ALWAYS fills the lower frame, whatever the
   // bird's pitch — this is the v3 ground-lock fix.
@@ -117,7 +127,7 @@ async function boot() {
   });
 
   // --- input: mouse-steer only (pure glide) ---
-  const input: BirdInput = { yawRate: 0, pitchRate: 0 };
+  const input: BirdInput = { yawRate: 0, pitchTarget: GLIDE_TRIM };
   // normalized cursor offset from screen-center (-1..1); start centered (no steer before first move).
   let mouseX = 0, mouseY = 0;
 
@@ -177,8 +187,8 @@ async function boot() {
   window.addEventListener("resize", resize);
 
   // Scripted pitch wobble (THIS task): auto nose up/down so the screenshot proves the camera keeps
-  // the ground framed no matter how hard the BIRD pitches. window.__autoWobble defaults on.
-  (window as any).__autoWobble = true;
+  // the ground framed no matter how hard the BIRD pitches. Off in AUTOPILOT mode (the pilot flies).
+  (window as any).__autoWobble = !AUTOPILOT;
   let wobbleT = 0;
 
   let frame = 0;
@@ -187,16 +197,23 @@ async function boot() {
   const loop = new FrameLoop((dt) => {
     fps = fps * 0.9 + (1 / Math.max(dt, 1e-3)) * 0.1;
 
-    // map input
-    input.yawRate = applyDead(mouseX) * YAW_GAIN;
-    input.pitchRate = -applyDead(mouseY) * PITCH_GAIN; // mouse-up = nose-up
+    // map input: AUTOPILOT flies (manual controls OFF this pass); else mouse-steer.
+    if (AUTOPILOT) {
+      const cmd = auto.update(bird, dt);
+      input.yawRate = cmd.yawRate;
+      input.pitchTarget = cmd.pitchTarget;
+      (window as any).__autoMode = auto.mode;
+    } else {
+      input.yawRate = applyDead(mouseX) * YAW_GAIN;
+      input.pitchTarget = GLIDE_TRIM - applyDead(mouseY) * PITCH_RANGE; // mouse-up = nose-up, holdable
+    }
 
     // scripted pitch wobble drives the bird hard up/down; the camera must NOT follow the pitch.
     // PITCH ONLY (no yaw) → heading stays 0 so the world-axis EKG rows render as clean horizontal
-    // stacked lines; the wobble is purely the ground-lock proof.
-    if ((window as any).__autoWobble) {
+    // stacked lines; the wobble is purely the ground-lock proof. (manual mode only)
+    if (!AUTOPILOT && (window as any).__autoWobble) {
       wobbleT += dt;
-      input.pitchRate = Math.sin(wobbleT * 1.1) * PITCH_GAIN * 1.6; // exceeds manual range → hard pitch
+      input.pitchTarget = Math.sin(wobbleT * 1.1) * 0.65; // sweeps near the full attitude range
       input.yawRate = 0;
     }
 
@@ -266,7 +283,7 @@ async function boot() {
     const varioStr = `${vario >= 0 ? "+" : ""}${vario.toFixed(1)}`;
     const windSpeed = Math.hypot(bird.lastWind[0], bird.lastWind[1]);
     overlay.textContent =
-      `vector-system — bird3d (soaring glider chase)\n` +
+      `vector-system — bird3d (soaring glider chase)${AUTOPILOT ? `   AUTO: ${auto.mode}` : ""}\n` +
       `alt over terrain: ${bird.lastClearance.toFixed(0)} m   air: ${bird.lastSpeed.toFixed(0)} m/s\n` +
       `vario: ${varioStr} m/s ${vario > 0.5 ? "▲" : vario < -0.5 ? "▼" : "—"}   updraft: +${bird.lastUpdraft.toFixed(1)} m/s\n` +
       `heading: ${headingDeg.toFixed(0)}°   ground-track: ${trackDeg.toFixed(0)}°   DRIFT: ${drift >= 0 ? "+" : ""}${drift.toFixed(0)}°\n` +

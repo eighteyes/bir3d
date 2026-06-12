@@ -24,8 +24,8 @@ import type { TerrainEKG } from "./terrain";
 import { windAt, thermalAt } from "./wind";
 
 export interface BirdInput {
-  yawRate: number;   // rad/s, from mouse-x offset
-  pitchRate: number; // rad/s, from mouse-y offset
+  yawRate: number;     // rad/s, from mouse-x offset (rate: hold to keep turning)
+  pitchTarget: number; // rad, from mouse-y offset (ATTITUDE: cursor height = nose angle, holdable)
 }
 
 export interface BirdTuning {
@@ -45,6 +45,27 @@ export interface BirdTuning {
 }
 
 type Vec3 = [number, number, number];
+
+// Updraft the PHYSICS applies at world (x,z) at sim time t — ridge lift (wind · uphill, gained)
+// + thermal cores, capped. Exported so the autopilot SENSES exactly the air the bird RIDES.
+export function updraftAt(
+  x: number,
+  z: number,
+  t: number,
+  terrain: TerrainEKG,
+  T: Required<BirdTuning>
+): number {
+  const [bwx, bwz] = windAt(x, z, t);
+  const wx = bwx * T.windGain;
+  const wz = bwz * T.windGain;
+  const eps = 6;
+  const hC = terrain.sampleHeight(x, z);
+  const gx = (terrain.sampleHeight(x + eps, z) - hC) / eps;
+  const gz = (terrain.sampleHeight(x, z + eps) - hC) / eps;
+  const ridge = Math.max(0, wx * gx + wz * gz) * T.liftGain;
+  const thermal = thermalAt(x, z, t) * 1.8; // stronger sparse cores (see integrate)
+  return Math.min(5.5, ridge + thermal);    // cap mirrors integrate's anti-launch clamp
+}
 
 const FLOATS_PER_VERT = 6; // local.xyz + attr.xyz
 const UNIFORM_BYTES = 96;  // mat4(64) + pos(12)+flapPhase(4) + heading,bank,flapHz,flapAmp(16) = 96
@@ -91,7 +112,7 @@ export class Bird3D {
       minSpeed: t.minSpeed ?? 13,
       maxSpeed: t.maxSpeed ?? 55,
       dragK: t.dragK ?? 0.4,
-      divePower: t.divePower ?? 0.9,
+      divePower: t.divePower ?? 1.1, // dives pay out visibly (was 0.9)
       gravity: t.gravity ?? 9.0,
       sinkRate: t.sinkRate ?? 1.4,   // v8: gentler sink (2.2→1.4) — glide efficiently, more time to find lift
       windGain: t.windGain ?? 1.6,  // multiplier on the shared windAt field (CRANKED)
@@ -171,15 +192,12 @@ export class Bird3D {
     const clamped = Math.min(dt, 1 / 20);
     const T = this.tuning;
 
-    // --- steering: mouse offsets drive yaw & pitch rate; bank eases toward yaw rate ---
+    // --- steering: mouse-x drives yaw RATE; mouse-y drives pitch ATTITUDE (holdable — the nose
+    // eases toward the cursor's target angle and STAYS there; centered cursor = gentle glide trim,
+    // which replaces the old hands-off auto-trim) ---
     this.heading += input.yawRate * clamped;
-    this.pitch += input.pitchRate * clamped;
-    // hands-off auto-trim: with ~no pitch input, ease toward a gentle glide attitude (slightly
-    // nose-down) so the glider settles into a steady DESCENT instead of holding a climb.
-    if (Math.abs(input.pitchRate) < 1e-3) {
-      this.pitch += (-0.03 - this.pitch) * Math.min(1, clamped * 0.8);
-    }
-    this.pitch = Math.max(-0.7, Math.min(0.7, this.pitch));
+    const pitchGoal = Math.max(-0.7, Math.min(0.7, input.pitchTarget));
+    this.pitch += (pitchGoal - this.pitch) * Math.min(1, clamped * 3.5);
     const targetBank = -input.yawRate * 0.5; // roll into the turn
     this.bank += (targetBank - this.bank) * Math.min(1, clamped * 4);
 
@@ -216,6 +234,7 @@ export class Bird3D {
     const hZ = this.terrain.sampleHeight(this.pos[0], this.pos[2] + eps);
     const gx = (hX - hC) / eps; // uphill gradient
     const gz = (hZ - hC) / eps;
+    // (kept in sync via the exported updraftAt — same ridge+thermal+cap math; gx/gz reused above)
     const into = wx * gx + wz * gz; // wind · uphill → ridge lift
     const ridge = Math.max(0, into) * T.liftGain;
     const thermal = thermalAt(this.pos[0], this.pos[2], this.time) * 1.8; // v8: stronger thermal cores (sparse but rewarding to find); NOT scaled by the horizontal-wind crank
