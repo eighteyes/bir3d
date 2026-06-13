@@ -256,11 +256,12 @@ export class Wind {
     // down the lee). `w` is computed pre-deflection so the vertical pour is unchanged — only the horizontal
     // path reorients from along-contour to into-and-over, and more motes dwell in the bright climbing state.
     this.deflect = p.deflect ?? 0.25;
-    // v10 DENSITY: bias the seed distance toward the NEAR field so the cloud is THICK around the bird and
-    // thins into the distance. ahead = near + (far−near)·rand^nearBias; k=2.6 lands ~70% of motes in the
-    // near third (the camera→bird→just-beyond band; bird sits ~followDist=120m ahead) — inverts v9's
-    // uniform-world seed where perspective made the FAR field read densest.
-    this.nearBias = p.nearBias ?? 2.6;
+    // v11 DISTANCE: the dedicated near comet SPHERE now owns the bird vicinity, so the FAR long-line tier
+    // is freed to SPREAD into the distance (v11 wants distant wind = long curved lines). Drop nearBias
+    // 2.6→1.3: at 2.6 ~61% of far motes piled in the near third (16% reached the far third) — they crowded
+    // the sphere and STARVED the distance; 1.3 rebalances to ~37/34/29% near/mid/far so the long lines
+    // populate the distance where they read as flowing arcs. ahead = near + (far−near)·rand^nearBias.
+    this.nearBias = p.nearBias ?? 1.3;
     // CURVED long tails: segments × segStep seconds of flow integrated backward = the comet arc. Much
     // longer than v8: 10 × 0.5s ≈ 5s of real flow (~35-50m near/mid-field) so the arc spans the deflection
     // zone near a ridge and the curve is unmistakable. segStep is the cheap length knob (no extra verts).
