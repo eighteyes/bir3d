@@ -367,11 +367,15 @@ export class Wind {
     // the sphere and STARVED the distance; 1.3 rebalances to ~37/34/29% near/mid/far so the long lines
     // populate the distance where they read as flowing arcs. ahead = near + (far−near)·rand^nearBias.
     this.nearBias = p.nearBias ?? 1.3;
-    // CURVED long tails: segments × segStep seconds of flow integrated backward = the comet arc. Much
-    // longer than v8: 10 × 0.5s ≈ 5s of real flow (~35-50m near/mid-field) so the arc spans the deflection
-    // zone near a ridge and the curve is unmistakable. segStep is the cheap length knob (no extra verts).
-    this.segments = p.segments ?? 10;
-    this.segStep = p.segStep ?? 0.5;
+    // CURVED long tails: segments × segStep seconds of flow integrated backward = the comet arc. v13
+    // PERF: the per-segment flowAt (4 sampleHeight each) tail loop dominated the CPU frame once the
+    // livelier fluid wind let more far motes survive the speed cull (fps 60→51). Cut segments 10→6 and
+    // bump segStep 0.5→0.8 so the arc keeps the SAME ~5s/35-50m flow span (and visible curve) with 40%
+    // fewer flowAt+clamp evals and 40% fewer verts. Tail flowAt is further sub-sampled below (every 2nd
+    // segment) to halve the remaining gradient cost while preserving the curve. segStep is the free length
+    // knob (no extra verts); the curve survives because flow is still sampled along the path (not reused).
+    this.segments = p.segments ?? 6;
+    this.segStep = p.segStep ?? 0.8;
     // small head: many tiny motes, not star-like blobs.
     this.dotPx = p.dotPx ?? 2.6;
     // calmest-air segment step = 25% (short stubby arc); fast air = full step (long arc). Kept LOW so the
@@ -692,13 +696,21 @@ export class Wind {
       }
 
       // CURVED TAIL: integrate BACKWARD along flowAt from the head, building a polyline of seg+1 points.
-      // tail length scales with speed (calm = short stub, fast = long arc). Each step is RK-lite (single
-      // eval) upwind; the path bends as flowAt changes over the terrain → the comet arcs over the ridges.
+      // tail length scales with speed (calm = short stub, fast = long arc). The path bends as flowAt changes
+      // over the terrain → the comet arcs over the ridges. v13 PERF: flowAt (4 sampleHeight each) was called
+      // PER segment — the dominant CPU cost. Cut it two ways WITHOUT losing the curve: (1) the FIRST step
+      // reuses the head flow [wx,wz,w] already computed for advection above (free; the head IS where flowAt
+      // was just sampled). (2) thereafter re-evaluate flowAt only every 2nd segment and HOLD it between —
+      // halves the gradient cost; over a ~6-8m sub-step the flow barely changes so the arc still reads
+      // curved (flow is still re-sampled along the path, not reused for the whole tail like the near comet).
+      // The per-POINT terrain clamp is KEPT (the 35-50m far tail crosses ridges and must not sink in).
       const stepLen = this.segStep * (this.tailFloor + (1 - this.tailFloor) * sp);
       ptX[0] = x; ptY[0] = y; ptZ[0] = z;
       let cx = x, cy = y, cz = z;
+      let fwx = wx, fwz = wz, fw = w; // step 1 reuses the head flow (sampled at the head above)
       for (let s = 1; s <= seg; s++) {
-        const [fwx, fwz, fw] = this.flowAt(cx, cz, t);
+        // re-sample flow every 2nd segment (steps 1,3,5…); hold the previous sample on the in-between steps.
+        if (s > 1 && (s & 1) === 1) { const f = this.flowAt(cx, cz, t); fwx = f[0]; fwz = f[1]; fw = f[2]; }
         cx -= fwx * stepLen;
         cz -= fwz * stepLen;
         cy -= fw * stepLen;
