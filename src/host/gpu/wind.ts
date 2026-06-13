@@ -9,7 +9,15 @@
 //     a grid→world mapping and STILL need a closed form for advection/overlay; the analytic field
 //     keeps one coherent, arbitrarily-sampleable source so the field you SEE is the field that PUSHES.
 //     FROZEN: windAt/thermalAt/potential/DEFAULTS drive the bird flight physics — do NOT retune them.
-//   - Wind: a render pipeline (wind.wgsl) that draws drifting neon COMET motes over the terrain.
+//   - Wind: a render pipeline (wind.wgsl) that draws drifting neon COMET motes over the terrain in TWO
+//     TIERS for legibility (v11):
+//       FAR / DISTANCE = the existing persistent population of LONG curved streamline lines (the v9/v10
+//         model below) — distant wind reads as long flowing arcs over the ridges.
+//       NEAR / UP-CLOSE = a DENSE WIND SPHERE of LITTLE short-tailed comets seeded in a BALL centered on
+//         the BIRD (radius ~80m), advected by the same terrain-aware flowAt; comets that drift outside the
+//         ball are recycled back inside so the sphere follows the bird. Rendered DENSE (no density cull —
+//         vis=1 for every near mote) so the local air is unmistakably legible right where the bird is.
+//     Both tiers share one pipeline/shader/vertex-format and draw in a single combined vertex buffer.
 //     v9 model — wind INTERACTS WITH TERRAIN + curved longer tails (supersedes v8's flat streaks):
 //     each mote carries a persisted 3D world position (x,y,z) advected each frame by flowAt() — the
 //     TERRAIN-SHAPED flow built on top of the frozen windAt: (1) VERTICAL — w = horizontalWind ·
@@ -129,6 +137,11 @@ interface DotParams {
   densityFloor?: number; // fraction of motes that survive the speed-fade even in the calmest air (0..1)
   speedLo?: number;   // |windAt| (m/s) mapped to speedFrac 0 (calm) — calibrated to the field min
   speedHi?: number;   // |windAt| (m/s) mapped to speedFrac 1 (fast) — calibrated to the field max
+  // --- v11 NEAR WIND SPHERE (dense little comets centered on the bird) ---
+  nearCount?: number;    // number of little comets packed in the bird-centered ball (DENSE)
+  nearRadius?: number;   // radius (m) of the sphere around the bird
+  nearSegments?: number; // tail segment count for the LITTLE comets (short → distinct from far lines)
+  nearSegStep?: number;  // seconds of flow integrated per near-comet tail segment (short tail)
 }
 
 export class Wind {
@@ -151,6 +164,21 @@ export class Wind {
   private densityFloor: number;
   private speedLo: number;
   private speedHi: number;
+
+  // --- v11 NEAR WIND SPHERE state (bird-centered dense little comets) ---
+  private nearCount: number;
+  private nearRadius: number;
+  private nearSegments: number;
+  private nearSegStep: number;
+  private nx: Float32Array;   // near-comet world x (per near mote)
+  private ny: Float32Array;   // near-comet world y (advected height)
+  private nz: Float32Array;   // near-comet world z
+  private nptX: Float32Array; // scratch polyline for the near comet (nearSegments+1)
+  private nptY: Float32Array;
+  private nptZ: Float32Array;
+  private nearSeeded = false; // first draw with a valid bird pos seeds the ball
+  private farVertexCount: number; // far-tier vertices (the long-line population)
+  private nearVertexCount: number; // near-tier vertices (the sphere)
 
   // PERSISTENT world-space particle state (NOT regenerated each frame — that is what makes them drift).
   // v9: each mote carries a 3D position (x, y, z); y is ADVECTED by the vertical flow w (terrain-shaped),
@@ -251,6 +279,14 @@ export class Wind {
     this.speedLo = p.speedLo ?? 2.0;
     this.speedHi = p.speedHi ?? 15.0;
 
+    // v11 NEAR SPHERE: a DENSE ball of LITTLE short-tailed comets around the bird. 1200 motes in an ~80m
+    // ball makes the local air unmistakably legible (the v11 fix). Short tails (4 × 0.22s ≈ 0.9s of flow,
+    // ~8-12m) keep them reading as little comets, NOT the far long lines — and bound the per-frame cost.
+    this.nearCount = p.nearCount ?? 1200;
+    this.nearRadius = p.nearRadius ?? 80;
+    this.nearSegments = p.nearSegments ?? 4;
+    this.nearSegStep = p.nearSegStep ?? 0.22;
+
     this.px = new Float32Array(this.count);
     this.py = new Float32Array(this.count);
     this.pz = new Float32Array(this.count);
@@ -259,7 +295,17 @@ export class Wind {
     this.ptY = new Float32Array(this.segments + 1);
     this.ptZ = new Float32Array(this.segments + 1);
 
-    this.vertexCount = this.count * this.segments * 6;
+    this.nx = new Float32Array(this.nearCount);
+    this.ny = new Float32Array(this.nearCount);
+    this.nz = new Float32Array(this.nearCount);
+    this.nptX = new Float32Array(this.nearSegments + 1);
+    this.nptY = new Float32Array(this.nearSegments + 1);
+    this.nptZ = new Float32Array(this.nearSegments + 1);
+
+    // combined vertex buffer: FAR long-line tier + NEAR sphere tier, drawn in one pass (shared format).
+    this.farVertexCount = this.count * this.segments * 6;
+    this.nearVertexCount = this.nearCount * this.nearSegments * 6;
+    this.vertexCount = this.farVertexCount + this.nearVertexCount;
     this.vertBytes = new ArrayBuffer(this.vertexCount * Wind.FPV * 4);
     this.vertHost = new Float32Array(this.vertBytes);
     this.vbuf = device.createBuffer({
@@ -350,6 +396,25 @@ export class Wind {
     this.pz[i] = z;
     // seed height at nominal clearance over the terrain; advection then pours it up/over the ridges.
     this.py[i] = this.sampleHeight(x, z) + this.clearance;
+  }
+
+  // v11: place near-comet i UNIFORMLY inside the ball of radius nearRadius centered on the bird. Uniform
+  // VOLUME density (r = R·cbrt(rand), random direction) so the sphere is evenly DENSE, not center-heavy.
+  // y is clamped above terrain so the comet never seeds inside a ridge; flowAt then advects it normally.
+  private seedNearMote(i: number, birdPos: [number, number, number]): void {
+    const R = this.nearRadius;
+    const r = R * Math.cbrt(Math.random());
+    // random unit vector (uniform on sphere) via z + azimuth.
+    const ct = 2 * Math.random() - 1;          // cos(theta) uniform in [-1,1]
+    const st = Math.sqrt(Math.max(0, 1 - ct * ct));
+    const ph = 2 * Math.PI * Math.random();
+    const x = birdPos[0] + r * st * Math.cos(ph);
+    const y0 = birdPos[1] + r * ct;
+    const z = birdPos[2] + r * st * Math.sin(ph);
+    const floor = this.sampleHeight(x, z) + this.minClear;
+    this.nx[i] = x;
+    this.ny[i] = y0 < floor ? floor : y0;
+    this.nz[i] = z;
   }
 
   // TERRAIN-SHAPED flow at world (x,z): the frozen horizontal windAt, plus a VERTICAL component and a
@@ -525,7 +590,94 @@ export class Wind {
         }
       }
     }
-    this.device.queue.writeBuffer(this.vbuf, 0, this.vertBytes);
+  }
+
+  // v11 NEAR SPHERE: advect the dense little comets around the bird, recycle any that leave the ball back
+  // inside, and emit their short curved tails into the SAME host vertex array (after the far tier's verts).
+  // Same terrain-shaped flowAt → coherent with the shared flow + respects terrain. vis is forced to 1 (NO
+  // density cull) so the sphere renders DENSE and unmistakably legible right where the bird is.
+  private stepNear(birdPos: [number, number, number], t: number, dt: number): void {
+    // seed once we have a real bird position (first frame): fill the whole ball so it is immediately dense.
+    if (!this.nearSeeded) {
+      for (let i = 0; i < this.nearCount; i++) this.seedNearMote(i, birdPos);
+      this.nearSeeded = true;
+    }
+
+    const lo = this.speedLo, hi = this.speedHi;
+    const v = this.vertHost;
+    const corners = Wind.CORNERS;
+    const seg = this.nearSegments;
+    const ptX = this.nptX, ptY = this.nptY, ptZ = this.nptZ;
+    const R2 = this.nearRadius * this.nearRadius;
+    // write after the far tier's verts.
+    let vi = this.farVertexCount * Wind.FPV;
+
+    for (let i = 0; i < this.nearCount; i++) {
+      let x0 = this.nx[i]!, y0 = this.ny[i]!, z0 = this.nz[i]!;
+
+      // recycle: if the comet has drifted outside the bird-centered ball, reseed it back inside (the
+      // sphere follows the bird as it moves). 3D distance test against the radius.
+      const dxb = x0 - birdPos[0], dyb = y0 - birdPos[1], dzb = z0 - birdPos[2];
+      if (dxb * dxb + dyb * dyb + dzb * dzb > R2) {
+        this.seedNearMote(i, birdPos);
+        x0 = this.nx[i]!; y0 = this.ny[i]!; z0 = this.nz[i]!;
+      }
+
+      // advect by the SAME terrain-shaped flow (horizontal deflected + vertical pour) → respects terrain.
+      const [wx, wz, w] = this.flowAt(x0, z0, t);
+      const x = x0 + wx * dt;
+      const z = z0 + wz * dt;
+      const terr = this.sampleHeight(x, z);
+      let y = y0 + w * dt;
+      const loY = terr + this.minClear;        // stay above ground
+      if (y < loY) y = loY;
+      this.nx[i] = x; this.ny[i] = y; this.nz[i] = z;
+
+      // speed tint (same calibration as the far tier) — little comets still brighten in fast air.
+      const wspeed = Math.hypot(wx, wz);
+      const u = Math.min(1, Math.max(0, (wspeed - lo) / (hi - lo)));
+      let sp = u * u * (3 - 2 * u);
+      const climbFrac = Math.min(1, Math.max(0, w / 7.0));
+      sp = Math.max(sp, climbFrac);
+
+      // SHORT curved tail: integrate backward along flowAt a few small steps. No speed-scaling of length
+      // here — these are uniformly little comets, the point is DENSITY + legibility, not speed-read.
+      const stepLen = this.nearSegStep;
+      ptX[0] = x; ptY[0] = y; ptZ[0] = z;
+      let cx = x, cy = y, cz = z;
+      for (let s = 1; s <= seg; s++) {
+        const [fwx, fwz, fw] = this.flowAt(cx, cz, t);
+        cx -= fwx * stepLen;
+        cz -= fwz * stepLen;
+        cy -= fw * stepLen;
+        const tb = this.sampleHeight(cx, cz) + this.minClear;
+        if (cy < tb) cy = tb;
+        ptX[s] = cx; ptY[s] = cy; ptZ[s] = cz;
+      }
+
+      // emit a quad per segment; vis forced to 1 → DENSE (no cull). along = head→tail fade over the ribbon.
+      for (let s = 0; s < seg; s++) {
+        const ax = ptX[s]!, ay = ptY[s]!, az = ptZ[s]!;
+        const bx = ptX[s + 1]!, by = ptY[s + 1]!, bz = ptZ[s + 1]!;
+        let sdx = bx - ax, sdz = bz - az;
+        const sdl = Math.hypot(sdx, sdz);
+        if (sdl > 1e-5) { sdx /= sdl; sdz /= sdl; } else { sdx = 1; sdz = 0; }
+        const alongN = s / seg;
+        const alongF = (s + 1) / seg;
+        for (let c = 0; c < 6; c++) {
+          const [pick, perp] = corners[c]!;
+          const ex = pick > 0.5 ? bx : ax;
+          const ey = pick > 0.5 ? by : ay;
+          const ez = pick > 0.5 ? bz : az;
+          const al = pick > 0.5 ? alongF : alongN;
+          v[vi++] = ex; v[vi++] = ey; v[vi++] = ez;
+          v[vi++] = pick; v[vi++] = perp;
+          v[vi++] = sp;
+          v[vi++] = sdx; v[vi++] = sdz;
+          v[vi++] = al; v[vi++] = 1; // vis=1 → always drawn (DENSE)
+        }
+      }
+    }
   }
 
   // SECOND pass: LOAD terrain color+depth (no clear); draw the drifting dot motes over the ridges.
@@ -542,9 +694,17 @@ export class Wind {
     time: number,
     fogColor: [number, number, number],
     fogDensity: number,
-    aspect = 1
+    aspect: number,
+    birdPos: [number, number, number]
   ): void {
+    // derive dt once (shared by both tiers) so the near sphere advances in lock-step with the far field.
+    let dt = this.lastTime < 0 ? 0 : time - this.lastTime;
+    if (dt < 0) dt = 0;
+    if (dt > 0.05) dt = 0.05;
     this.step(camGround, camFwd, camRight, time);
+    this.stepNear(birdPos, time, dt);
+    // single upload of the combined (far + near) vertex buffer.
+    this.device.queue.writeBuffer(this.vbuf, 0, this.vertBytes);
 
     // dotPx (screen px diameter) → NDC half-width for the ribbon perpendicular thickness. The curved
     // tail LENGTH now lives in the integrated world-space polyline (built in step()), not in a uniform —

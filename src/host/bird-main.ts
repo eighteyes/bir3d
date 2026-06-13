@@ -264,7 +264,7 @@ async function boot() {
     // wind pass: loads color+depth (no clear); drifting neon DOT motes over the ridges (depth-tested,
     // no depth-write) — advected by the bird's sim time so the drawn field matches the field that pushes.
     wind.draw(enc, colorView, depthView, viewProj, camGround, camFwd, camRight, eye,
-      bird.simTime, SKY, 1 / 1400, pxW / pxH); // fog expanded 2× alongside the terrain's
+      bird.simTime, SKY, 1 / 1400, pxW / pxH, bird.pos); // fog expanded 2× alongside the terrain's; bird.pos = near-sphere center
     // bird pass: loads color+depth, depth-tested → ridges occlude the bird.
     bird.draw(enc, colorView, depthView, viewProj);
     // altitude plumb-line + ground diamond under the bird (depth-tested → ridges occlude it).
