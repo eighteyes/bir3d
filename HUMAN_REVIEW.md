@@ -904,3 +904,35 @@ Open http://localhost:5174/index-bird.html (falls back to 5173). Watch the wind 
 - `targetBand=3.0` in `fluid-wind.ts` contradicts its own comment ("mean ~8.5") and `wind.ts` `FLUID_MAX` comment ("mean ~10/max ~16"); the regulated SCALE plus `FLUID_MAX=10` clamp produce the observed ~15-17 peak — comments are stale, the measured number is authoritative.
 - A/B probe harnesses: `.ai/tmp/v13-gate.mjs` (full gate), `.ai/tmp/v13-fps-probe.mjs` / `v13-fps-headed.mjs` (raw rAF), `.ai/tmp/v13-ab.mjs` (fluid marginal cost). All Playwright + Metal WebGPU flags, port 5174 then 5173, wait `window.__birdBooted`.
 - The ~45fps ceiling is real (pre-existing in committed v13) and worth a separate perf pass; the prime suspect is the motes' per-mote 10-segment `sampleHeight` tail loop (`wind.ts` flags it as the dominant CPU cost), but it was NOT isolated and is OUT of v13 scope.
+
+## Bird 3D wind perf: far-mote tail lightened, fps restored
+**Date:** 2026-06-13
+**Commit:** eda55a8 (`gpu/wind.ts` only — far-mote curved-tail build cost cut)
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done (`wind.ts` only)
+- PROBLEM: v13 wired the live GPU fluid as `windAt`'s base. The fluid STEP is cheap; the cost is the FAR-mote CURVED TAIL — each far mote built a ~10-segment polyline integrated along the flow, calling `sampleHeight`+`flowAt` PER SEGMENT. The livelier fluid let more far motes survive the speed cull, so this loop dominated the CPU frame (fps 60→~51, the v13-gate entry above flagged this exact loop as the prime suspect).
+- FIX (far tier only; near comet sphere was already cheap and is unchanged):
+  - Far tail segments 10→6, `segStep` 0.5→0.8 — SAME ~5s / 35-50m flow span and visible curve, 40% fewer `flowAt`+clamp evals and 40% fewer verts.
+  - First tail step REUSES the head flow `[wx,wz,w]` already computed for advection (free; the head is where `flowAt` was just sampled).
+  - Thereafter re-evaluate `flowAt` only every 2nd segment and HOLD between — halves the remaining gradient cost; over a ~6-8m sub-step the flow barely changes so the arc still reads curved (flow is still re-sampled along the path, NOT reused for the whole tail like the near comet).
+  - Per-POINT terrain clamp KEPT (the 35-50m far tail crosses ridges and must not sink in).
+- UNCHANGED: the wind FIELD / forcing, `windAt`/`flowAt`/`thermalAt` semantics, near comet sphere, fade envelope, two-tier look, terrain occlusion. NO shader edit. NO other file touched.
+
+### Measured results
+- FPS before: ~51 (overlay EMA; the v13 regression baseline). FPS after: **60 flat** — 10 overlay samples over ~5s all read 60 (min/mean/max 60/60/60), well above the 58 gate.
+- NO look regression (read from `.ai/tmp/perf-final.png` + `.ai/tmp/perf-final-crop.png`): curved distant lines over far ridges PRESENT; dense near-bird comet sphere legible; terrain pour (motes drape/curve over ridges) intact; fade soft (no pop); crab/drift NON-ZERO (overlay DRIFT +15°); evolving fluid present (`__windAt(1000,0)` swings `[9.7,12.7]`→`[2.8,6.9]` over ~5s at fixed t).
+- Zero page/console errors.
+
+### Verify
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/tsc --noEmit && echo TYPECHECK_OK
+```
+```
+cd /Users/god/projects/ai-jank/vector-system && node .ai/tmp/perf-final.mjs
+```
+Open http://localhost:5174/index-bird.html (falls back to 5173). Overlay `fps:` reads ~60; watch far motes still draw long curved arcs over distant ridges, the near sphere stays dense, motes fade (no pop), DRIFT stays non-zero.
+
+### Watch for
+- `perf-final.mjs` reads the overlay EMA `fps:` field (smoothed); it pinned 60 here. If you want raw rAF too, the v13 raw probes are at `.ai/tmp/v13-fps-probe.mjs`.
+- Levers if it regresses again (all `wind.ts`, far tier): `segments` (6), `segStep` (0.8), the every-2nd-segment subsample cadence, or capping how many far motes build full tails.
