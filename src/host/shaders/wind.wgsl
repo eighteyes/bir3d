@@ -96,5 +96,5 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
 
   var color = tint * intensity * clamp(fog, 0.0, 1.0);
   color = min(color, vec3<f32>(1.2, 1.3, 1.5));
-  return vec4<f32>(color, 1.0);
+  return vec4<f32>(color * 0.5, 1.0); // 50% opacity — wind rendered at half brightness (additive blend)
 }
