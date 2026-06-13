@@ -873,3 +873,34 @@ Fly a moment with the cursor near screen-center, then confirm:
 - `tailFloor` / `densityFloor` are the calm-air floors — raising them flattens the speed contrast (calm air starts to look as busy as fast air); lowering `densityFloor` toward 0 reintroduces empty gaps.
 - `speedLo` / `speedHi` are calibrated to the current `windAt` (sampled min ~0.03, max ~16.5, mean ~8.5); retuning the field (`curlAmp`/`driftAmp`) would require recalibrating these for the contrast to stay full-range.
 - Screenshot driver: `.ai/tmp/v8b-shot.mjs` (Playwright + Metal WebGPU flags, port 5174 then 5173); waits `window.__birdBooted`; captures a pair ~0.8s apart at `.ai/tmp/v8b-final-0.png` / `.ai/tmp/v8b-final-1.png`.
+
+## Bird 3D v13 (real GPU fluid wired as wind source)
+**Date:** 2026-06-13
+**Commit:** 8488539 (v13 code: `bird-main.ts` + `gpu/fluid-wind.ts` + `gpu/wind.ts`); this entry = doc-only follow-up commit
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What this entry covers
+NO-REGRESSION GATE on the already-committed v13 wiring (the GPU Stam fluid replaced the analytic curl-noise as `windAt`'s base horizontal source; prevailing drift kept; `flowAt`/`thermalAt` unchanged). Verified by MEASUREMENT — no code changed for this gate (a temporary `__fluidOff` A/B probe guard was added to `bird-main.ts` and fully reverted; `git status` confirms `bird-main.ts` is clean). FPS/visuals were measured against the CLEAN v13 tree (out-of-scope uncommitted edits to `bird3d.ts`/`terrain.ts`/`terrain_ekg.wgsl` — an unrelated terrain line→dots experiment — were stashed for the fps/screenshot reads, then restored).
+
+### Measured results
+- (a) FPS (clean v13): ~45 (raw rAF over 3s), overlay EMA ~49-52. Below 60. The fluid step did NOT regress fps: an in-context A/B (`__fluidOff` true vs false, same page so any headless effect + tree state cancel) shows the fluid's MARGINAL cost ≈ 0 fps (fluid-off ~43.6, fluid-on ~46 — within noise; the off side also swaps `windAt` to the analytic branch which runs `potential()` 4× in the hot mote loop, so the A/B slightly under-counts the step, but net is still negligible). Headed run matched headless (~45.5 raw / 51 EMA) → NOT a headless-throttle artifact. Stashing the out-of-scope edits left fps unchanged (~45.4 raw) → they are not the cost either. CONCLUSION: the ~45fps ceiling is PRE-EXISTING in the committed v13 baseline (likely the motes' 10-segment `sampleHeight` tail loop that `wind.ts` flags as the dominant CPU cost, plus the committed terrain render) — the bottleneck was NOT isolated and is OUT of v13 scope. Did NOT tune fluid grid/iters (256/10) — the A/B proves it is not the cost; tuning would degrade the wind field for nothing.
+- (b) NO-REGRESSION (all PASS, read from `.ai/tmp/v13-final.png` + `.ai/tmp/v13-final-crop.png`): terrain pour (motes drape/curve over ridges), crab/drift (overlay DRIFT +10° to +18°, NON-ZERO), mote fade (soft edges, no pop), near-bird comet sphere legible, long distant lines over far ridges, small bird vs big ridges, elevation color (teal→magenta).
+- (c) EVOLUTION PROOF (field is the FLUID, not quasi-static curl-noise): `window.__windAt(x,z)` sampled at fixed `t=0` (any change is purely the readback replacing the field).
+  - Fixed world point (x0,z0)=(109,316), 6× over ~3s: `[7.47,7.83] [7.6,7.2] [7.79,6.43] [7.98,5.6] [7.92,5.05] [7.24,5.18]`.
+  - Discriminator at LIVE bird pos (bird always grid-center → cell fixed → PURE temporal evolution, no window-translation confound): `[11.45,3.66] [11.07,5.3] [9.69,7.11] [8.08,8.01] [6.88,8.23] [5.94,8.16]`.
+  - Both sets swing clearly frame-to-frame → real evolving wind, and the non-null readback also confirms the fluid path is actually wired.
+
+### Verify
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/tsc --noEmit && echo TYPECHECK_OK
+```
+```
+cd /Users/god/projects/ai-jank/vector-system && node .ai/tmp/v13-gate.mjs
+```
+Open http://localhost:5174/index-bird.html (falls back to 5173). Watch the wind motes drift and re-read the overlay over several seconds: DRIFT stays non-zero, the local air swirl visibly CHANGES (gusts), terrain pour + near sphere intact.
+
+### Watch for
+- Observed |wind| runs ~15-17 m/s (overlay), slightly above the stated 10-15 band, but DRIFT is only +10-18° — nowhere near the +61° blow-around regression. Feel is intact; do NOT crank fluid force.
+- `targetBand=3.0` in `fluid-wind.ts` contradicts its own comment ("mean ~8.5") and `wind.ts` `FLUID_MAX` comment ("mean ~10/max ~16"); the regulated SCALE plus `FLUID_MAX=10` clamp produce the observed ~15-17 peak — comments are stale, the measured number is authoritative.
+- A/B probe harnesses: `.ai/tmp/v13-gate.mjs` (full gate), `.ai/tmp/v13-fps-probe.mjs` / `v13-fps-headed.mjs` (raw rAF), `.ai/tmp/v13-ab.mjs` (fluid marginal cost). All Playwright + Metal WebGPU flags, port 5174 then 5173, wait `window.__birdBooted`.
+- The ~45fps ceiling is real (pre-existing in committed v13) and worth a separate perf pass; the prime suspect is the motes' per-mote 10-segment `sampleHeight` tail loop (`wind.ts` flags it as the dominant CPU cost), but it was NOT isolated and is OUT of v13 scope.
