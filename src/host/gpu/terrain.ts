@@ -18,11 +18,16 @@
 //   - sampleHeight(x,z): TS mirror of the WGSL fBm (same constants/hash) for the bird ridge-lift.
 //   - draw(...): record fill pass (clears color+depth) then line pass (loads) — first pass of frame.
 
-const BASE_FREQ = 0.00285714; // ~1/350 per meter (mirrors WGSL)
+// Heightfield constants — MUST mirror terrain_ekg.wgsl exactly (bird physics samples this twin).
+const BASE_FREQ = 0.00142857; // ~1/700 per meter — features 2× wider; a valley dwarfs the 7 m bird
 const LACUNARITY = 2.0;
 const GAIN = 0.5;
-const OCTAVES = 3;
-const RELIEF = 220.0;
+const OCTAVES = 4;            // extra octave restores mid-scale detail at the wider base
+const RELIEF = 320.0;
+const SHARP = 1.6;            // pow on the normalized ridge sum — deepens valleys, sharpens crests
+const TERRACES = 5.0;         // cliff bands: flat shelves with steep risers (geology, not noise)
+const RISER_POW = 4.0;        // riser sharpness within each band — higher = cliffier
+const CLIFF_MIX = 0.65;       // blend terraced vs smooth (1 = hard ledges everywhere)
 
 export interface TerrainParams {
   rows?: number;       // number of stacked depth rows
@@ -34,6 +39,7 @@ export interface TerrainParams {
   fogColor?: [number, number, number];
   fogDensity?: number;
   baseline?: number;   // low world-y the fill curtains drop to (occlusion only)
+  sampleCount?: number; // MSAA samples per pixel — MUST match the render target + every pipeline in the pass
 }
 
 export class TerrainEKG {
@@ -138,6 +144,7 @@ export class TerrainEKG {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
+    const sampleCount = p.sampleCount ?? 1; // 1 = no MSAA; >1 must match the render target + all pipelines.
     const module = device.createShaderModule({ code: shader });
     // shared vertex layout: 3 floats (xFrac, rowDepth, flag) — flag is rowFade for lines, topFlag for fill.
     const vbLayout: GPUVertexBufferLayout = {
@@ -159,6 +166,7 @@ export class TerrainEKG {
       },
       primitive: { topology: "triangle-list", cullMode: "none" },
       depthStencil: { depthWriteEnabled: true, depthCompare: "less", format: "depth24plus" },
+      multisample: { count: sampleCount },
     });
 
     // --- LINE pipeline: additive neon glow, depthCompare less-equal, depthWrite OFF. ---
@@ -182,6 +190,7 @@ export class TerrainEKG {
       },
       primitive: { topology: "line-list", cullMode: "none" },
       depthStencil: { depthWriteEnabled: false, depthCompare: "less-equal", format: "depth24plus" },
+      multisample: { count: sampleCount },
     });
 
     // separate bind group per pipeline (layout:"auto" → distinct layouts), both pointing at ubuf.
@@ -223,7 +232,12 @@ export class TerrainEKG {
       freq *= LACUNARITY;
       amp *= GAIN;
     }
-    return (sum / norm) * RELIEF;
+    // sharpen (deep valleys, crisp crests) then carve terraced cliff bands (shelf + steep riser).
+    const s = Math.pow(sum / norm, SHARP);
+    const b = s * TERRACES;
+    const fb = b - Math.floor(b);
+    const ter = Math.floor(b) / TERRACES + Math.pow(fb, RISER_POW) / TERRACES;
+    return (s + (ter - s) * CLIFF_MIX) * RELIEF;
   }
 
   draw(

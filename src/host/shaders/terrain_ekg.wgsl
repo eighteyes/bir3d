@@ -40,12 +40,16 @@ struct VSOut {
   @location(3) rowDepth : f32,  // depth ahead of camera (m) — for hard cutoff
 };
 
-// --- fBm — IDENTICAL constants mirrored in terrain.ts sampleHeight ---
-const BASE_FREQ : f32 = 0.00285714;  // ~1/350 per meter
+// --- heightfield — IDENTICAL constants mirrored in terrain.ts sampleHeight ---
+const BASE_FREQ : f32 = 0.00142857;  // ~1/700 per meter — 2× wider features
 const LACUNARITY : f32 = 2.0;
 const GAIN : f32 = 0.5;
-const OCTAVES : i32 = 3;
-const RELIEF : f32 = 220.0;
+const OCTAVES : i32 = 4;
+const RELIEF : f32 = 320.0;
+const SHARP : f32 = 1.6;      // valley-deepening / crest-sharpening pow
+const TERRACES : f32 = 5.0;   // cliff bands
+const RISER_POW : f32 = 4.0;  // riser sharpness
+const CLIFF_MIX : f32 = 0.65; // terraced vs smooth blend
 
 fn hash2(p : vec2<f32>) -> f32 {
   return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
@@ -73,7 +77,12 @@ fn fbm(p : vec2<f32>) -> f32 {
     freq = freq * LACUNARITY;
     amp = amp * GAIN;
   }
-  return (sum / norm) * RELIEF;
+  // sharpen (deep valleys, crisp crests) then carve terraced cliff bands (shelf + steep riser).
+  let s = pow(sum / norm, SHARP);
+  let b = s * TERRACES;
+  let fb = b - floor(b);
+  let ter = floor(b) / TERRACES + pow(fb, RISER_POW) / TERRACES;
+  return (s + (ter - s) * CLIFF_MIX) * RELIEF;
 }
 
 // world ridge height at a camera-relative (xFrac, depth) sample.

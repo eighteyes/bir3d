@@ -104,7 +104,8 @@ export class Bird3D {
     colorFormat: GPUTextureFormat,
     private terrain: TerrainEKG,
     startPos: Vec3 = [0, 200, 0],
-    t: BirdTuning = {}
+    t: BirdTuning = {},
+    sampleCount = 1 // MSAA samples — must match the render target + every pipeline in the pass
   ) {
     this.pos = startPos;
     this.tuning = {
@@ -173,6 +174,7 @@ export class Bird3D {
       primitive: { topology: "triangle-list", cullMode: "none" },
       // depth-test against the stored terrain depth so ridges occlude the bird.
       depthStencil: { depthWriteEnabled: true, depthCompare: "less", format: "depth24plus" },
+      multisample: { count: sampleCount },
     });
     this.bindGroup = device.createBindGroup({
       layout: this.pipeline.getBindGroupLayout(0),

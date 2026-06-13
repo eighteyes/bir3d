@@ -1,5 +1,8 @@
-// autopilot.ts — AutoPilot: hands-off soaring controller. Emits BirdInput; physics untouched.
+// autopilot.ts — AutoPilot: hands-off flight controller. Emits BirdInput; physics untouched.
 // Responsibilities:
+//   - POLICY "straight" (bird-vs-wind eval): hold a locked heading at trim glide — no lift-seeking,
+//     no orbiting; only ground-avoid (which re-locks to the escape heading) and a stall nose-down
+//     deviate. POLICY "soar": full lift-hunting behavior below.
 //   - Each frame, SENSE the air via the exported updraftAt (the exact field the physics applies):
 //     updraft here + at 8 compass probes (radius ~140 m), terrain look-ahead along velocity.
 //   - DECIDE a mode (priority order): AVOID (keep off the ground — hard rule) > SOAR (in lift:
@@ -26,7 +29,10 @@ export class AutoPilot {
   private yawCmd = 0;
   private logT = 0;
 
-  constructor(private terrain: TerrainEKG) {}
+  // "straight": hold a locked heading + trim glide (no lift-seeking, no orbiting) — the bird-vs-wind
+  // eval policy; only AVOID/ENERGY deviate. "soar": full lift-hunting behavior.
+  constructor(private terrain: TerrainEKG, public policy: "straight" | "soar" = "soar") {}
+  private lockedHeading: number | null = null;
 
   update(bird: Bird3D, dt: number): BirdInput {
     const T = bird.tuning;
@@ -34,14 +40,17 @@ export class AutoPilot {
     const t = bird.simTime;
     const clr = bird.lastClearance;
     const spd = bird.speed;
+    if (this.lockedHeading === null) this.lockedHeading = bird.heading;
 
     // --- sense: best lift among 8 compass probes + lift here vs current sink ---
     let bestAng = bird.heading;
     let bestU = -1;
-    for (let i = 0; i < 8; i++) {
-      const a = (i / 8) * Math.PI * 2;
-      const u = updraftAt(px + Math.sin(a) * PROBE_R, pz + Math.cos(a) * PROBE_R, t, this.terrain, T);
-      if (u > bestU) { bestU = u; bestAng = a; }
+    if (this.policy === "soar") {
+      for (let i = 0; i < 8; i++) {
+        const a = (i / 8) * Math.PI * 2;
+        const u = updraftAt(px + Math.sin(a) * PROBE_R, pz + Math.cos(a) * PROBE_R, t, this.terrain, T);
+        if (u > bestU) { bestU = u; bestAng = a; }
+      }
     }
     const here = updraftAt(px, pz, t, this.terrain, T);
     const sinkNow = T.sinkRate * (T.glideSpeed / spd) ** 3;
@@ -63,6 +72,14 @@ export class AutoPilot {
       const hr = this.terrain.sampleHeight(
         px + Math.sin(bird.heading + 0.8) * 160, pz + Math.cos(bird.heading + 0.8) * 160);
       headingGoal = bird.heading + (hl < hr ? -0.8 : 0.8);
+      this.lockedHeading = headingGoal; // the escape heading becomes the new straight line
+    } else if (this.policy === "straight") {
+      // STRAIGHT-LINE EVAL: hold the locked heading at trim glide. No lift-seeking, no orbiting —
+      // every deviation you observe is the WIND acting on the bird, not the pilot. Only the AVOID
+      // branch above (close to the ground) and a stall-guard nose-down may interfere.
+      this.mode = spd < T.glideSpeed - 5 ? "ENERGY" : "STRAIGHT";
+      pitchGoal = spd < T.glideSpeed - 5 ? -0.22 : -0.03;
+      headingGoal = this.lockedHeading;
     } else if (here > sinkNow + 0.4) {
       this.mode = "SOAR";
       // in net lift: orbit gently to stay inside it; shallow climb attitude rides it up.

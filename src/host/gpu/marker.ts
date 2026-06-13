@@ -22,7 +22,7 @@ export class GroundMarker {
   private pipeline: GPURenderPipeline;
   private bindGroup: GPUBindGroup;
 
-  constructor(private device: GPUDevice, shader: string, colorFormat: GPUTextureFormat) {
+  constructor(private device: GPUDevice, shader: string, colorFormat: GPUTextureFormat, sampleCount = 1) {
     const verts: number[] = [];
     const v = (pos: Vec3, kind: number, t: number) =>
       verts.push(pos[0], pos[1], pos[2], kind, t, 0);
@@ -82,6 +82,7 @@ export class GroundMarker {
       primitive: { topology: "line-list" },
       // depth-tested so ridges occlude the marker; write OFF — it is an overlay cue, not geometry.
       depthStencil: { depthWriteEnabled: false, depthCompare: "less", format: "depth24plus" },
+      multisample: { count: sampleCount },
     });
     this.bindGroup = device.createBindGroup({
       layout: this.pipeline.getBindGroupLayout(0),
@@ -96,7 +97,8 @@ export class GroundMarker {
     viewProj: Float32Array,
     birdPos: Vec3,
     groundY: number,
-    time: number
+    time: number,
+    resolveTarget?: GPUTextureView // MSAA resolve dest (the swapchain view); this is the LAST pass of the frame
   ): void {
     const u = this.uniformF32;
     u.set(viewProj, 0);
@@ -107,7 +109,7 @@ export class GroundMarker {
     this.device.queue.writeBuffer(this.ubuf, 0, this.uniformHost);
 
     const pass = encoder.beginRenderPass({
-      colorAttachments: [{ view: colorView, loadOp: "load", storeOp: "store" }],
+      colorAttachments: [{ view: colorView, resolveTarget, loadOp: "load", storeOp: "store" }],
       depthStencilAttachment: {
         view: depthView,
         depthLoadOp: "load",

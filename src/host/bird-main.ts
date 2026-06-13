@@ -37,6 +37,11 @@ const FOV_KICK = (16 * Math.PI) / 180; // extra FOV at dive ceiling — speed re
 const NEAR = 1;
 const FAR = 12000;
 
+// MSAA: render every pass into a 4× multisample color+depth target, then resolve once (on the final
+// marker pass) into the swapchain — smooths the thin neon line/ribbon edges (the canvas itself can't
+// be multisampled directly). Single source of truth: threaded into every pipeline so counts match.
+const SAMPLES = 4;
+
 // Altitude-adaptive camera (the swoop fix): LOW clearance pulls the eye down near the bird and
 // flattens the look angle so the ground rushes; HIGH clearance restores the v3/v4 god-view framing.
 const CAM_LOW = { clearance: 25, height: 10, pitchDeg: 8 };
@@ -76,13 +81,23 @@ async function boot() {
   let depthTex = device.createTexture({
     size: [pxW, pxH],
     format: "depth24plus",
+    sampleCount: SAMPLES,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+  // multisample color target — every pass renders here; the final pass resolves it into the swapchain.
+  let msaaTex = device.createTexture({
+    size: [pxW, pxH],
+    format,
+    sampleCount: SAMPLES,
     usage: GPUTextureUsage.RENDER_ATTACHMENT,
   });
 
   const terrainShader = await fetch("/src/host/shaders/terrain_ekg.wgsl").then((r) => r.text());
   const terrain = new TerrainEKG(device, terrainShader, format, {
     rows: 512,        // stacked EKG depth rows — covers the 2× maxDist at the same 4× spacing
-    cols: 768,        // samples per row — holds ridge detail at the wider halfWidth below
+    cols: 1536,       // samples per row — 2× density: the wide halfWidth means near rows show only a
+                      // central slice, so more samples are needed to shrink the chord faceting up close.
+    sampleCount: SAMPLES,
     rowSpacing: 4.5,  // m between rows: 4× line density — ~455 visible rows inside maxDist
     rowStart: -150,   // BEHIND the camera ground point. Rows are built ahead of the camera; start a
                       // little behind so the near-ground under the camera isn't empty black.
@@ -100,17 +115,17 @@ async function boot() {
   const startH = terrain.sampleHeight(0, 0);
   // HIGHER START (v4): begin well above terrain (~200 m clearance) so the flight is aerial from
   // the first frame and the EKG stack sits below the eyeline (less horizon tangle).
-  const bird = new Bird3D(device, birdShader, format, terrain, [0, startH + 200, 0]);
+  const bird = new Bird3D(device, birdShader, format, terrain, [0, startH + 200, 0], {}, SAMPLES);
 
   // VISIBLE WIND: neon streamline comets over the terrain, integrated from the SAME shared windAt
   // field that pushes the bird (src/host/gpu/wind.ts). Camera-relative like the EKG rows.
   const windShader = await fetch("/src/host/shaders/wind.wgsl").then((r) => r.text());
-  const wind = new Wind(device, windShader, format, (x, z) => terrain.sampleHeight(x, z));
+  const wind = new Wind(device, windShader, format, (x, z) => terrain.sampleHeight(x, z), {}, {}, SAMPLES);
 
   // ALTITUDE PLUMB-LINE: dashed neon drop-line bird→ground (one dash per ~9 m = readable altimeter)
   // + pulsing ground diamond. THE direct how-close-is-the-ground cue for swoops.
   const markerShader = await fetch("/src/host/shaders/marker.wgsl").then((r) => r.text());
-  const marker = new GroundMarker(device, markerShader, format);
+  const marker = new GroundMarker(device, markerShader, format, SAMPLES);
 
   // hands-off flight controller (AUTOPILOT mode) — emits the same BirdInput the mouse did.
   // "straight" policy = bird-vs-wind eval: locked heading, trim glide, deviate only near ground.
@@ -183,6 +198,14 @@ async function boot() {
     depthTex = device.createTexture({
       size: [pxW, pxH],
       format: "depth24plus",
+      sampleCount: SAMPLES,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    msaaTex.destroy();
+    msaaTex = device.createTexture({
+      size: [pxW, pxH],
+      format,
+      sampleCount: SAMPLES,
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
     });
   };
@@ -248,7 +271,8 @@ async function boot() {
     const view = cam.viewMatrix();
     const viewProj = multiply(proj, view);
 
-    const colorView = ctx.getCurrentTexture().createView();
+    const colorView = msaaTex.createView();                   // all passes render into the MSAA target
+    const resolveView = ctx.getCurrentTexture().createView(); // final pass resolves it into the swapchain
     const depthView = depthTex.createView();
     const eye = cam.getEye();
 
@@ -270,7 +294,7 @@ async function boot() {
     // altitude plumb-line + ground diamond under the bird (depth-tested → ridges occlude it).
     marker.draw(enc, colorView, depthView, viewProj,
       [bird.pos[0], bird.pos[1], bird.pos[2]],
-      bird.pos[1] - bird.lastClearance, bird.simTime);
+      bird.pos[1] - bird.lastClearance, bird.simTime, resolveView);
     device.queue.submit([enc.finish()]);
 
     (window as any).__camPos = eye;

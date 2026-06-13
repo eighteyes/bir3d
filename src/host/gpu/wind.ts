@@ -234,7 +234,8 @@ export class Wind {
     colorFormat: GPUTextureFormat,
     private sampleHeight: (x: number, z: number) => number,
     cfg: WindConfig = {},
-    p: DotParams = {}
+    p: DotParams = {},
+    sampleCount = 1 // MSAA samples — must match the render target + every pipeline in the pass
   ) {
     this.cfg = { ...DEFAULTS, ...cfg };
     // v9: fewer motes than v8 (4200 → 2200) to AFFORD the multi-step curved-tail integration per mote
@@ -386,6 +387,7 @@ export class Wind {
       primitive: { topology: "triangle-list", cullMode: "none" },
       // depth-test (no write) so terrain ridges occlude the motes but they don't z-fight each other.
       depthStencil: { depthWriteEnabled: false, depthCompare: "less", format: "depth24plus" },
+      multisample: { count: sampleCount },
     });
     this.bindGroup = device.createBindGroup({
       layout: this.pipeline.getBindGroupLayout(0),

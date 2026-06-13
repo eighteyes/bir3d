@@ -173,3 +173,18 @@ wind.ts/wind.wgsl ONLY (do NOT touch bird physics/camera/terrain).
 - **Terrain interaction must HUG + POUR (it's still too weak).** v9 motes float in a flat layer ~45-55 m ABOVE the ridges, so they don't visibly relate to the terrain. Fix: motes HUG the terrain surface (much lower clearance, follow the contour up and over each ridge) AND a STRONGER vertical pour over windward slopes (raise the lift the motes ride; brighten/accelerate motes that are climbing) so the airflow OBVIOUSLY conforms to and pours over the landscape — you should clearly see wind streaming up the windward faces and spilling over the crests, not floating in a flat sheet.
 
 **Done (v10):** the wind is a thick cloud of streaks right around the bird thinning into the distance, and it visibly hugs the terrain — pouring up the windward ridges and spilling over the crests.
+
+---
+
+## Felt wind (2026-06-12, committed 4d1c306) — autopilot off + camera follows ground-track
+Root cause of "I don't feel the wind impacting the bird" (3 rounds): the user was watching the AUTOPILOT fly smoothly THROUGH the wind, and the chase camera followed HEADING so drift was invisible. Fix (advisor-guided): default to MANUAL (P toggles autopilot, kept), and point the camera down the GROUND-TRACK (blend 70%) so the bird visibly CRABS into the wind. User confirms "wind is better" now.
+
+## v11 (2026-06-12) — wind LEGIBLE at the bird: two tiers (distant lines + near comet sphere)
+User: "i see wind all around, but not next to the bird. keep the long lines for the in-the-distance wind, and the little comets for the up-close wind sphere." Plus the standing note: "wind is a much lower density than what it's rendered as" (air is thin — keep it airy).
+- **FAR (distance) = LONG curved streamline LINES** — keep the existing long curved tails for the distant wind. Sparse/airy.
+- **NEAR (up-close) = a WIND SPHERE of LITTLE COMETS around the bird** — a ball/volume of small short-tailed comets centered on the BIRD (radius ~60–100 m), advected by the local terrain-aware flow, dense enough to be LEGIBLE right where the bird is (showing the air you're flying through); recycle comets that leave the sphere back in. This is the fix for "wind not legible next to the bird."
+- **RENDER at HIGHER density** (user clarification 2026-06-12: "air calculations for fluid are low density, render at a higher density"). The air *calc/physics* is low-density (thin medium — correct), but the VISUAL must be DENSE and clearly visible so you can read it: MORE comets, not fewer — especially a THICK sphere of comets at the bird. (This CORRECTS the earlier "airy/don't crowd" wording — low-density CALCULATION, high-density RENDER.)
+- **Respect terrain** (comets stay above ground and flow over it).
+Scope: wind.ts + wind.wgsl, plus the single `wind.draw(...)` call in bird-main.ts (to pass the bird position as the sphere center) — nothing else.
+
+**Done (v11):** distant wind reads as long curved lines; right around the bird a sphere of little comets shows the local air, so the wind is legible exactly where you are; airy, terrain-respecting.

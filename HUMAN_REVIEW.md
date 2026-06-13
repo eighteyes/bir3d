@@ -1,5 +1,81 @@
 # Human Review Steps
 
+## Terrain traces smoother — MSAA + 2× sample density
+**Date:** 2026-06-12
+**Commit:** N/A (no git repo present in working tree)
+**Session:** (current)
+
+### What was done (`bird-main.ts` + 4 GPU drawables; no shader edits)
+- PROBLEM (user): "can we make the terrain lines splines, not points? the jaggies are throwing me." Two causes: (1) thin neon lines/ribbons staircase because the render target had NO MSAA (sampleCount 1); (2) near rows show only a central slice of the wide `halfWidth=2400` span, so `cols=768` left visible chord faceting up close.
+- FIX:
+  - 4× MSAA. New `SAMPLES=4` in `bird-main.ts` (single source of truth). Added a multisample color target (`msaaTex`, swapchain format) + made `depthTex` sampleCount 4; both recreated on resize. Every pass renders into `msaaTex`; the FINAL pass (`marker.draw`) carries a `resolveTarget` = swapchain view, resolving once into the canvas (a WebGPU canvas can't be multisampled directly).
+  - Threaded `sampleCount` into every pipeline so counts match the target: `TerrainEKG` (via `TerrainParams.sampleCount`, both fill+line pipelines), `Bird3D`, `Wind`, `GroundMarker` (trailing ctor arg, default 1). `marker.draw` gained a trailing optional `resolveTarget`.
+  - Sample density: terrain `cols` 768 → 1536 (shrinks near-field chord faceting).
+- UNCHANGED: heightfield function (still terraced/cliffy by design — MSAA/density do NOT soften the geology), flight physics, the EKG aesthetic, all shaders.
+- NOTE: chose "more samples + MSAA" over a Catmull-Rom spline (user declined spline) and over softening the cliffs (user likes the aesthetic, esp. distant ridge highlighting).
+
+### Verify
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/tsc --noEmit && echo TYPECHECK_OK
+```
+```
+cd /Users/god/projects/ai-jank/vector-system && (npm run dev >/tmp/vite-bird.log 2>&1 &) ; sleep 4 ; /opt/homebrew/bin/node .ai/tmp/msaa-boot-check.mjs
+```
+Then open http://localhost:5173/index-bird.html and eyeball: terrain traces read as smooth curves (no staircase on near rows), distant-ridge highlight intact, no black screen. If near-field faceting still bugs you, the levers are `cols` (bird-main.ts:86) and `SAMPLES` (bird-main.ts).
+
+## Wind motes fade in/out on recycle (no pop)
+**Date:** 2026-06-12
+**Commit:** N/A (no git repo present in working tree)
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done (`wind.ts` only; `wind.wgsl` unchanged — `vis` already plumbed)
+- PROBLEM (user): "the wind pops in / out, can we have a fade?" Persistent motes RECYCLE — far tier reseeds at the camera-relative span boundaries; near tier (a ~65 m ball of ~1600 little comets around `bird.pos`) reseeds when a comet drifts outside the ball. On recycle the position SNAPS to a new seed → the mote POPS in at the new spot and POPS out when it leaves.
+- FIX (CPU-side fade envelope folded into the existing per-vertex `vis`, so the shader needs no change):
+  - Per-mote AGE (seconds since last seed). Far tier: `age` array; near tier: `nearAge` array. Advanced by `dt` each frame in the rebuild/update loop, reset to 0 in `seedMote` / `seedNearMote`.
+  - `fadeIn = smoothstep(0, fadeInTime, age)` — a freshly (re)seeded mote ramps `vis` 0→1 over the first ~0.55 s of life (`fadeInTime`).
+  - `fadeOut` ramps 1→0 as the mote nears its recycle condition:
+    - FAR tier: distance to the NEAREST span boundary (front / back / either side); `smoothstep(0, fadeFarEdge, edgeDist)` → 0 in the last `fadeFarEdge` (50 m) before any span exit.
+    - NEAR tier: proximity to the ball EDGE; `distFrac = dist(bird)/nearRadius`; `1 - smoothstep(fadeNearEdge, 1, distFrac)` → 1 inside, 0 at the radius (`fadeNearEdge` 0.78 → fade starts at 78 % of R).
+  - FAR tier: `vis *= fadeIn * fadeOut` — multiplied INTO the existing density cull (density-fade preserved, not replaced).
+  - NEAR tier: `nearVis = fadeIn * fadeOut` REPLACES the old hard `vis = 1` — the sphere now shows a soft brightness gradient (dim toward the edge / when young) instead of hard uniform dots.
+  - AGE is advanced BEFORE the cull-skip so a culled mote that later survives the density cull still has a real age — it won't pop when it re-enters.
+- Tuning knobs added to `DotParams` / constructor: `fadeInTime` (0.55 s), `fadeFarEdge` (50 m), `fadeNearEdge` (0.78). Fade zones are wide enough that bird/camera relative motion can't skip a mote past them in one frame.
+- UNCHANGED: `windAt`/`thermalAt`/flight physics (frozen), the two-tier look, additive neon, terrain occlusion, the v11 distance spread. NO shader edit. NO other files touched.
+
+### Pre-conditions
+```
+cd /Users/god/projects/ai-jank/vector-system
+```
+
+### Verify: typecheck clean
+```
+npx tsc --noEmit
+```
+Expected: exit 0, no output.
+
+### Verify: boot + capture (Playwright, Metal WebGPU)
+```
+npm run dev
+```
+```
+node .ai/tmp/myshot-bird3d.mjs .ai/tmp/fade-final.png .ai/tmp/fade-final-1.png .ai/tmp/fade-final-crop.png
+```
+Expected: JSON with `"errors": []` and `"booted": true`. Saves a full frame, a second frame, and a centered bird crop.
+
+### Verify: the fade reads (watch in MOTION — a still cannot prove pop-vs-fade)
+Open http://localhost:5174/index-bird.html (vite falls back to 5173). Fly with the cursor near screen-center, then confirm:
+- NEAR SPHERE has SOFT edges: little comets dim toward the ball boundary and brighten toward the center — NO hard uniform-brightness disc with a crisp rim.
+- Watch a comet reach the sphere edge: it FADES OUT before it recycles, and a reseeded comet FADES IN from dark — no hard POP at either end.
+- FAR LINES: motes near the wedge front/back/side boundaries are dim and ease out; reseeded far motes ease in. No mid-air pop-in.
+- Prior wins intact: two-tier look (long distant arcs + dense near sphere), the small gliding-V bird, EKG ridges that OCCLUDE the motes, the good flight.
+- HUD bottom line reads `fps: ~60`; no `[WebGPU lost]` / `pageerror` / `console.error`.
+
+### Watch for
+- Fade is a brightness envelope only — it does NOT move/recycle motes any differently; it just eases `vis` at the ends of a mote's life.
+- `fadeNearEdge` too low → the whole sphere dims (fade starts too far in); too high (→1) → the edge pops again. `fadeFarEdge` too small → far motes still pop at the span boundary.
+- `fadeInTime` ~0.4–0.7 s; longer makes reseeds linger dark, shorter reintroduces a softer pop.
+- Static-frame evidence is the brightness GRADIENT on the near sphere (visible in the crop); true pop-vs-fade only reads in motion.
+
 ## Bird 3D v11 (two-tier wind: distant lines + dense near comet sphere)
 **Date:** 2026-06-12
 **Commit:** f37af9d
