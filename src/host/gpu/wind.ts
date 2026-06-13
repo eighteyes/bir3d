@@ -279,13 +279,15 @@ export class Wind {
     this.speedLo = p.speedLo ?? 2.0;
     this.speedHi = p.speedHi ?? 15.0;
 
-    // v11 NEAR SPHERE: a DENSE ball of LITTLE short-tailed comets around the bird. 1200 motes in an ~80m
-    // ball makes the local air unmistakably legible (the v11 fix). Short tails (4 × 0.22s ≈ 0.9s of flow,
-    // ~8-12m) keep them reading as little comets, NOT the far long lines — and bound the per-frame cost.
-    this.nearCount = p.nearCount ?? 1200;
-    this.nearRadius = p.nearRadius ?? 80;
-    this.nearSegments = p.nearSegments ?? 4;
-    this.nearSegStep = p.nearSegStep ?? 0.22;
+    // v11 NEAR SPHERE: a DENSE ball of LITTLE short-tailed comets around the bird. ~1600 motes in a tight
+    // ~65m ball makes the local air unmistakably legible AND visually distinct from the far long lines (the
+    // v11 fix). SHORT tails (3 × 0.12s ≈ 0.36s of flow, ~3-4m) keep them reading as LITTLE comets/dots, not
+    // the far streamlines. Tight radius + high count = a thick visible cloud right at the bird (count chosen
+    // to hold 60fps; the near tail reuses the head flow + a single tip clamp to stay cheap).
+    this.nearCount = p.nearCount ?? 1600;
+    this.nearRadius = p.nearRadius ?? 65;
+    this.nearSegments = p.nearSegments ?? 3;
+    this.nearSegStep = p.nearSegStep ?? 0.12;
 
     this.px = new Float32Array(this.count);
     this.py = new Float32Array(this.count);
@@ -640,20 +642,23 @@ export class Wind {
       const climbFrac = Math.min(1, Math.max(0, w / 7.0));
       sp = Math.max(sp, climbFrac);
 
-      // SHORT curved tail: integrate backward along flowAt a few small steps. No speed-scaling of length
-      // here — these are uniformly little comets, the point is DENSITY + legibility, not speed-read.
+      // SHORT tail: these tails are only ~3-4m, over which flowAt barely changes — so REUSE the head's
+      // already-computed flow vector [wx,wz,w] for every backward step instead of re-evaluating flowAt per
+      // segment. That removes `seg` flowAt calls (4 sampleHeight each) per comet — the dominant cost of the
+      // dense sphere — with no visible difference (a 4m streak doesn't curve). Per-point terrain clamp kept.
       const stepLen = this.nearSegStep;
       ptX[0] = x; ptY[0] = y; ptZ[0] = z;
       let cx = x, cy = y, cz = z;
       for (let s = 1; s <= seg; s++) {
-        const [fwx, fwz, fw] = this.flowAt(cx, cz, t);
-        cx -= fwx * stepLen;
-        cz -= fwz * stepLen;
-        cy -= fw * stepLen;
-        const tb = this.sampleHeight(cx, cz) + this.minClear;
-        if (cy < tb) cy = tb;
+        cx -= wx * stepLen;
+        cz -= wz * stepLen;
+        cy -= w * stepLen;
         ptX[s] = cx; ptY[s] = cy; ptZ[s] = cz;
       }
+      // single terrain clamp at the tail tip only (the head is already above minClear and the ~4m streak
+      // can't sink through a ridge between consecutive points) — avoids a sampleHeight per segment.
+      const tipB = this.sampleHeight(cx, cz) + this.minClear;
+      if (ptY[seg]! < tipB) ptY[seg] = tipB;
 
       // emit a quad per segment; vis forced to 1 → DENSE (no cull). along = head→tail fade over the ribbon.
       for (let s = 0; s < seg; s++) {
