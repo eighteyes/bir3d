@@ -1,5 +1,67 @@
 # Human Review Steps
 
+## Bird 3D v11 (two-tier wind: distant lines + dense near comet sphere)
+**Date:** 2026-06-12
+**Commit:** f37af9d
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done (`wind.ts` + `wind.wgsl` + 1 line in `bird-main.ts`)
+- TWO-TIER WIND for legibility at the bird (user: "i see wind all around, but not next to the bird"):
+  - FAR tier = the existing persistent population of LONG curved streamline lines (2200 motes, multi-segment tails integrated backward along the terrain-shaped flow) — distant wind reads as long flowing arcs over the ridges.
+  - NEAR tier = a DENSE WIND SPHERE of ~1600 LITTLE short-tailed comets seeded uniformly in a ~65 m ball centered on the BIRD; advected by the SAME terrain-aware `flowAt`; comets that leave the ball recycle back inside so the sphere follows the bird. `vis=1` for every near comet (NO density cull) → the local air is unmistakably legible right where you fly.
+  - Both tiers share one pipeline/shader/vertex-format, drawn in a single combined vertex buffer.
+- `bird-main.ts`: the single `wind.draw(...)` call passes `bird.pos` as the near-sphere center (the only change in that file).
+- DISTANCE SPREAD (final tune, f37af9d): with the sphere owning the bird vicinity, dropped the far tier's `nearBias` 2.6→1.3 so the long lines spread into the distance (was ~61% near / 16% far; now ~37/34/29% near/mid/far) — the long curved lines now populate the distance where v11 wants them.
+- PHYSICS low-density, VISUAL high-density: the near sphere renders as a THICK cloud of many little comets (user: "air calculations for fluid are low density, render at a higher density").
+- `windAt`/`thermalAt`/flight physics UNTOUCHED (frozen). Terrain respected: comets stay above ground, hug + pour over the ridges, depth-tested (ridges occlude).
+
+### Verify: typecheck + boot capture
+```
+node node_modules/typescript/bin/tsc --noEmit
+```
+```
+node .ai/tmp/myshot-v11b.mjs
+```
+Expected: connects on 5174 (or 5173), `fps: 60`, `errors: none`, `DRIFT` non-zero (~+26° — wind visibly crabs the bird). Saves `.ai/tmp/v11b-final-0.png`, `.ai/tmp/v11b-final-1.png`, `.ai/tmp/v11b-final-crop.png`.
+
+### Verify: WATCH IT (eyes-on)
+Open http://localhost:5174/index-bird.html (autopilot off — touch nothing or fly manually):
+- [ ] DISTANT wind reads as long curved flowing LINES arcing over the far ridges.
+- [ ] A DENSE legible sphere of little cyan comets surrounds the bird — the air next to it is unmistakable (the v11 fix).
+- [ ] The near sphere follows the bird as it flies; comets recycle, the cloud stays thick.
+- [ ] Prior wins intact: small white V bird dwarfed by big magenta EKG ridges; EKG terrain + elevation color; crab camera; good flight; 60fps; no errors.
+
+### Watch for
+- Near-sphere cost: ~1600 comets × 3 tail segments held 60fps headless; 2200 read borderline 56–59. The near tail REUSES the head flow vector (no per-segment `flowAt`/`sampleHeight`) — if you raise `nearCount`, that shortcut is what keeps it cheap; restoring per-segment flow there is the first fps cliff.
+- The two-tier distinction is subtle in a downscaled full frame — read tail-length-at-range from a tight DISTANCE crop (e.g. `.ai/tmp/v11b-dist-crop.png`, upper band away from the bird), not the bird-centered crop.
+
+## Bird3D v12 — fog 2×, terraced-cliff terrain, straight-line wind eval
+**Date:** 2026-06-12
+**Commit:** working tree
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done
+- FOG EXPANDED 2× (`bird-main.ts`): terrain fogDensity 1/550→1/1100, wind fog 1/700→1/1400. Horizon moved with it: maxDist 950→1900, rows 256→512, cols 512→768, halfWidth 1500→2400 (the 76° dive frustum is ~2300 m half-wide at the new horizon — 1500 would have shown naked row ends).
+- TERRAIN GEOLOGY (`terrain.ts` + `terrain_ekg.wgsl`, IDENTICAL twins): BASE_FREQ 1/350→1/700 (features 2× wider — a valley is now ~50 wingspans, the bird reads as a speck in real terrain), OCTAVES 3→4, RELIEF 220→320, then SHARP=1.6 pow (deep valleys, crisp crests) + TERRACED CLIFF BANDS (TERRACES=5, RISER_POW=4, CLIFF_MIX=0.65 — flat shelves with steep risers ≈ every 64 m of height).
+- STRAIGHT-LINE EVAL POLICY (`autopilot.ts`): `new AutoPilot(terrain, "straight")` — locked heading at trim glide, NO lift-seeking/orbiting; only AVOID (near ground, re-locks to escape heading) and a stall nose-down deviate. Probes skipped in straight mode. (User's P-key toggles manual ↔ autopilot in bird-main.)
+
+### Measured (60 s straight line, `node .ai/tmp/auto-eval.mjs` → EVAL_PASS)
+- clearance min 40 / avg 111 / max 199 m — AVOID fired 3×, recovered, never near the floor.
+- vario -3.6…+9.2 m/s, 50% of samples positive — lift bands cross the straight track often.
+- |drift| avg 27°, max 69° — the wind is STRONGLY felt on a constant heading (eval headline).
+
+### Verify
+```
+node node_modules/typescript/bin/tsc --noEmit
+node .ai/tmp/auto-eval.mjs
+```
+Then eyes-on `.ai/tmp/eval-straight.png` / live page: wide valleys dwarfing the bird, terraced shelf-and-riser ridge profiles (not noise fuzz), ridges readable ~2× deeper before the haze.
+
+### Watch for
+- TS/WGSL heightfield twins MUST stay identical — any future terrain change edits BOTH or the bird flies a different mountain than you see.
+- |drift| avg 27° may be more wind than a player wants; windGain/windDrift sliders are the tamers.
+- 512×768 rows ≈ 786k line verts — fps held 60 headless; watch it on battery.
+
 ## Bird3D v11 — AUTOPILOT: autonomous soaring, manual controls off
 **Date:** 2026-06-12
 **Commit:** working tree
