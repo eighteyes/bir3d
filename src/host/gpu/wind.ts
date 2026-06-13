@@ -142,6 +142,10 @@ interface DotParams {
   nearRadius?: number;   // radius (m) of the sphere around the bird
   nearSegments?: number; // tail segment count for the LITTLE comets (short → distinct from far lines)
   nearSegStep?: number;  // seconds of flow integrated per near-comet tail segment (short tail)
+  // --- v12 FADE envelope (no-pop on recycle): fade IN on (re)seed, fade OUT before recycle ---
+  fadeInTime?: number;   // seconds over which a freshly seeded mote ramps vis 0→1 (smoothstep)
+  fadeFarEdge?: number;  // meters before a FAR span boundary where the fade-OUT begins (→0 at the edge)
+  fadeNearEdge?: number; // fraction (0..1) of the near ball radius at which the fade-OUT begins (→0 at R)
 }
 
 export class Wind {
@@ -170,9 +174,14 @@ export class Wind {
   private nearRadius: number;
   private nearSegments: number;
   private nearSegStep: number;
+  // v12 FADE envelope tuning.
+  private fadeInTime: number;
+  private fadeFarEdge: number;
+  private fadeNearEdge: number;
   private nx: Float32Array;   // near-comet world x (per near mote)
   private ny: Float32Array;   // near-comet world y (advected height)
   private nz: Float32Array;   // near-comet world z
+  private nearAge: Float32Array; // v12 FADE: per-near-comet AGE (s since last seed/recycle) → fade-IN ramp
   private nptX: Float32Array; // scratch polyline for the near comet (nearSegments+1)
   private nptY: Float32Array;
   private nptZ: Float32Array;
@@ -187,6 +196,9 @@ export class Wind {
   private py: Float32Array;   // world y — ADVECTED height (per mote)
   private pz: Float32Array;   // world z (per mote)
   private speedFrac: Float32Array; // cached 0..1 wind speed at the mote (for color/density/tail)
+  // v12 FADE: per-mote AGE (seconds since last seed/recycle). Advanced by dt every frame, reset to 0 in
+  // seedMote. Drives the fade-IN envelope (young motes ramp up) so a (re)seeded mote never POPS in.
+  private age: Float32Array;
 
   private vbuf: GPUBuffer;     // per-vertex ribbon-segment data, rebuilt from particle state each frame
   private vertexCount: number; // count * segments * 6 (a quad per tail segment)
@@ -291,10 +303,20 @@ export class Wind {
     this.nearSegments = p.nearSegments ?? 3;
     this.nearSegStep = p.nearSegStep ?? 0.12;
 
+    // v12 FADE: motes RECYCLE (far = span-boundary reseed; near = ball-edge reseed) and the position
+    // SNAPS to a new seed → a hard POP in at the new spot and POP out when it leaves. Fold a fade envelope
+    // into the existing `vis`: fadeIn(age) ramps 0→1 over the first ~0.55s of a mote's life; fadeOut ramps
+    // 1→0 as the mote nears its recycle condition (far: distance to the nearest span exit; near: distance
+    // to the ball edge). Multiplied into vis → every mote eases in on (re)seed and eases out before recycle.
+    this.fadeInTime = p.fadeInTime ?? 0.55;   // ~0.4-0.7s ramp; smoothstep keeps the onset gentle.
+    this.fadeFarEdge = p.fadeFarEdge ?? 50;   // last 50m before a far span boundary fades to 0.
+    this.fadeNearEdge = p.fadeNearEdge ?? 0.78; // start fading at 78% of the ball radius → 0 at the edge.
+
     this.px = new Float32Array(this.count);
     this.py = new Float32Array(this.count);
     this.pz = new Float32Array(this.count);
     this.speedFrac = new Float32Array(this.count);
+    this.age = new Float32Array(this.count);
     this.ptX = new Float32Array(this.segments + 1);
     this.ptY = new Float32Array(this.segments + 1);
     this.ptZ = new Float32Array(this.segments + 1);
@@ -302,6 +324,7 @@ export class Wind {
     this.nx = new Float32Array(this.nearCount);
     this.ny = new Float32Array(this.nearCount);
     this.nz = new Float32Array(this.nearCount);
+    this.nearAge = new Float32Array(this.nearCount);
     this.nptX = new Float32Array(this.nearSegments + 1);
     this.nptY = new Float32Array(this.nearSegments + 1);
     this.nptZ = new Float32Array(this.nearSegments + 1);
@@ -400,6 +423,7 @@ export class Wind {
     this.pz[i] = z;
     // seed height at nominal clearance over the terrain; advection then pours it up/over the ridges.
     this.py[i] = this.sampleHeight(x, z) + this.clearance;
+    this.age[i] = 0; // v12 FADE: fresh seed → age 0 so the fade-IN envelope ramps this mote up from dark.
   }
 
   // v11: place near-comet i UNIFORMLY inside the ball of radius nearRadius centered on the bird. Uniform
@@ -419,6 +443,7 @@ export class Wind {
     this.nx[i] = x;
     this.ny[i] = y0 < floor ? floor : y0;
     this.nz[i] = z;
+    this.nearAge[i] = 0; // v12 FADE: fresh seed → age 0 so the fade-IN envelope ramps this comet up.
   }
 
   // TERRAIN-SHAPED flow at world (x,z): the frozen horizontal windAt, plus a VERTICAL component and a
@@ -538,7 +563,26 @@ export class Wind {
       // spans many verts): stable per-mote rank vs a speed-dependent cutoff. Calm air keeps a floor.
       const rank = hashRank(i);
       const cutoff = this.densityFloor + (1 - this.densityFloor) * sp;
-      const vis = 1 - smoothstep(cutoff - 0.1, cutoff + 0.02, rank);
+      let vis = 1 - smoothstep(cutoff - 0.1, cutoff + 0.02, rank);
+
+      // v12 FADE envelope (no-pop): advance this mote's AGE every frame (BEFORE any cull-skip so a culled
+      // mote that later survives the cull still has a real age — otherwise it would pop). Multiply a
+      // fadeIn(age)·fadeOut(edge) envelope into the density vis so the mote eases in on (re)seed and eases
+      // out before it recycles. Recompute the exit distances from the NEW (advected) position so the
+      // fade-out tracks the actual recycle boundary. fadeIn keeps the existing density vis untouched once
+      // age > fadeInTime; fadeOut→0 only in the last fadeFarEdge meters before a span exit.
+      this.age[i]! += dt;
+      const fadeIn = smoothstep(0, this.fadeInTime, this.age[i]!);
+      const nrx = x - camGround[0], nrz = z - camGround[1];
+      const nFwd = nrx * camFwd[0] + nrz * camFwd[1];
+      const nSide = nrx * camRight[0] + nrz * camRight[1];
+      // distance to the NEAREST span boundary (front / back / either side); fade over the last fadeFarEdge m.
+      const distFront = this.spanAhead - nFwd;
+      const distBack = nFwd + this.spanBehind;
+      const distSide = this.spanWide - Math.abs(nSide);
+      const edgeDist = Math.min(distFront, distBack, distSide);
+      const fadeOut = smoothstep(0, this.fadeFarEdge, edgeDist);
+      vis *= fadeIn * fadeOut;
       if (vis <= 0.001) {
         // emit degenerate (collapsed) verts for every segment so the draw count stays fixed.
         for (let s = 0; s < seg; s++) {
@@ -637,6 +681,18 @@ export class Wind {
       if (y < loY) y = loY;
       this.nx[i] = x; this.ny[i] = y; this.nz[i] = z;
 
+      // v12 FADE envelope (no-pop): advance AGE, then fadeIn(age)·fadeOut(ballEdge). fadeIn ramps a freshly
+      // (re)seeded comet up from dark over fadeInTime; fadeOut dims a comet as it nears the ball EDGE so it
+      // is already faint when it recycles. Edge distance from the NEW (advected) position vs the bird. This
+      // REPLACES the old hard vis=1 — so the sphere now shows a soft brightness gradient (dim toward the
+      // edge / when young) instead of hard-edged uniform dots that would pop on recycle.
+      this.nearAge[i]! += dt;
+      const fadeIn = smoothstep(0, this.fadeInTime, this.nearAge[i]!);
+      const ndx = x - birdPos[0], ndy = y - birdPos[1], ndz = z - birdPos[2];
+      const distFrac = Math.sqrt(ndx * ndx + ndy * ndy + ndz * ndz) / this.nearRadius; // 0 center → 1 edge
+      const fadeOut = 1 - smoothstep(this.fadeNearEdge, 1, distFrac); // 1 inside → 0 at the ball edge
+      const nearVis = fadeIn * fadeOut;
+
       // speed tint (same calibration as the far tier) — little comets still brighten in fast air.
       const wspeed = Math.hypot(wx, wz);
       const u = Math.min(1, Math.max(0, (wspeed - lo) / (hi - lo)));
@@ -681,7 +737,7 @@ export class Wind {
           v[vi++] = pick; v[vi++] = perp;
           v[vi++] = sp;
           v[vi++] = sdx; v[vi++] = sdz;
-          v[vi++] = al; v[vi++] = 1; // vis=1 → always drawn (DENSE)
+          v[vi++] = al; v[vi++] = nearVis; // v12 FADE: vis = fadeIn·fadeOut (no hard pop; soft ball edge)
         }
       }
     }
