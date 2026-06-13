@@ -21,7 +21,8 @@
 import { acquireDevice } from "./gpu/device";
 import { TerrainEKG } from "./gpu/terrain";
 import { Bird3D, type BirdInput } from "./gpu/bird3d";
-import { Wind } from "./gpu/wind";
+import { Wind, windAt, setFluidField } from "./gpu/wind";
+import { FluidWind } from "./gpu/fluid-wind";
 import { GroundMarker } from "./gpu/marker";
 import { ChaseCamera } from "./gpu/camera";
 import { AutoPilot } from "./autopilot";
@@ -41,6 +42,10 @@ const FAR = 12000;
 // marker pass) into the swapchain — smooths the thin neon line/ribbon edges (the canvas itself can't
 // be multisampled directly). Single source of truth: threaded into every pipeline so counts match.
 const SAMPLES = 4;
+
+// Terrain dots: DOT_PX = on-screen dot radius (device px); the stack draws round point-sprites instead
+// of solid lines. dotRadius (NDC-y) = 2·DOT_PX / pxH so the dot holds a constant screen size at any depth.
+const DOT_PX = 3;
 
 // Altitude-adaptive camera (the swoop fix): LOW clearance pulls the eye down near the bird and
 // flattens the look angle so the ground rushes; HIGH clearance restores the v3/v4 god-view framing.
@@ -106,6 +111,7 @@ async function boot() {
     maxDist: 1900,    // CLEAN HORIZON moved out 2× with the fog (950→1900) — fog still dissolves
                       // rows before this cutoff so the far edge never shows as a shelf.
     baseline: -300,   // fill curtains drop to this world-y (occlusion only; below the frame).
+    dotStride: 3,     // draw every 3rd sample as a dot — spaced/lighter than the old solid trace.
     fogColor: SKY,
     fogDensity: 1 / 1100, // FOG EXPANDED 2× (1/550→1/1100): visibility doubles; far ridges read
                           // much deeper before dissolving into the haze band.
@@ -121,6 +127,28 @@ async function boot() {
   // field that pushes the bird (src/host/gpu/wind.ts). Camera-relative like the EKG rows.
   const windShader = await fetch("/src/host/shaders/wind.wgsl").then((r) => r.text());
   const wind = new Wind(device, windShader, format, (x, z) => terrain.sampleHeight(x, z), {}, {}, SAMPLES);
+
+  // v13: the REAL GPU fluid is the EVOLVING wind SOURCE. windAt() (wind.ts) samples this field as its
+  // base horizontal vector + keeps the prevailing drift; bird3d (physics) and the motes (via flowAt) ride
+  // it for free. The fluid is stepped + read each frame here over a bird-local moving window; magnitude is
+  // regulated to the flyable band by the SCALE (not by cranking force — that is the +61° regression).
+  const fluidShaderPaths = {
+    forces: "/src/host/shaders/fluid/forces.wgsl",
+    divergence: "/src/host/shaders/fluid/divergence.wgsl",
+    jacobi: "/src/host/shaders/fluid/jacobi.wgsl",
+    subtractGrad: "/src/host/shaders/fluid/subtract_grad.wgsl",
+    advect: "/src/host/shaders/fluid/advect.wgsl",
+    setBnd: "/src/host/shaders/fluid/set_bnd.wgsl",
+  };
+  const fluidShaders = Object.fromEntries(
+    await Promise.all(
+      Object.entries(fluidShaderPaths).map(async ([k, p]) => [k, await fetch(p).then((r) => r.text())])
+    )
+  ) as { forces: string; divergence: string; jacobi: string; subtractGrad: string; advect: string; setBnd: string };
+  // iters is the perf lever: step() records ~2×iters×3 jacobi/set_bnd passes/frame, and the per-dispatch
+  // encode cost (not per-cell GPU work) dominates — so iters, NOT grid, sets the frame budget. A wind
+  // field needs no converged divergence-free projection, so low iters is visually fine and holds 60fps.
+  const fluidWind = new FluidWind(device, fluidShaders, { grid: 256, iters: 10 });
 
   // ALTITUDE PLUMB-LINE: dashed neon drop-line bird→ground (one dash per ~9 m = readable altimeter)
   // + pulsing ground diamond. THE direct how-close-is-the-ground cue for swoops.
@@ -219,6 +247,9 @@ async function boot() {
   let frame = 0;
   let fps = 0;
   let fovCur = FOV_Y; // eased per-frame toward FOV_Y + speed kick
+  // smoothed horizontal MOMENTUM (low-passed bird velocity) — the camera aims along this, not heading,
+  // so buffet/gust jitter and stall thrashing don't shake the view.
+  let momX = bird.vel[0], momZ = bird.vel[2];
   const loop = new FrameLoop((dt) => {
     fps = fps * 0.9 + (1 / Math.max(dt, 1e-3)) * 0.1;
 
@@ -242,6 +273,16 @@ async function boot() {
       input.yawRate = 0;
     }
 
+    // v13: push the latest resolved fluid field into wind.ts BEFORE integrate/draw consume windAt, so the
+    // bird physics + motes read the fluid this frame. read() also regulates the scale toward the flyable
+    // band. Null until the first readback resolves → windAt falls back to analytic curl-noise (first frames).
+    const field = fluidWind.read();
+    if (field) {
+      const [oX, oZ] = fluidWind.originXZ;
+      setFluidField(field.u, field.v, fluidWind.gridW, fluidWind.gridH, oX, oZ,
+        fluidWind.cellMeters, fluidWind.currentScale);
+    }
+
     bird.integrate(dt, input);
 
     // altitude-adaptive camera: low clearance → eye drops + look flattens (ground rush);
@@ -253,13 +294,14 @@ async function boot() {
 
     // camera follows the bird
     cam.target = [bird.pos[0], bird.pos[1], bird.pos[2]];
-    // Follow the GROUND-TRACK (actual travel dir), not heading — so when wind drifts the bird it
-    // visibly CRABS in frame (nose cocked into the wind). The most legible "wind is shoving me" cue.
-    // Blend 70% toward track (shortest arc); world-up ground-lock preserved.
-    let dTrk = bird.lastGroundTrack - bird.heading;
-    dTrk = Math.atan2(Math.sin(dTrk), Math.cos(dTrk));
-    const camYaw = bird.heading + dTrk * 0.7;
-    cam.forward = [Math.sin(camYaw), 0, Math.cos(camYaw)];
+    // Aim along the bird's MOMENTUM (smoothed horizontal velocity), not heading or the raw ground-track.
+    // A low-pass (~0.4s) on the velocity vector filters the buffet/gust jitter and stall thrashing that
+    // made the view shake, while still swinging to follow real turns and wind crab.
+    const kMom = Math.min(1, dt * 2.5);
+    momX += (bird.vel[0] - momX) * kMom;
+    momZ += (bird.vel[2] - momZ) * kMom;
+    const ml = Math.hypot(momX, momZ) || 1;
+    cam.forward = [momX / ml, 0, momZ / ml];
     cam.update();
 
     // speed FOV kick: diving widens the view (eases, never snaps).
@@ -277,6 +319,10 @@ async function boot() {
     const eye = cam.getEye();
 
     const enc = device.createCommandEncoder();
+    // v13: step the GPU fluid (the evolving wind source) over the bird-local moving window, and enqueue
+    // its velocity buffers for async readback (consumed next frames via fluidWind.read()). Recorded into
+    // the same frame encoder; afterSubmit() (post-submit) kicks the non-awaited maps.
+    fluidWind.step(enc, dt, bird.pos[0], bird.pos[2]);
     // terrain pass: clears color+depth. CAMERA-RELATIVE rows — build them around the camera ground
     // point using the SMOOTHED view basis (forward/right) so the stack stays screen-horizontal.
     const camGround = cam.groundPos();
@@ -284,7 +330,7 @@ async function boot() {
     const camRight = cam.rightHoriz();
     terrain.draw(enc, colorView, depthView, viewProj, camGround, camFwd, camRight, eye, {
       r: SKY[0], g: SKY[1], b: SKY[2], a: 1,
-    });
+    }, pxW / pxH, (2 * DOT_PX) / pxH);
     // wind pass: loads color+depth (no clear); drifting neon DOT motes over the ridges (depth-tested,
     // no depth-write) — advected by the bird's sim time so the drawn field matches the field that pushes.
     wind.draw(enc, colorView, depthView, viewProj, camGround, camFwd, camRight, eye,
@@ -296,6 +342,8 @@ async function boot() {
       [bird.pos[0], bird.pos[1], bird.pos[2]],
       bird.pos[1] - bird.lastClearance, bird.simTime, resolveView);
     device.queue.submit([enc.finish()]);
+    // v13: kick the non-awaited readback maps for the slots copied this frame (must be AFTER submit).
+    fluidWind.afterSubmit();
 
     (window as any).__camPos = eye;
     (window as any).__birdPos = bird.pos;
@@ -324,6 +372,11 @@ async function boot() {
     // compass overlay: large vectors — heading (cyan), ground-track (yellow), wind (magenta).
     drawCompass(compassCtx, bird.heading, bird.lastGroundTrack, bird.lastWind, windSpeed, drift);
   });
+
+  // v13 EVOLUTION PROBE: sample windAt at a FIXED world point with a FIXED t. Because t is fixed, any
+  // change across calls comes ONLY from the fluid readback replacing the field each frame — that IS the
+  // proof the wind is the evolving fluid (the old analytic curl-noise at a fixed point was quasi-static).
+  (window as any).__windAt = (x: number, z: number) => windAt(x, z, 0);
 
   loop.start();
   (window as any).__birdBooted = true;

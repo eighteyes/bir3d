@@ -51,6 +51,48 @@ const DEFAULTS: Required<WindConfig> = {
   thermalAmp: 4.0,
 };
 
+// --- v13: GPU-fluid field (the structured horizontal SOURCE) ---
+// Module-level handle to the latest async-readback fluid velocity, plus its bird-local world→grid
+// mapping. windAt() uses this as its BASE horizontal vector when set (else falls back to the analytic
+// curl-noise below — covers the first frames before the first readback resolves). bird3d (physics) and
+// the Wind motes (via flowAt→windAt) BOTH read windAt, so wiring the field here makes both ride the
+// fluid with NO change to either. setFluidField is called once per frame from bird-main.ts.
+interface FluidField {
+  u: Float32Array;    // bordered (gridW+2)*(gridH+2) f32 — fluid velocity x (grid-space)
+  v: Float32Array;    // bordered (gridW+2)*(gridH+2) f32 — fluid velocity y (grid-space)
+  gridW: number;      // interior cells across (x)
+  gridH: number;      // interior cells across (z)
+  originX: number;    // world X at grid interior cell (0,*) center — window origin (moves with bird)
+  originZ: number;    // world Z at grid interior cell (*,0) center
+  cellM: number;      // meters per grid cell (world span = gridW*cellM)
+  scale: number;      // grid-velocity → m/s scale (calibrated so |sampled| lands in the flyable band)
+}
+let fluidField: FluidField | null = null;
+
+// Peak |fluid wind| (m/s) the FLUID component is clamped to (drift is added on top). Tuned with the
+// regulator's targetBand so the SAMPLED field lands mean ~10 / max ~16 — in the spec's 10-15 flyable
+// band, no +61° blow-around (drift+16° crab preserved), AND matching the shipped analytic field's speed
+// distribution so the motes' speed-cull survival (→ the per-mote 10-segment sampleHeight tail loop, the
+// dominant CPU cost) does not spike above the analytic baseline.
+const FLUID_MAX = 10;
+
+// Per-frame setter (bird-main.ts). uArr/vArr are the latest readback of fluid.velocityX/Y (bordered
+// (gridW+2)*(gridH+2)). The window is BIRD-LOCAL: originX/Z is the world position of interior cell
+// (0,0); it moves with the bird so the field is always live where the bird is. scale maps the raw
+// grid velocity into m/s (calibrated against the measured readback magnitude).
+export function setFluidField(
+  uArr: Float32Array,
+  vArr: Float32Array,
+  gridW: number,
+  gridH: number,
+  originX: number,
+  originZ: number,
+  cellM: number,
+  scale: number
+): void {
+  fluidField = { u: uArr, v: vArr, gridW, gridH, originX, originZ, cellM, scale };
+}
+
 // Closed-form curl-noise potential. Sum of sines → smooth scalar field; wind = curl(potential)
 // = (dPot/dz, -dPot/dx), which is divergence-free (looks like real flow, no sources/sinks).
 function potential(x: number, z: number, t: number): number {
@@ -62,13 +104,66 @@ function potential(x: number, z: number, t: number): number {
   ) * s;
 }
 
-// Horizontal wind [wx, wz] m/s at world (x,z), time t. Curl-noise + steady prevailing drift.
+// Module-level scratch tuple for windAt's single return allocation. windAt is called tens of thousands
+// of times per frame (every mote × every tail segment); returning a fresh array each call was ~7ms/frame
+// of GC pressure (measured). Every caller (bird3d, flowAt) destructures the result IMMEDIATELY
+// (`const [wx,wz] = windAt(...)`), reading it out before the next call overwrites the scratch — so reuse
+// is safe and transparent (no signature change).
+const _w: [number, number] = [0, 0];
+
+// Horizontal wind [wx, wz] m/s at world (x,z), time t.
+// v13: BASE = the GPU-fluid sample (the structured, EVOLVING horizontal source) when a field is set
+// (async readback wired from bird-main.ts), else the analytic curl-noise (fallback for the first frames
+// before readback resolves). In BOTH cases the steady PREVAILING DRIFT is ADDED — a zero-mean fluid swirl
+// alone would collapse the crab/ground-track onto heading and regress the felt-wind; the drift is the
+// ever-present cross-track shove. windAt stays the single source of truth for bird physics + motes.
+// Returns the shared _w scratch — destructure it before the next call.
 export function windAt(
   x: number,
   z: number,
   t: number,
   cfg: Required<WindConfig> = DEFAULTS
 ): [number, number] {
+  // steady prevailing drift (large-scale, ever-present cross-track shove) — KEPT in every branch.
+  const dx = Math.sin(cfg.driftDir) * cfg.driftAmp;
+  const dz = Math.cos(cfg.driftDir) * cfg.driftAmp;
+
+  // BASE = the GPU-fluid bilinear sample when a field is set (the real evolving source). Inlined (no
+  // intermediate array) so the hot mote loop stays allocation-free. Interior cells are indexed
+  // i+(gridW+2)*j with i,j in 1..gridW — the +1 border offset is critical (off-by-one silently shifts
+  // the whole field). World (originX,originZ) maps to interior cell (0,0) → grid coord (x-originX)/cellM.
+  const f = fluidField;
+  if (f) {
+    const gx = (x - f.originX) / f.cellM;
+    const gz = (z - f.originZ) / f.cellM;
+    if (gx >= 0 && gz >= 0 && gx <= f.gridW - 1 && gz <= f.gridH - 1) {
+      const i0 = gx | 0, j0 = gz | 0;
+      const i1 = i0 + 1 < f.gridW ? i0 + 1 : i0;
+      const j1 = j0 + 1 < f.gridH ? j0 + 1 : j0;
+      const tx = gx - i0, tz = gz - j0;
+      const stride = f.gridW + 2;
+      const u = f.u, v = f.v;
+      // +1 on both axes → skip the border into the interior.
+      const a = (i0 + 1) + stride * (j0 + 1);
+      const b = (i1 + 1) + stride * (j0 + 1);
+      const c = (i0 + 1) + stride * (j1 + 1);
+      const d = (i1 + 1) + stride * (j1 + 1);
+      let ux = ((u[a]! * (1 - tx) + u[b]! * tx) * (1 - tz) + (u[c]! * (1 - tx) + u[d]! * tx) * tz) * f.scale;
+      let vx = ((v[a]! * (1 - tx) + v[b]! * tx) * (1 - tz) + (v[c]! * (1 - tx) + v[d]! * tx) * tz) * f.scale;
+      // Clamp the fluid sample magnitude to match the analytic field's distribution (max ~16.5 m/s) it
+      // replaced. The regulator pins the MEAN, but local cells run 2-3× mean (peaky); unclamped peaks
+      // (a) push the wind past the proven-flyable band → the +61° blown-around regression, and (b) raise
+      // the motes' speed-cull survival → more run the 10-segment sampleHeight tail loop → a CPU spike.
+      // Clamping the peaks to the analytic max fixes BOTH (feel stays in-band, cull survival matches).
+      const mag = Math.hypot(ux, vx);
+      if (mag > FLUID_MAX) { const s = FLUID_MAX / mag; ux *= s; vx *= s; }
+      _w[0] = ux + dx;
+      _w[1] = vx + dz;
+      return _w;
+    }
+  }
+
+  // FALLBACK: analytic curl-noise (first frames before readback resolves, or outside the window).
   const sc = cfg.curlScale;
   const e = 0.75; // finite-diff step in SCALED units
   const px = x * sc, pz = z * sc;
@@ -77,12 +172,9 @@ export function windAt(
     (potential(px, pz + e, t) - potential(px, pz - e, t)) / (2 * e);
   const dPot_dx =
     (potential(px + e, pz, t) - potential(px - e, pz, t)) / (2 * e);
-  const cx = dPot_dz * cfg.curlAmp;
-  const cz = -dPot_dx * cfg.curlAmp;
-  // steady prevailing drift (large-scale, ever-present cross-track shove)
-  const dx = Math.sin(cfg.driftDir) * cfg.driftAmp;
-  const dz = Math.cos(cfg.driftDir) * cfg.driftAmp;
-  return [cx + dx, cz + dz];
+  _w[0] = dPot_dz * cfg.curlAmp + dx;
+  _w[1] = -dPot_dx * cfg.curlAmp + dz;
+  return _w;
 }
 
 // Vertical thermal updraft (m/s) at world (x,z): a few broad, slowly-drifting columns of rising
