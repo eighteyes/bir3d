@@ -282,8 +282,9 @@ export class Wind {
     // v11 NEAR SPHERE: a DENSE ball of LITTLE short-tailed comets around the bird. ~1600 motes in a tight
     // ~65m ball makes the local air unmistakably legible AND visually distinct from the far long lines (the
     // v11 fix). SHORT tails (3 × 0.12s ≈ 0.36s of flow, ~3-4m) keep them reading as LITTLE comets/dots, not
-    // the far streamlines. Tight radius + high count = a thick visible cloud right at the bird (count chosen
-    // to hold 60fps; the near tail reuses the head flow + a single tip clamp to stay cheap).
+    // the far streamlines. Tight radius + high count = a thick visible cloud right at the bird. Count chosen
+    // to hold a clean 60fps (2200 read as borderline 56-59); the near tail reuses the head flow + a single
+    // tip terrain clamp to stay cheap (no per-segment flowAt/sampleHeight).
     this.nearCount = p.nearCount ?? 1600;
     this.nearRadius = p.nearRadius ?? 65;
     this.nearSegments = p.nearSegments ?? 3;
