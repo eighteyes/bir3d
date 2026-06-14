@@ -1,5 +1,94 @@
 # Human Review Steps
 
+## Bird 3D v15 (world-pinned fluid window + terrain coupling)
+**Date:** 2026-06-13
+**Commit:** fda3f2f
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What changed (fluid subsystem only — `gpu/fluid-wind.ts`, `gpu/fluid.ts`, `shaders/fluid/{shift,force_field}.wgsl`)
+- WORLD-PINNED MOVING WINDOW: the GpuFluid(256) grid origin is anchored to WORLD coords (was bird-local in v13). The window recenters in GRID-ALIGNED whole-cell steps when the bird nears the edge; on recenter the u/v field is GPU-shifted by the integer cell offset (overlap copied 1:1, leading edge clamp-extended) so the flow scrolls with the world — no seam/pop. Readback origin is captured per-slot and returned paired with the field so the world→grid mapping is self-consistent across the 2-3-frame-stale readback even when an intervening recenter moved the live origin.
+- TERRAIN COUPLING: per-cell orographic force from an fBm twin of terrain.ts (down-gradient push → flow deflected around/over high terrain, channelled along valleys), clamped to `terrainMax` (flyable band, no spike). Recomputed only on recenter (fBm re-eval is edge-strip-only; force derivation is cheap neighbour diffs).
+- Magnitude regulator decoupled: force = structure, scale (grid-vel→m/s) = band.
+
+### Verify — typecheck (standalone)
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/tsc --noEmit && echo OK
+```
+
+### Verify — run the sim (standalone)
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/vite
+```
+
+### Verify — screenshot (standalone, dev server must be up)
+```
+cd /Users/god/projects/ai-jank/vector-system && node .ai/tmp/v15-shot.mjs
+```
+
+### Verify — full v15 probe: fps + anchor + no-seam + spatial coupling (standalone)
+```
+cd /Users/god/projects/ai-jank/vector-system && node .ai/tmp/probe-v15.mjs
+```
+
+### Verify — 30s bounded-field / blow-up check (standalone)
+```
+cd /Users/god/projects/ai-jank/vector-system && node .ai/tmp/probe-v15-blowup.mjs
+```
+
+### Measured results (2026-06-13)
+- fps: 60 held across the full 10s probe (20/20 samples) and the 30s blow-up run, with terrain coupling + bloom both active.
+- NO SEAM/POP on recenter: at the recenter crossing (recenterFrame 0→1), wind at a fixed world point went 7.0@79° → 7.3@78°, |Δ|=0.25 m/s (within normal per-100ms fluid evolution). Corroborated by 65 recenters over 30s flight, zero errors, bounded rawMean.
+- ANCHORED (not bird-relative): during the 10s anchor loop the bird flew ~270 m (27 m/s, ground-track 21°) while `recenterFrame` stayed 0 — the window origin did NOT follow the bird. The fixed point's wind evolved smoothly (6.7→15.3→4.1 m/s, 57°→127°→84°) because the FLUID evolves, not because the window moved (in v13 the bird-local window slid every frame).
+- SPATIAL terrain coupling: 5 fixed points across the window at one instant gave differing directions/magnitudes (2.8@169°, 2.1@96°, 8.8@63°, 7.5@74°, 7.3@70°) — the field is spatially structured, not flat.
+- BOUNDED field: rawMean oscillates 15–31, scale tracks inversely 0.10–0.20 over 30s of continuous recentering — no monotonic climb, no divergence.
+
+### Visual checklist (open http://localhost:5174/index-bird.html)
+- [ ] 60fps in the overlay with bloom on.
+- [ ] Fly straight across ~window-span (≈2600 m); the wind does NOT jump/snap when the window recenters (motes keep streaming continuously).
+- [ ] Wind gusts sit over the SAME ridges as you fly past (anchored to the landscape), not random churn that moves with you.
+- [ ] No-regression: bloom glow, EKG terrain-pour, crab/DRIFT (overlay DRIFT non-zero), mote fade-in/out, near-bird comet sphere, evolving fluid (overlay wind vector changes over time) all present; zero console errors.
+
+### Rough / caveats
+- No-pop sampled continuously across ONE recenter crossing (first, ~1-cell, |Δ|=0.25 m/s); corroborated by 65 recenters/30s zero-error, but it is one continuous crossing, not a full window-span sweep with frame-by-frame sampling.
+- The 5-point spatial variation is consistent with terrain coupling but does not isolate it from the fluid's own swirl/drift; the per-cell fBm-gradient force is wired and active, but a point-sample doesn't prove terrain-correlation cleanly.
+
+## Bird snap-accel fix + wind volume-fill (v14)
+**Date:** 2026-06-13
+**Commit:** N/A (uncommitted working tree)
+**Session:** 17dc1ecc-a6c4-4456-bc85-980e0fb1a6b1
+
+### Symptoms (user)
+- "the bird has very fast accel / deaccel" — snappy/jerky motion, no inertia.
+- "the wind has strange boundaries where particles cluster in planes" — confirmed by user as FLAT HORIZONTAL layers.
+
+### Bird — velocity-vector inertia (`gpu/bird3d.ts`)
+- ROOT CAUSE (adversarially confirmed): the bird had no velocity momentum. `integrate()` overwrote `this.vel = dir·speed + wind + updraft − sink` every frame (was bird3d.ts:279-281) — assigned, never integrated — so world velocity instantly tracked pitch/speed/sink → snap accel/deaccel.
+- FIX: compose the flight-path velocity into a TARGET (`tvx/tvy/tvz`), then low-pass `this.vel` toward it with a dt-correct factor `1 − e^(−dt/VEL_TAU)`, `VEL_TAU = 0.25 s`. Buffet is added as an instantaneous overlay (`cvx/cvy/cvz`) for the position step + telemetry, deliberately NOT fed back through the filter (keeps the gust texture crisp).
+- NOT TOUCHED (refutation caught the investigator over-reaching): cubic stall-sink (intentional "drops HARD" feel) and the pitch-ease (its claimed frame-rate bug was backwards — a raw lerp already preserves its time constant across refresh rates).
+- KNOB: `VEL_TAU` at top of `integrate()`. Bigger = heavier/smoother; smaller = snappier.
+
+### Wind — per-mote home height fills a volume (`gpu/wind.ts`)
+- ROOT CAUSE: wedge motes were seeded at a single height (`terr + clearance`, 16 m) AND relaxed back to that same single height every frame, while vertical excitation (terrain-pour `w`) is ≈0 over flat ground — so the whole [minClear 5 .. maxClear 170] band collapsed onto one 16 m sheet. (Near-bird "comet" motes already seed in a volume — unaffected.) The original design comment (wind.ts ~386) deliberately pinned them low; user now wants volume.
+- FIX: new per-mote `pHome` array + `vSpread` config (default 40 m). Each mote draws a HOME clearance uniformly from `[max(minClear, clearance−vSpread) .. min(maxClear, clearance+vSpread)]` (band clamped BEFORE sampling so motes never pile at a clamp → no new sheet), seeds at it, and relaxes toward its OWN home. Ridge-pour + anti-deplete behaviour preserved on top.
+- KNOB: `vSpread` (wind cfg). 0 = old flat sheet; larger = taller volume. `clearance` is now the band CENTER.
+
+### Verify — typecheck (standalone)
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/tsc --noEmit && echo OK
+```
+
+### Verify — run the sim (standalone)
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/vite
+```
+
+### Visual checklist (open http://localhost:5173/index-bird.html)
+- [ ] BIRD: pitch/dive/recover ramps smoothly — no instant snap to a new speed; still feels connected to the stick (not mushy). Tune `VEL_TAU` if too floaty (lower) or still too sharp (raise).
+- [ ] BIRD: stall still breaks (hold nose up → nose drops, vario goes strongly negative) — the inertia must not have erased the stall plummet.
+- [ ] WIND: wedge motes now fill a VERTICAL VOLUME of air, not a single flat sheet at one height. Over flat ground you should see motes at a range of heights.
+- [ ] WIND: no NEW flat sheet at the floor/ceiling (would mean clamp-piling — raise `minClear` headroom or lower `vSpread`).
+- [ ] WIND: ridge-pour still reads — motes still stream up windward faces and spill over crests.
+
 ## Bird 3D v14 (neon bloom post-process + re-tune)
 **Date:** 2026-06-13
 **Commit:** 8e49e36 (bloom wiring) + this doc commit
