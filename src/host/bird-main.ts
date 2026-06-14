@@ -1,6 +1,10 @@
 // bird-main.ts — 3D gliding bird over the neon ridgeline terrain. Entry for /index-bird.html.
 // Responsibilities:
-//   - Acquire device; configure canvas color + matching depth target (recreate on resize).
+//   - Acquire device; configure canvas (swapchain) + HDR rgba16float MSAA scene target + single-sample
+//     HDR resolve/scene texture + matching depth target (recreate on resize).
+//   - BLOOM post-process: scene passes render into the HDR target (rgba16float, so the glow doesn't
+//     band on the dark scene), resolve into the scene texture, then bloom (threshold → separable
+//     blur → composite/Reinhard tone-map) writes the final glowing image to the swapchain.
 //   - Build TerrainEKG (neon ridgeline) and Bird3D (CPU-integrated glider); ChaseCamera follows
 //     the BIRD: target=bird.pos, forward=bird.forwardVec(), camOffset=(bird.x,bird.z) so the terrain
 //     grid recenters under the bird.
@@ -26,6 +30,7 @@ import { FluidWind } from "./gpu/fluid-wind";
 import { GroundMarker } from "./gpu/marker";
 import { ChaseCamera } from "./gpu/camera";
 import { AutoPilot } from "./autopilot";
+import { Bloom } from "./gpu/bloom";
 import { perspective, multiply } from "./gpu/mat4";
 import { FrameLoop } from "./frameloop";
 
@@ -39,13 +44,16 @@ const NEAR = 1;
 const FAR = 12000;
 
 // MSAA: render every pass into a 4× multisample color+depth target, then resolve once (on the final
-// marker pass) into the swapchain — smooths the thin neon line/ribbon edges (the canvas itself can't
-// be multisampled directly). Single source of truth: threaded into every pipeline so counts match.
+// marker pass) into the single-sample HDR scene texture — smooths the thin neon line/ribbon edges
+// (the canvas itself can't be multisampled directly). Single source of truth: threaded into every
+// pipeline so counts match.
 const SAMPLES = 4;
 
-// Terrain dots: DOT_PX = on-screen dot radius (device px); the stack draws round point-sprites instead
-// of solid lines. dotRadius (NDC-y) = 2·DOT_PX / pxH so the dot holds a constant screen size at any depth.
-const DOT_PX = 3;
+// BLOOM (neon glow): all scene passes render into an HDR rgba16float MSAA target, resolve into a
+// single-sample rgba16float SCENE texture, then the bloom chain (threshold → separable blur →
+// composite/tone-map) reads that and writes the final image to the swapchain. rgba16float is
+// REQUIRED — rgba8 bands the soft glow on this very dark scene.
+const HDR_FORMAT: GPUTextureFormat = "rgba16float";
 
 // Altitude-adaptive camera (the swoop fix): LOW clearance pulls the eye down near the bird and
 // flattens the look angle so the ground rushes; HIGH clearance restores the v3/v4 god-view framing.
@@ -89,16 +97,23 @@ async function boot() {
     sampleCount: SAMPLES,
     usage: GPUTextureUsage.RENDER_ATTACHMENT,
   });
-  // multisample color target — every pass renders here; the final pass resolves it into the swapchain.
+  // multisample HDR color target — every scene pass renders here; the final marker pass resolves it
+  // into the single-sample HDR scene texture (NOT the swapchain — bloom composites that last).
   let msaaTex = device.createTexture({
     size: [pxW, pxH],
-    format,
+    format: HDR_FORMAT,
     sampleCount: SAMPLES,
     usage: GPUTextureUsage.RENDER_ATTACHMENT,
   });
+  // single-sample HDR scene texture — the MSAA resolve target AND the bloom chain's input.
+  let sceneTex = device.createTexture({
+    size: [pxW, pxH],
+    format: HDR_FORMAT,
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+  });
 
   const terrainShader = await fetch("/src/host/shaders/terrain_ekg.wgsl").then((r) => r.text());
-  const terrain = new TerrainEKG(device, terrainShader, format, {
+  const terrain = new TerrainEKG(device, terrainShader, HDR_FORMAT, {
     rows: 512,        // stacked EKG depth rows — covers the 2× maxDist at the same 4× spacing
     cols: 1536,       // samples per row — 2× density: the wide halfWidth means near rows show only a
                       // central slice, so more samples are needed to shrink the chord faceting up close.
@@ -111,7 +126,6 @@ async function boot() {
     maxDist: 1900,    // CLEAN HORIZON moved out 2× with the fog (950→1900) — fog still dissolves
                       // rows before this cutoff so the far edge never shows as a shelf.
     baseline: -300,   // fill curtains drop to this world-y (occlusion only; below the frame).
-    dotStride: 3,     // draw every 3rd sample as a dot — spaced/lighter than the old solid trace.
     fogColor: SKY,
     fogDensity: 1 / 1100, // FOG EXPANDED 2× (1/550→1/1100): visibility doubles; far ridges read
                           // much deeper before dissolving into the haze band.
@@ -121,12 +135,12 @@ async function boot() {
   const startH = terrain.sampleHeight(0, 0);
   // HIGHER START (v4): begin well above terrain (~200 m clearance) so the flight is aerial from
   // the first frame and the EKG stack sits below the eyeline (less horizon tangle).
-  const bird = new Bird3D(device, birdShader, format, terrain, [0, startH + 200, 0], {}, SAMPLES);
+  const bird = new Bird3D(device, birdShader, HDR_FORMAT, terrain, [0, startH + 200, 0], {}, SAMPLES);
 
   // VISIBLE WIND: neon streamline comets over the terrain, integrated from the SAME shared windAt
   // field that pushes the bird (src/host/gpu/wind.ts). Camera-relative like the EKG rows.
   const windShader = await fetch("/src/host/shaders/wind.wgsl").then((r) => r.text());
-  const wind = new Wind(device, windShader, format, (x, z) => terrain.sampleHeight(x, z), {}, {}, SAMPLES);
+  const wind = new Wind(device, windShader, HDR_FORMAT, (x, z) => terrain.sampleHeight(x, z), {}, {}, SAMPLES);
 
   // v13: the REAL GPU fluid is the EVOLVING wind SOURCE. windAt() (wind.ts) samples this field as its
   // base horizontal vector + keeps the prevailing drift; bird3d (physics) and the motes (via flowAt) ride
@@ -153,7 +167,27 @@ async function boot() {
   // ALTITUDE PLUMB-LINE: dashed neon drop-line bird→ground (one dash per ~9 m = readable altimeter)
   // + pulsing ground diamond. THE direct how-close-is-the-ground cue for swoops.
   const markerShader = await fetch("/src/host/shaders/marker.wgsl").then((r) => r.text());
-  const marker = new GroundMarker(device, markerShader, format, SAMPLES);
+  const marker = new GroundMarker(device, markerShader, HDR_FORMAT, SAMPLES);
+
+  // BLOOM post-process: reads the resolved HDR scene texture, writes the final image to the swapchain.
+  // RE-TUNED for the additive-neon double-count risk (dense comet sphere + 50%-opacity wind + bright
+  // bird are blowout candidates): threshold high enough that only bright cores seed the glow; Reinhard
+  // tone-map in the composite keeps blown pixels HUE-COLORED instead of smearing to white. Half-res
+  // blur (downsample 2) gives a wide soft glow AND holds the 60fps budget.
+  const bloomShaders = {
+    threshold: await fetch("/src/host/shaders/bloom_threshold.wgsl").then((r) => r.text()),
+    blur: await fetch("/src/host/shaders/bloom_blur.wgsl").then((r) => r.text()),
+    composite: await fetch("/src/host/shaders/bloom_composite.wgsl").then((r) => r.text()),
+  };
+  const bloom = new Bloom(device, format, bloomShaders, {
+    threshold: 0.85, // only neon cores above this luminance bloom (dark ground / dim far lines do not)
+    knee: 0.5,       // soft ramp above the threshold so the glow fades in, no hard edge
+    intensity: 0.9,  // bloom add weight — glow, not wash
+    exposure: 1.0,   // scene exposure into the tone-map
+    downsample: 2,   // half-res bloom chain (wide soft glow + perf)
+    blurPasses: 2,   // H+V iterations — widens the glow; 2 holds 60fps
+  });
+  bloom.resize(pxW, pxH);
 
   // hands-off flight controller (AUTOPILOT mode) — emits the same BirdInput the mouse did.
   // "straight" policy = bird-vs-wind eval: locked heading, trim glide, deviate only near ground.
@@ -232,10 +266,17 @@ async function boot() {
     msaaTex.destroy();
     msaaTex = device.createTexture({
       size: [pxW, pxH],
-      format,
+      format: HDR_FORMAT,
       sampleCount: SAMPLES,
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
     });
+    sceneTex.destroy();
+    sceneTex = device.createTexture({
+      size: [pxW, pxH],
+      format: HDR_FORMAT,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    bloom.resize(pxW, pxH); // recreate the downsampled bloom-chain textures + bind groups
   };
   window.addEventListener("resize", resize);
 
@@ -313,8 +354,9 @@ async function boot() {
     const view = cam.viewMatrix();
     const viewProj = multiply(proj, view);
 
-    const colorView = msaaTex.createView();                   // all passes render into the MSAA target
-    const resolveView = ctx.getCurrentTexture().createView(); // final pass resolves it into the swapchain
+    const colorView = msaaTex.createView();                   // all scene passes render into the HDR MSAA target
+    const resolveView = sceneTex.createView();                // final scene pass resolves into the HDR scene texture
+    const swapView = ctx.getCurrentTexture().createView();    // bloom composite writes the final image here
     const depthView = depthTex.createView();
     const eye = cam.getEye();
 
@@ -330,7 +372,7 @@ async function boot() {
     const camRight = cam.rightHoriz();
     terrain.draw(enc, colorView, depthView, viewProj, camGround, camFwd, camRight, eye, {
       r: SKY[0], g: SKY[1], b: SKY[2], a: 1,
-    }, pxW / pxH, (2 * DOT_PX) / pxH);
+    });
     // wind pass: loads color+depth (no clear); drifting neon DOT motes over the ridges (depth-tested,
     // no depth-write) — advected by the bird's sim time so the drawn field matches the field that pushes.
     wind.draw(enc, colorView, depthView, viewProj, camGround, camFwd, camRight, eye,
@@ -338,9 +380,12 @@ async function boot() {
     // bird pass: loads color+depth, depth-tested → ridges occlude the bird.
     bird.draw(enc, colorView, depthView, viewProj);
     // altitude plumb-line + ground diamond under the bird (depth-tested → ridges occlude it).
+    // LAST scene pass — resolves the HDR MSAA target into the single-sample scene texture.
     marker.draw(enc, colorView, depthView, viewProj,
       [bird.pos[0], bird.pos[1], bird.pos[2]],
       bird.pos[1] - bird.lastClearance, bird.simTime, resolveView);
+    // BLOOM: threshold → separable blur → composite/tone-map the HDR scene into the swapchain.
+    bloom.apply(enc, resolveView, swapView);
     device.queue.submit([enc.finish()]);
     // v13: kick the non-awaited readback maps for the slots copied this frame (must be AFTER submit).
     fluidWind.afterSubmit();
