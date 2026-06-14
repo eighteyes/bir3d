@@ -39,7 +39,15 @@ interface FluidShaders {
   subtractGrad: string;
   advect: string;
   setBnd: string;
+  // Optional extra kernels for the world-pinned moving window + terrain coupling (fluid-wind.ts).
+  // Created lazily via initExtraPipelines() if not present at construction (the caller may fetch
+  // these after the base shaders); shift()/setForceField() no-op until they are ready.
+  shift?: string;
+  forceField?: string;
 }
+
+// Shift params uniform: w,h,dx,dz (dx/dz are i32 cell offsets). 16 bytes, 16-byte aligned.
+const SHIFT_PARAMS_BYTES = 16;
 
 export class GpuFluid {
   readonly w: number;
@@ -56,6 +64,19 @@ export class GpuFluid {
   private p: PingPong<GPUBuffer>;
   private div: GPUBuffer;
   private params: GPUBuffer;
+
+  // World-pinned recenter: GPU shift pass (u/v only; p is re-cleared each step, dye unused).
+  private shiftParams: GPUBuffer;
+  private shiftHost = new ArrayBuffer(SHIFT_PARAMS_BYTES);
+  private shiftU32 = new Uint32Array(this.shiftHost);
+  private shiftI32 = new Int32Array(this.shiftHost);
+  private pShift: GPUComputePipeline | null = null;
+
+  // Terrain coupling: per-cell force field (bordered (W+2)*(H+2)), added in step() like the scalar disc.
+  private fxField: GPUBuffer;
+  private fyField: GPUBuffer;
+  private pForceField: GPUComputePipeline | null = null;
+  private hasForceField = false;
 
   // Scratch for per-step uniform upload (w/h fixed; dt/forces vary).
   private paramsHost = new ArrayBuffer(PARAMS_BYTES);
@@ -104,6 +125,14 @@ export class GpuFluid {
       size: PARAMS_BYTES,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+    this.shiftParams = device.createBuffer({
+      size: SHIFT_PARAMS_BYTES,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.shiftU32[0] = w;
+    this.shiftU32[1] = h;
+    this.fxField = storage();
+    this.fyField = storage();
 
     // w/h are constant for the solver's lifetime; write once.
     this.paramsU32[0] = w;
@@ -120,11 +149,59 @@ export class GpuFluid {
     this.pVelxCorners = makeComputePipeline(device, shaders.setBnd, "velx_corners");
     this.pVelyEdges = makeComputePipeline(device, shaders.setBnd, "vely_edges");
     this.pVelyCorners = makeComputePipeline(device, shaders.setBnd, "vely_corners");
+
+    if (shaders.shift || shaders.forceField) {
+      this.initExtraPipelines(shaders.shift, shaders.forceField);
+    }
+  }
+
+  /**
+   * Lazily build the optional shift + per-cell force-field pipelines (world-pinned window + terrain
+   * coupling). Safe to call once after the base shaders are fetched; idempotent per kernel.
+   */
+  initExtraPipelines(shiftSrc?: string, forceFieldSrc?: string): void {
+    if (shiftSrc && !this.pShift) this.pShift = makeComputePipeline(this.device, shiftSrc);
+    if (forceFieldSrc && !this.pForceField) {
+      this.pForceField = makeComputePipeline(this.device, forceFieldSrc);
+    }
   }
 
   /** Set the scripted force / dye-injection source applied each step (until changed). */
   setForce(force: Partial<ForceParams>): void {
     this.force = { ...this.force, ...force };
+  }
+
+  /**
+   * Upload the per-cell terrain force field (bordered (W+2)*(H+2) f32 each). Once set, step() adds
+   * dt*fx_field / dt*fy_field to the velocity every step (terrain orographic coupling). The caller
+   * recomputes/uploads these only when the world-pinned window recenters (on shift), not every frame.
+   */
+  setForceField(fx: Float32Array, fy: Float32Array): void {
+    if (fx.byteLength !== this.bytes || fy.byteLength !== this.bytes) {
+      throw new Error(`setForceField: expected ${this.bytes} bytes per field`);
+    }
+    // .buffer/byteOffset/byteLength overload sidesteps the lib's Float32Array<ArrayBufferLike> mismatch.
+    this.device.queue.writeBuffer(this.fxField, 0, fx.buffer, fx.byteOffset, fx.byteLength);
+    this.device.queue.writeBuffer(this.fyField, 0, fy.buffer, fy.byteOffset, fy.byteLength);
+    this.hasForceField = this.pForceField !== null;
+  }
+
+  /**
+   * Scroll the velocity field (u,v) by an integer cell offset (world-pinned recenter). The overlapping
+   * region is copied 1:1 (no resample → no seam); freshly-exposed leading-edge cells are clamp-extended
+   * from the nearest interior column/row. p is NOT shifted (project clears it every step) and dye is
+   * unused. No-op until the shift pipeline is ready. dx>0 shifts the field toward +x (origin moved -x).
+   */
+  shift(encoder: GPUCommandEncoder, dx: number, dz: number): void {
+    if (!this.pShift || (dx === 0 && dz === 0)) return;
+    this.shiftI32[2] = dx;
+    this.shiftI32[3] = dz;
+    this.device.queue.writeBuffer(this.shiftParams, 0, this.shiftHost);
+    // u: src=current → dst=next, then swap.
+    this.pass(encoder, this.pShift, [this.shiftParams, this.u.current, this.u.next], "shift");
+    this.u.swap();
+    this.pass(encoder, this.pShift, [this.shiftParams, this.v.current, this.v.next], "shift");
+    this.v.swap();
   }
 
   /** Current (most-recently-written) buffers — for one-shot readback / viz OUTSIDE the loop. */
@@ -230,6 +307,16 @@ export class GpuFluid {
 
     // add-forces + dye injection (interior, in place).
     this.pass(encoder, this.pForces, [this.params, this.u.current, this.v.current, this.dye.current], "forces");
+    // per-cell terrain force field (orographic coupling) — added the same step, before projection so the
+    // pressure solve redistributes it into divergence-free flow that bends around/over the terrain.
+    if (this.hasForceField && this.pForceField) {
+      this.pass(
+        encoder,
+        this.pForceField,
+        [this.params, this.u.current, this.v.current, this.fxField, this.fyField],
+        "forces"
+      );
+    }
     this.setBndVel(encoder);
 
     // project the post-force field.
@@ -257,7 +344,7 @@ export class GpuFluid {
     for (const b of [
       this.u.current, this.u.next, this.v.current, this.v.next,
       this.dye.current, this.dye.next, this.p.current, this.p.next,
-      this.div, this.params,
+      this.div, this.params, this.shiftParams, this.fxField, this.fyField,
     ]) {
       b.destroy();
     }
