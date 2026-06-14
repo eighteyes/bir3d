@@ -1,5 +1,99 @@
 # Human Review Steps
 
+## Bird 3D v14 (neon bloom post-process + re-tune)
+**Date:** 2026-06-13
+**Commit:** 8e49e36 (bloom wiring) + this doc commit
+**Session:** 4f2f34f8-ceb1-4a8e-ad37-2dfe8d0681f5
+
+### What was done (`bird-main.ts` + `gpu/bloom.ts` + `shaders/bloom_*.wgsl`)
+- BLOOM post-process for the neon glow. All scene passes (terrain / wind / bird / marker) now render into an HDR `rgba16float` 4× MSAA target, resolve into a single-sample HDR scene texture, then the bloom chain reads that and writes the final image to the swapchain. `rgba16float` is REQUIRED — `rgba8` bands the soft glow on this very dark scene.
+- Chain: bright-pass THRESHOLD (soft-knee, luminance-weighted, keeps hue) → SEPARABLE 9-tap Gaussian blur (H then V, 2 iterations) at HALF-RES (downsample 2 = wide soft glow + perf) → COMPOSITE (scene·exposure + bloom·intensity, highlight-only rolloff tone-map at K=0.8 so blowout stays hue-colored, not white). All fullscreen-triangle passes.
+- The existing render MODULES were NOT changed — `bird-main` constructs TerrainEKG / Bird3D / Wind / GroundMarker with `'rgba16float'` as their `colorFormat` (instead of the canvas preferred format), so they draw into the HDR target. Canvas context stays the preferred swapchain format; only the final composite writes to it.
+
+### Re-tune (the advisor's blowout risk: bloom + additive neon double-counts bright pixels)
+- TUNING (held — no down-tune needed): threshold 0.85, knee 0.5, intensity 0.9, exposure 1.0, downsample 2, blurPasses 2. Verified by reading the captured images against the pre-bloom baseline (`.ai/tmp/fade-final.png`). Per-element read (all PASS):
+  - (a) terrain elevation color ramp — cool blue/purple valleys vs magenta peaks STILL DISTINGUISHABLE (colored magenta halos, NOT uniform white).
+  - (b) 50%-opacity wind motes — glow as discrete bright specks, SEPARABLE (not smeared into a sheet).
+  - (c) dense near-comet sphere — reads as individual comet STREAKS around the bird, NOT a white blob (confirmed on the tight crop `.ai/tmp/v14-bird-tight.png`).
+  - (d) bird V — bright cyan-white with a glow halo, fully V-SHAPED (two wings + body notch).
+  - (e) mote fade — soft into the dark haze at frame edges, no hard pop.
+  - terrain pour + crab/drift (DRIFT +15°) + evolving fluid wind all still present.
+
+### Measured
+- 60 fps over 5 s (samples: 60×10, min/median/max = 60/60/60). Bloom is +4 full-screen passes (threshold + 2×(H+V) blur + composite) at half-res — holds the ~60fps budget clawed back in v13. Zero page errors.
+- Screenshots: `.ai/tmp/v14-final.png` (full), `.ai/tmp/v14-final-crop.png` (center crop), `.ai/tmp/v14-bird-tight.png` (bird + comet sphere).
+
+### Verify
+```
+cd /Users/god/projects/ai-jank/vector-system && node .ai/tmp/probe-v14.mjs
+```
+Open http://localhost:5174/index-bird.html (or 5173): the scene should GLOW like neon — magenta ridge halos, a luminous bird V, glowing wind motes — while every element STILL READS (no white smear). Knobs live in `bird-main.ts` (the `new Bloom(...)` constructor): threshold UP / intensity DOWN if anything blows out; `Bloom.setTuning({...})` re-tunes without a rebuild.
+
+## Wind: bird drifts on visible flow (#3) + far/near tier crossfade (#4)
+**Date:** 2026-06-13
+**Commit:** N/A (no git repo present in working tree)
+**Session:** (current)
+
+### #3 — bird drifts through the terrain-shaped flow the motes ride (`wind.ts` + `bird3d.ts`)
+- PROBLEM (user): the wind visual didn't match the wind applied to the bird. ROOT CAUSE: bird drifted on raw `windAt × windGain(1.6)`; motes advect on `flowAt` (terrain-deflected `windAt`). Different vector → mismatch.
+- FIX: new module-level `flowHorizontal(wx, wz, gx, gz, deflect)` in wind.ts — the SINGLE into-slope deflection impl, PURE (caller passes the gradient, so no double `sampleHeight` in the hot mote loop). `Wind.flowAt` delegates to it (vertical `w` still computed from RAW pre-deflection wind → byte-equivalent for motes). `bird3d` imports it, adds `deflect` tuning (0.25 == Wind's), computes a central-diff gradient (reusing hX/hZ + 2 new −e samples) and applies the SAME deflection to its horizontal drift. `lastWind` (→ overlay + compass) now reports the deflected drift.
+- CRITICAL GUARD: ridge LIFT keeps the RAW gained wind (`rwx/rwz`) — deflection sheds exactly the into-slope component that drives ridge lift, so feeding deflected wind there would kill windward soaring. `into = rwx*gx + rwz*gz` ≡ old behaviour (byte-identical). Exported `updraftAt` (autopilot's lift sense) still uses raw windAt.
+
+### #4 — far/near tier crossfade, no pop (`wind.ts`)
+- PROBLEM (user): substantial gap between far streamlines and the near ball; tiers pop in/out instead of fading.
+- FIX: plumb `birdPos` into far `step()`. (a) inside `nearRadius*1.6` blend zone, raise the far density floor proximity-scaled (`max(vis, 0.85*proximity)`) so far stays dense into the ball — no calm-air thinning at the bird, no hard ring. (b) far→near handoff: `nearHandoff = smoothstep(0.35, 1, dist3D/nearRadius)` fades far motes out inside the ball so far+near don't stack over-bright; near tier owns the interior. (c) `fadeFarEdge` 50→120 softens the outer wedge perimeter.
+- Result: far owns outside, crossfade across the shell, near owns inside — one tier per region.
+
+### VERIFIED
+- tsc clean; boots clean over many frames (birdPos plumbing + flowHorizontal export/import valid, no circular import); fps 60 (crossfade adds only ~1 sqrt + smoothsteps per far mote); manual stall still fires (nose breaks under nose-up input, vario ~−12). `.ai/tmp/{msaa-boot-check,stall-check,fps-check,shot}.mjs`.
+
+### Review
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/tsc --noEmit && echo OK
+```
+Open http://localhost:5173/index-bird.html: (#3) the compass magenta WIND arrow should bend near ridges and the bird's drift should follow the visible streamlines; (#4) fly toward/over a ridge — the streamlines should flow continuously from distance into the near ball with no pop or gap. Knobs: `bird.tuning.deflect` (match `Wind.deflect`), `Wind.fadeFarEdge`, the `blendR`/`nearHandoff` constants in wind.ts step().
+
+## Far wind streamlines: corners → smooth curves
+**Date:** 2026-06-13
+**Commit:** N/A (no git repo present in working tree)
+**Session:** (current)
+
+### `wind.ts` (+ no shader change)
+- PROBLEM (user): the distance/far wind lines have visible CORNERS; want smooth curves. ROOT CAUSE (workflow-mapped): far tail = only `segments=6` points, each rendered as an INDEPENDENT un-mitered billboard quad oriented by its own per-segment direction → the ribbon kinks at all 5 interior joints. The flow path is already curved; it was just drawn as too few straight pieces.
+- FIX: `FAR_SUBDIV=3` — at render time, Catmull-Rom subdivide the coarse 6-point tail into a dense 19-point polyline (`sptX/sptY/sptZ`), then emit the ribbon over the dense points. Catmull-Rom is interpolating → passes exactly through every original (terrain-clamped) point; endpoints clamped (no out-of-range control reads). Adds ZERO `flowAt`/`sampleHeight` calls (the cited dominant CPU cost stays at the coarse count) — only interpolation + 3× vertex upload (far buffer 3.2MB→9.5MB, once-allocated).
+- Near tier (short comets) left UNTOUCHED.
+- VERIFIED: tsc clean; boots clean over many frames (no buffer overrun/RangeError); fps 60 (no regression). `.ai/tmp/shot.mjs`, `.ai/tmp/fps-check.mjs`.
+
+### Verify
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/tsc --noEmit && echo OK
+```
+Open http://localhost:5173/index-bird.html — the long distance streamlines should arc smoothly over the ridges with no angular kinks. Knob: `Wind.FAR_SUBDIV` in src/host/gpu/wind.ts (2 = lighter, 4 = smoother/more verts).
+
+## Manual stall + momentum camera
+**Date:** 2026-06-13
+**Commit:** N/A (no git repo present in working tree)
+**Session:** (current)
+
+### Stall (`bird3d.ts` integrate)
+- PROBLEM (user): flight felt "flat", bird couldn't stall. ROOT CAUSE: the `Math.max(minSpeed, …)` speed floor forbade airspeed decaying into a stall; the cubic sink that would drop the bird never engaged.
+- FIX: floor lowered to absolute `STALL_FLOOR=7` (keeps cubic sink finite); `minSpeed` is now the stall THRESHOLD. Below it: nose BREAKS down (`breakPitch -0.35..-0.7`, overrides held stick), yaw mushy (×0.35), cubic sink capped at `SINK_CAP=28`. Speed rebuilds in the dive → recover → porpoise if you keep pulling. Autopilot energy guard (nose-down at glideSpeed−5=21, above stall 13) keeps the nanny out of it.
+- VERIFIED headless: held nose-up → vario plunged to **−15.3 m/s** (vs ~−3 glide), pitch broke negative under nose-up input. `.ai/tmp/stall-check.mjs`.
+
+### Camera (`bird-main.ts`)
+- PROBLEM (user): camera "super shaky"; track momentum not heading. ROOT CAUSE: aimed along `bird.lastGroundTrack` which carries buffet/gust jitter (±2.6°) + stall thrashing.
+- FIX: aim along a low-passed (`dt*2.5`, ~0.4s) horizontal velocity vector — momentum. Filters jitter, still swings for real turns + wind crab.
+- NOTE: a terrain-dots experiment was tried and reverted (back to lines) per user.
+
+### Verify
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/tsc --noEmit && echo OK
+```
+```
+cd /Users/god/projects/ai-jank/vector-system && (npm run dev >/tmp/v.log 2>&1 &) ; sleep 4 ; /opt/homebrew/bin/node .ai/tmp/stall-check.mjs
+```
+Open http://localhost:5173/index-bird.html (manual), drag mouse to top to hold nose up → watch it stall and drop; camera should glide, not shake.
+
 ## Terrain traces smoother — MSAA + 2× sample density
 **Date:** 2026-06-12
 **Commit:** N/A (no git repo present in working tree)
