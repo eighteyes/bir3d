@@ -402,16 +402,18 @@ export class Wind {
     this.vSpread = p.vSpread ?? 40;     // v14: spread mote HOME heights across ~[minClear .. clearance+40]m so
                                         //      the wedge reads as a VOLUME of moving air, not a flat sheet. The
                                         //      ridge-pour (liftGain/relax) rides ON TOP of this spread unchanged.
-    this.liftGain = p.liftGain ?? 2.4;
-    this.relax = p.relax ?? 0.1;        // gentle pull back toward nominal clearance (τ~10s) — anti-deplete
-                                        // without damping the multi-second pour-over transient.
+    this.liftGain = p.liftGain ?? 0.3;  // v16 RUN-ALONGSIDE: was 2.4 — kill the vertical "pour UP" so the wind
+                                        // runs ALONGSIDE the terrain (horizontal, hugging the surface), not erupting off it.
+    this.relax = p.relax ?? 2.5;        // v16: was 0.1 — FAST track of terrain+home (τ~0.4s) so each mote HUGS the
+                                        // surface contour and rides ALONGSIDE it as the terrain undulates.
     // v10 POUR over deflect: v9's strong deflection (0.9) routed motes AROUND ridges ALONG the contour —
     // flat horizontal streaks, the opposite of v10's "stream UP windward faces and SPILL over crests". Drop
     // to 0.25 so most of the into-slope horizontal wind is KEPT → motes drive UP and OVER the crest (the
     // minClear clamp rides them along the surface; once they crest, the gradient flips and w<0 spills them
     // down the lee). `w` is computed pre-deflection so the vertical pour is unchanged — only the horizontal
     // path reorients from along-contour to into-and-over, and more motes dwell in the bright climbing state.
-    this.deflect = p.deflect ?? 0.25;
+    this.deflect = p.deflect ?? 0.85;   // v16 RUN-ALONGSIDE: was 0.25 (drove motes UP+OVER crests) — restore strong
+                                        // into-slope deflection so the horizontal flow routes AROUND ridges ALONG the contour.
     // v11 DISTANCE: the dedicated near comet SPHERE now owns the bird vicinity, so the FAR long-line tier
     // is freed to SPREAD into the distance (v11 wants distant wind = long curved lines). Drop nearBias
     // 2.6→1.3: at 2.6 ~61% of far motes piled in the near third (16% reached the far third) — they crowded
