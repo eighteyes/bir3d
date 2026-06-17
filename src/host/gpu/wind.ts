@@ -48,7 +48,7 @@ const DEFAULTS: Required<WindConfig> = {
   curlAmp: 7.0,
   driftDir: (35 * Math.PI) / 180, // prevailing wind toward ~ENE
   driftAmp: 6.0,
-  thermalAmp: 4.0,
+  thermalAmp: 5.0,
 };
 
 // --- v13: GPU-fluid field (the structured horizontal SOURCE) ---
@@ -102,6 +102,36 @@ function potential(x: number, z: number, t: number): number {
     0.6 * Math.sin((x + z) * 0.7 - 0.1 * t) +
     0.4 * Math.cos(x * 0.5 - z * 0.9 + 0.07 * t)
   ) * s;
+}
+
+// Catmull-Rom spline interpolation: smooth value at t∈[0,1] on the segment p1→p2 with neighbors p0,p3.
+// Interpolating (passes through p1 at t=0, p2 at t=1) → resampling a polyline with it keeps the original
+// vertices and rounds the corners between them. Used to subdivide the far wind tail into a smooth curve.
+function catmullRom(p0: number, p1: number, p2: number, p3: number, t: number): number {
+  const t2 = t * t, t3 = t2 * t;
+  return 0.5 * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3);
+}
+
+// SHARED terrain into-slope DEFLECTION — the SINGLE implementation used by BOTH Wind.flowAt (the motes)
+// and bird3d (the physics) so the bird drifts with EXACTLY the vector the motes ride. PURE: takes the
+// horizontal wind [wx,wz] and the terrain gradient [gx,gz] (the caller computes the gradient once — no
+// sampleHeight here, so the hot per-segment mote loop is never double-sampled). Sheds the component
+// blowing UP the slope so flow bends AROUND peaks / OVER crests instead of through them.
+export function flowHorizontal(
+  wx: number, wz: number, gx: number, gz: number, deflect: number
+): [number, number] {
+  const gmag = Math.hypot(gx, gz);
+  if (gmag > 1e-5) {
+    const nx = gx / gmag, nz = gz / gmag;   // unit uphill normal
+    const into = wx * nx + wz * nz;         // +into = blowing UP the slope (the part to shed)
+    if (into > 0) {
+      const steep = Math.min(1, gmag * 4.0); // steeper → deflect more; capped so gentle ground barely bends
+      const k = deflect * steep;
+      wx -= k * into * nx;
+      wz -= k * into * nz;
+    }
+  }
+  return [wx, wz];
 }
 
 // Module-level scratch tuple for windAt's single return allocation. windAt is called tens of thousands
@@ -190,9 +220,11 @@ export function thermalAt(
   const a = Math.sin(x * s + 0.05 * t) * Math.sin(z * s * 1.1 - 0.04 * t);
   const b = Math.sin((x + z) * s * 0.6 + 0.03 * t);
   // SPARSE columns: product of both lobes raised to a power → ~0 across most of the world and
-  // strong only in narrow rising cores you must HUNT for (a glider sinks by default; lift is local).
+  // strong only in rising cores you must HUNT for (a glider sinks by default; lift is local).
+  // v14: exponent 2.2→1.8 BROADENS the cores so lift is findable (still ~0 over half the world where
+  // either lobe is negative — the hunt remains, the needles are just wider).
   const core = Math.max(0, a) * Math.max(0, b);
-  return Math.pow(core, 2.2) * cfg.thermalAmp;
+  return Math.pow(core, 1.8) * cfg.thermalAmp;
 }
 
 // stable per-mote rank in 0..1 from the integer index (deterministic, frame-stable) — used for the
@@ -218,6 +250,9 @@ interface DotParams {
   clearance?: number; // nominal meters above terrain the motes relax toward (height is advected, not pinned)
   minClear?: number;  // hard floor: motes never sink closer than this above terrain
   maxClear?: number;  // soft ceiling on height above terrain (keeps motes in the readable band)
+  vSpread?: number;   // v14: half-height (m) of the vertical band each mote's HOME clearance is spread across
+                      //      (centered on `clearance`, clamped into [minClear,maxClear]). 0 = a single flat
+                      //      sheet at clearance (old behaviour); larger = the wedge field FILLS a volume.
   nearBias?: number;  // v10 density: ahead = near + (far-near)·rand^nearBias (k>1 → cluster near the bird)
   liftGain?: number;  // multiplier on the vertical flow w = liftGain · (horizontalWind · uphillGrad)
   relax?: number;     // per-second relaxation of height back toward nominal clearance (anti-deplete)
@@ -249,6 +284,7 @@ export class Wind {
   private clearance: number;
   private minClear: number;
   private maxClear: number;
+  private vSpread: number;
   private nearBias: number;
   private liftGain: number;
   private relax: number;
@@ -287,6 +323,9 @@ export class Wind {
   private px: Float32Array;   // world x (per mote)
   private py: Float32Array;   // world y — ADVECTED height (per mote)
   private pz: Float32Array;   // world z (per mote)
+  // v14: per-mote HOME clearance (m above terrain) the height RELAXES toward. Distributed across a vertical
+  // band at seed time so the wedge field fills a VOLUME instead of collapsing to one sheet at `clearance`.
+  private pHome: Float32Array;
   private speedFrac: Float32Array; // cached 0..1 wind speed at the mote (for color/density/tail)
   // v12 FADE: per-mote AGE (seconds since last seed/recycle). Advanced by dt every frame, reset to 0 in
   // seedMote. Drives the fade-IN envelope (young motes ramp up) so a (re)seeded mote never POPS in.
@@ -306,6 +345,11 @@ export class Wind {
   private ptX: Float32Array;
   private ptY: Float32Array;
   private ptZ: Float32Array;
+  // dense scratch polyline: the coarse far tail (segments+1 pts) Catmull-Rom resampled to
+  // (segments·FAR_SUBDIV + 1) pts so the ribbon renders as a smooth CURVE, not 6 straight kinked pieces.
+  private sptX: Float32Array;
+  private sptY: Float32Array;
+  private sptZ: Float32Array;
 
   private lastTime = -1;       // for per-frame dt derivation from bird.simTime
   private seeded = false;      // first draw seeds the field uniformly across the wedge
@@ -314,6 +358,10 @@ export class Wind {
   // The streak is now a CURVED ribbon: each segment is a quad between two integrated polyline points,
   // oriented along that segment's own screen-space direction; `along` is the head→tail fade fraction.
   private static FPV = 10;
+  // far tail render-time smoothing: each coarse segment is subdivided into FAR_SUBDIV rendered segments
+  // via Catmull-Rom (interpolating → passes through the original integrated points). Pure geometry; adds
+  // NO flowAt/sampleHeight calls (those stay at the coarse `segments` count — the cited CPU cost).
+  private static FAR_SUBDIV = 3;
   // a quad per ribbon segment: x∈{0,1} picks the segment's near(0)/far(1) endpoint, y∈{-1,1} is the perp.
   private static CORNERS: ReadonlyArray<[number, number]> = [
     [0, -1], [1, -1], [1, 1],
@@ -351,6 +399,9 @@ export class Wind {
     // v10 POUR: dh/dt = (liftGain−1)·d(terr)/dt along the path, so liftGain>1 lifts climbing motes OFF the
     // windward face into a visible arc; raise 3.2→2.4 — strong enough to pour up + spill (with the now-low
     // clearance the arcs read against the surface) but NOT the v9 "9" that pinned every mote at the ceiling.
+    this.vSpread = p.vSpread ?? 40;     // v14: spread mote HOME heights across ~[minClear .. clearance+40]m so
+                                        //      the wedge reads as a VOLUME of moving air, not a flat sheet. The
+                                        //      ridge-pour (liftGain/relax) rides ON TOP of this spread unchanged.
     this.liftGain = p.liftGain ?? 2.4;
     this.relax = p.relax ?? 0.1;        // gentle pull back toward nominal clearance (τ~10s) — anti-deplete
                                         // without damping the multi-second pour-over transient.
@@ -406,17 +457,23 @@ export class Wind {
     // 1→0 as the mote nears its recycle condition (far: distance to the nearest span exit; near: distance
     // to the ball edge). Multiplied into vis → every mote eases in on (re)seed and eases out before recycle.
     this.fadeInTime = p.fadeInTime ?? 0.55;   // ~0.4-0.7s ramp; smoothstep keeps the onset gentle.
-    this.fadeFarEdge = p.fadeFarEdge ?? 50;   // last 50m before a far span boundary fades to 0.
+    this.fadeFarEdge = p.fadeFarEdge ?? 120;  // last 120m before a far span boundary fades to 0 — wide enough
+                                              // to soften the outer wedge edge (the ball handoff is separate).
     this.fadeNearEdge = p.fadeNearEdge ?? 0.78; // start fading at 78% of the ball radius → 0 at the edge.
 
     this.px = new Float32Array(this.count);
     this.py = new Float32Array(this.count);
     this.pz = new Float32Array(this.count);
+    this.pHome = new Float32Array(this.count);
     this.speedFrac = new Float32Array(this.count);
     this.age = new Float32Array(this.count);
     this.ptX = new Float32Array(this.segments + 1);
     this.ptY = new Float32Array(this.segments + 1);
     this.ptZ = new Float32Array(this.segments + 1);
+    const denseSeg = this.segments * Wind.FAR_SUBDIV;
+    this.sptX = new Float32Array(denseSeg + 1);
+    this.sptY = new Float32Array(denseSeg + 1);
+    this.sptZ = new Float32Array(denseSeg + 1);
 
     this.nx = new Float32Array(this.nearCount);
     this.ny = new Float32Array(this.nearCount);
@@ -427,7 +484,8 @@ export class Wind {
     this.nptZ = new Float32Array(this.nearSegments + 1);
 
     // combined vertex buffer: FAR long-line tier + NEAR sphere tier, drawn in one pass (shared format).
-    this.farVertexCount = this.count * this.segments * 6;
+    // FAR uses the SUBDIVIDED segment count (each coarse segment → FAR_SUBDIV rendered ribbon quads).
+    this.farVertexCount = this.count * this.segments * Wind.FAR_SUBDIV * 6;
     this.nearVertexCount = this.nearCount * this.nearSegments * 6;
     this.vertexCount = this.farVertexCount + this.nearVertexCount;
     this.vertBytes = new ArrayBuffer(this.vertexCount * Wind.FPV * 4);
@@ -519,8 +577,15 @@ export class Wind {
     const z = camGround[1] + camFwd[1] * ahead + camRight[1] * lateral;
     this.px[i] = x;
     this.pz[i] = z;
-    // seed height at nominal clearance over the terrain; advection then pours it up/over the ridges.
-    this.py[i] = this.sampleHeight(x, z) + this.clearance;
+    // v14 VOLUME: give this mote a HOME clearance drawn uniformly from a vertical band centered on
+    // `clearance` (±vSpread), with the band itself clamped into [minClear,maxClear] BEFORE sampling so
+    // motes never pile against a clamp (that would just make a new sheet at the floor/ceiling).
+    const loHome = Math.max(this.minClear, this.clearance - this.vSpread);
+    const hiHome = Math.min(this.maxClear, this.clearance + this.vSpread);
+    const home = loHome + Math.random() * (hiHome - loHome);
+    this.pHome[i] = home;
+    // seed height AT the mote's home; advection then pours it up/over the ridges, relax returns it home.
+    this.py[i] = this.sampleHeight(x, z) + home;
     this.age[i] = 0; // v12 FADE: fresh seed → age 0 so the fade-IN envelope ramps this mote up from dark.
   }
 
@@ -549,31 +614,16 @@ export class Wind {
   // Returns [wx, wz, w] (m/s). The SAME function feeds both mote advection and the curved-tail integration
   // so the streaks trace exactly the flow that carries the motes. windAt itself is untouched (frozen).
   private flowAt(x: number, z: number, t: number): [number, number, number] {
-    let [wx, wz] = windAt(x, z, t, this.cfg);
+    const [wx0, wz0] = windAt(x, z, t, this.cfg);
     // terrain gradient via central finite-diff: grad points UPHILL; magnitude ~ slope.
     const e = 6.0; // meters
-    const hxp = this.sampleHeight(x + e, z);
-    const hxm = this.sampleHeight(x - e, z);
-    const hzp = this.sampleHeight(x, z + e);
-    const hzm = this.sampleHeight(x, z - e);
-    const gx = (hxp - hxm) / (2 * e); // dH/dx (rise per meter east)
-    const gz = (hzp - hzm) / (2 * e); // dH/dz (rise per meter north)
-    // VERTICAL: w = horizontalWind · uphill-gradient → wind climbing a windward slope rises, descends a lee.
-    const w = this.liftGain * (wx * gx + wz * gz);
-    // HORIZONTAL DEFLECTION: remove the component of the wind pointing INTO a rising slope (downhill of
-    // grad), scaled by deflect and by slope steepness so flow bends AROUND peaks / OVER crests, not through.
-    const gmag = Math.hypot(gx, gz);
-    if (gmag > 1e-5) {
-      const nx = gx / gmag, nz = gz / gmag;   // unit uphill normal
-      const into = wx * nx + wz * nz;         // +into = blowing UP the slope (the part to shed)
-      if (into > 0) {
-        // steeper slope → deflect more; cap the steepness term so gentle ground barely bends.
-        const steep = Math.min(1, gmag * 4.0);
-        const k = this.deflect * steep;
-        wx -= k * into * nx;
-        wz -= k * into * nz;
-      }
-    }
+    const gx = (this.sampleHeight(x + e, z) - this.sampleHeight(x - e, z)) / (2 * e); // dH/dx
+    const gz = (this.sampleHeight(x, z + e) - this.sampleHeight(x, z - e)) / (2 * e); // dH/dz
+    // VERTICAL: w = RAW (pre-deflection) horizontalWind · uphill-gradient — unchanged frozen behaviour
+    // (computed BEFORE the horizontal deflection, exactly as before).
+    const w = this.liftGain * (wx0 * gx + wz0 * gz);
+    // HORIZONTAL: shed the into-slope component via the SHARED fn (identical math, now also used by the bird).
+    const [wx, wz] = flowHorizontal(wx0, wz0, gx, gz, this.deflect);
     return [wx, wz, w];
   }
 
@@ -584,7 +634,8 @@ export class Wind {
     camGround: [number, number],
     camFwd: [number, number],
     camRight: [number, number],
-    t: number
+    t: number,
+    birdPos: [number, number, number]
   ): void {
     // seed once: scatter ALL motes uniformly across the whole wedge so frame-0 is already full coverage.
     if (!this.seeded) {
@@ -604,7 +655,9 @@ export class Wind {
     const v = this.vertHost;
     const corners = Wind.CORNERS;
     const seg = this.segments;
+    const denseSeg = seg * Wind.FAR_SUBDIV;          // rendered (subdivided) segment count per tail
     const ptX = this.ptX, ptY = this.ptY, ptZ = this.ptZ;
+    const sptX = this.sptX, sptY = this.sptY, sptZ = this.sptZ; // dense Catmull-Rom polyline
     let vi = 0;
     for (let i = 0; i < this.count; i++) {
       let x0 = this.px[i]!;
@@ -634,7 +687,7 @@ export class Wind {
       // height advected by w, then a mild relaxation toward nominal clearance (anti-deplete) and clamps.
       const terr = this.sampleHeight(x, z);
       let y = y0 + w * dt;
-      y += (terr + this.clearance - y) * Math.min(1, this.relax * dt);
+      y += (terr + this.pHome[i]! - y) * Math.min(1, this.relax * dt);
       const loY = terr + this.minClear;
       const hiY = terr + this.maxClear;
       if (y < loY) y = loY;
@@ -663,6 +716,17 @@ export class Wind {
       const cutoff = this.densityFloor + (1 - this.densityFloor) * sp;
       let vis = 1 - smoothstep(cutoff - 0.1, cutoff + 0.02, rank);
 
+      // TIER CROSSFADE (no gap): inside the near-ball blend zone, RAISE the far density floor so far motes
+      // stay dense through the region the near comets occupy (no calm-air thinning right at the bird).
+      // Proximity-SCALED (not a flat clamp) so the floor ramps in smoothly — no hard ring at the zone edge.
+      const bdx = x - birdPos[0], bdz = z - birdPos[2];
+      const bdist = Math.hypot(bdx, bdz);
+      const blendR = this.nearRadius * 1.6;            // blend zone reaches 1.6× the ball radius
+      if (bdist < blendR) {
+        const proximity = 1 - smoothstep(this.nearRadius, blendR, bdist); // 1 at/inside ball → 0 at blendR
+        vis = Math.max(vis, 0.85 * proximity);
+      }
+
       // v12 FADE envelope (no-pop): advance this mote's AGE every frame (BEFORE any cull-skip so a culled
       // mote that later survives the cull still has a real age — otherwise it would pop). Multiply a
       // fadeIn(age)·fadeOut(edge) envelope into the density vis so the mote eases in on (re)seed and eases
@@ -680,10 +744,16 @@ export class Wind {
       const distSide = this.spanWide - Math.abs(nSide);
       const edgeDist = Math.min(distFront, distBack, distSide);
       const fadeOut = smoothstep(0, this.fadeFarEdge, edgeDist);
-      vis *= fadeIn * fadeOut;
+      // far→near HANDOFF: fade the far mote DOWN as it enters the near ball so far+near don't STACK into an
+      // over-bright core — the near tier owns the ball interior, far owns outside, smooth handoff across the
+      // shell. Mirrors the near tier's edge fade so exactly ONE tier carries each region (no pop, no double).
+      const bdy = y - birdPos[1];
+      const d3 = Math.sqrt(bdx * bdx + bdy * bdy + bdz * bdz) / this.nearRadius; // 0 center → 1 ball edge
+      const nearHandoff = smoothstep(0.35, 1.0, d3); // far full outside the ball (d3≥1) → ~0 by 35% radius
+      vis *= fadeIn * fadeOut * nearHandoff;
       if (vis <= 0.001) {
-        // emit degenerate (collapsed) verts for every segment so the draw count stays fixed.
-        for (let s = 0; s < seg; s++) {
+        // emit degenerate (collapsed) verts for every RENDERED segment so the draw count stays fixed.
+        for (let s = 0; s < denseSeg; s++) {
           for (let c = 0; c < 6; c++) {
             v[vi++] = x; v[vi++] = y; v[vi++] = z;
             v[vi++] = 0; v[vi++] = 0;
@@ -720,16 +790,34 @@ export class Wind {
         ptX[s] = cx; ptY[s] = cy; ptZ[s] = cz;
       }
 
-      // emit a quad per segment between consecutive polyline points. corner.x picks near(0)/far(1) point.
-      for (let s = 0; s < seg; s++) {
-        const ax = ptX[s]!, ay = ptY[s]!, az = ptZ[s]!;       // near (toward head)
-        const bx = ptX[s + 1]!, by = ptY[s + 1]!, bz = ptZ[s + 1]!; // far (toward tail)
+      // SMOOTH: Catmull-Rom resample the coarse seg+1 points into a dense denseSeg+1 polyline so the
+      // ribbon reads as a CURVE, not a few straight pieces with corners at the joints. Interpolating →
+      // passes exactly through every original (terrain-clamped) point; endpoints are clamped (no P[-1]/
+      // P[seg+1] read). No extra flowAt/sampleHeight — pure interpolation arithmetic.
+      for (let i = 0; i < seg; i++) {
+        const i0 = i > 0 ? i - 1 : 0;
+        const i2 = i + 1;
+        const i3 = i + 2 <= seg ? i + 2 : seg;
+        for (let j = 0; j < Wind.FAR_SUBDIV; j++) {
+          const tt = j / Wind.FAR_SUBDIV;
+          const di = i * Wind.FAR_SUBDIV + j;
+          sptX[di] = catmullRom(ptX[i0]!, ptX[i]!, ptX[i2]!, ptX[i3]!, tt);
+          sptY[di] = catmullRom(ptY[i0]!, ptY[i]!, ptY[i2]!, ptY[i3]!, tt);
+          sptZ[di] = catmullRom(ptZ[i0]!, ptZ[i]!, ptZ[i2]!, ptZ[i3]!, tt);
+        }
+      }
+      sptX[denseSeg] = ptX[seg]!; sptY[denseSeg] = ptY[seg]!; sptZ[denseSeg] = ptZ[seg]!;
+
+      // emit a quad per RENDERED segment between consecutive dense points. corner.x picks near(0)/far(1).
+      for (let s = 0; s < denseSeg; s++) {
+        const ax = sptX[s]!, ay = sptY[s]!, az = sptZ[s]!;       // near (toward head)
+        const bx = sptX[s + 1]!, by = sptY[s + 1]!, bz = sptZ[s + 1]!; // far (toward tail)
         // segment direction in world XZ (for screen-space perp orientation in the VS).
         let sdx = bx - ax, sdz = bz - az;
         const sdl = Math.hypot(sdx, sdz);
         if (sdl > 1e-5) { sdx /= sdl; sdz /= sdl; } else { sdx = 1; sdz = 0; }
-        const alongN = s / seg;       // head=0 → tail=1 across the whole ribbon
-        const alongF = (s + 1) / seg;
+        const alongN = s / denseSeg;       // head=0 → tail=1 across the whole ribbon
+        const alongF = (s + 1) / denseSeg;
         for (let c = 0; c < 6; c++) {
           const [pick, perp] = corners[c]!; // pick: 0=near endpoint, 1=far endpoint
           const ex = pick > 0.5 ? bx : ax;
@@ -870,7 +958,7 @@ export class Wind {
     let dt = this.lastTime < 0 ? 0 : time - this.lastTime;
     if (dt < 0) dt = 0;
     if (dt > 0.05) dt = 0.05;
-    this.step(camGround, camFwd, camRight, time);
+    this.step(camGround, camFwd, camRight, time, birdPos);
     this.stepNear(birdPos, time, dt);
     // single upload of the combined (far + near) vertex buffer.
     this.device.queue.writeBuffer(this.vbuf, 0, this.vertBytes);

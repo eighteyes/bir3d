@@ -72,6 +72,12 @@ cd /Users/god/projects/ai-jank/vector-system && node .ai/tmp/probe-v15-blowup.mj
 - FIX: new per-mote `pHome` array + `vSpread` config (default 40 m). Each mote draws a HOME clearance uniformly from `[max(minClear, clearance−vSpread) .. min(maxClear, clearance+vSpread)]` (band clamped BEFORE sampling so motes never pile at a clamp → no new sheet), seeds at it, and relaxes toward its OWN home. Ridge-pour + anti-deplete behaviour preserved on top.
 - KNOB: `vSpread` (wind cfg). 0 = old flat sheet; larger = taller volume. `clearance` is now the band CENTER.
 
+### Climb/lift — "can't get higher" + "headwind makes me drop" (`gpu/bird3d.ts` + `gpu/wind.ts`)
+- DIAGNOSIS (NOT a regression): the velocity-inertia change did not touch the lift/sink math — steady-state climb/sink is byte-identical. The symptoms were the pure-soaring model working as designed: a glider always sinks (~1.4 m/s at trim); lift comes only from windward ridges (`max(0, wind·uphill)`) or sparse thermals; oncoming/flat-ground wind gives no lift. (The new ~0.25 s velocity lag also mildly softens transient zoom-climbs.)
+- DECISION (user): keep the soaring identity, make lift FINDABLE. No headwind-lift term added — oncoming wind over flat ground stays neutral by choice.
+- TUNE: sinkRate 1.4→1.0 (bird3d.ts ~119); liftGain 2.5→3.5 (~122); updraft cap 5.5→8.0 at BOTH sites (`updraftAt` ~68 + `integrate` ~274); thermalAmp 4.0→5.0 (wind.ts DEFAULTS); thermal core exponent `pow(core, 2.2→1.8)` (wind.ts `thermalAt`) = broader, findable cores while ~half the world stays calm (the hunt is preserved).
+- NEW BALANCE: trim sink ~1.0 m/s; a strong core nets ~+7 m/s climb (capped at 8); modest cores now net slightly positive instead of sinking.
+
 ### Verify — typecheck (standalone)
 ```
 cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/tsc --noEmit && echo OK
@@ -88,6 +94,10 @@ cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/vite
 - [ ] WIND: wedge motes now fill a VERTICAL VOLUME of air, not a single flat sheet at one height. Over flat ground you should see motes at a range of heights.
 - [ ] WIND: no NEW flat sheet at the floor/ceiling (would mean clamp-piling — raise `minClear` headroom or lower `vSpread`).
 - [ ] WIND: ridge-pour still reads — motes still stream up windward faces and spill over crests.
+- [ ] LIFT: you can now CLIMB by finding lift — fly around and you should hit thermals (vario/overlay updraft goes positive) that let you gain altitude, not just sink everywhere.
+- [ ] LIFT: soaring a windward ridge (wind blowing UP the slope) sustains/climbs you; expect stronger hold than before.
+- [ ] LIFT no-launch: outside lift you still sink (~1 m/s) and strong cores don't rocket you (climb caps ~+7 m/s) — it must still feel like a glider, not a jetpack.
+- [ ] LIFT (accepted limitation): flying INTO wind over flat ground still gives no lift (by design — that was the deliberate choice, not a bug).
 
 ## Bird 3D v14 (neon bloom post-process + re-tune)
 **Date:** 2026-06-13

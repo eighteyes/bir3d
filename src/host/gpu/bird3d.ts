@@ -21,7 +21,7 @@
 //   - forwardVec()/heading expose the chase convention (+Z forward) for the camera.
 
 import type { TerrainEKG } from "./terrain";
-import { windAt, thermalAt } from "./wind";
+import { windAt, thermalAt, flowHorizontal } from "./wind";
 
 export interface BirdInput {
   yawRate: number;     // rad/s, from mouse-x offset (rate: hold to keep turning)
@@ -39,6 +39,7 @@ export interface BirdTuning {
   windGain?: number;     // analytic wind push scale
   windDrift?: number;    // fraction of horizontal wind the bird drifts with
   liftGain?: number;     // ridge updraft scale (vertical air-motion m/s per unit wind·slope)
+  deflect?: number;      // terrain into-slope deflection of horizontal drift — MUST match Wind.deflect to ride the motes
   flexHz?: number;       // subtle wing-flex frequency (NOT a flap beat)
   flexAmp?: number;      // subtle wing-flex amplitude (rad) — wings held OUT, no flap cycle
   minClearance?: number; // min meters above terrain
@@ -64,7 +65,7 @@ export function updraftAt(
   const gz = (terrain.sampleHeight(x, z + eps) - hC) / eps;
   const ridge = Math.max(0, wx * gx + wz * gz) * T.liftGain;
   const thermal = thermalAt(x, z, t) * 1.8; // stronger sparse cores (see integrate)
-  return Math.min(5.5, ridge + thermal);    // cap mirrors integrate's anti-launch clamp
+  return Math.min(8.0, ridge + thermal);    // cap mirrors integrate's anti-launch clamp (v14: 5.5→8.0)
 }
 
 const FLOATS_PER_VERT = 6; // local.xyz + attr.xyz
@@ -115,10 +116,11 @@ export class Bird3D {
       dragK: t.dragK ?? 0.4,
       divePower: t.divePower ?? 1.1, // dives pay out visibly (was 0.9)
       gravity: t.gravity ?? 9.0,
-      sinkRate: t.sinkRate ?? 1.4,   // v8: gentler sink (2.2→1.4) — glide efficiently, more time to find lift
+      sinkRate: t.sinkRate ?? 1.0,   // v14: gentler sink (1.4→1.0) — glide efficiently, more time to find lift
       windGain: t.windGain ?? 1.6,  // multiplier on the shared windAt field (CRANKED)
       windDrift: t.windDrift ?? 1.0, // fraction of horizontal wind the glider drifts with
-      liftGain: t.liftGain ?? 2.5,   // v8: stronger ridge lift (1.2→2.5) — soaring the windward ridges sustains you
+      liftGain: t.liftGain ?? 3.5,   // v14: stronger ridge lift (2.5→3.5) — soaring the windward ridges sustains you
+      deflect: t.deflect ?? 0.25,    // matches Wind's default deflect so the bird drifts with the visible motes
       flexHz: t.flexHz ?? 0.6,   // slow, subtle flex — wings stay OUT (no flap beat)
       flexAmp: t.flexAmp ?? 0.06, // tiny → static gliding V
       minClearance: t.minClearance ?? 6,
@@ -193,13 +195,33 @@ export class Bird3D {
     this.time += dt;
     const clamped = Math.min(dt, 1 / 20);
     const T = this.tuning;
+    const STALL_FLOOR = 7; // m/s — absolute airspeed floor: lets speed DECAY into the stall regime
+                           // (below minSpeed) while keeping the cubic sink term from dividing to infinity.
+    const SINK_CAP = 28;   // m/s — clamp the cubic stall-sink: a deep stall drops HARD but recoverably,
+                           // not a teleport-to-terrain.
+    const VEL_TAU = 0.25;  // s — velocity-vector inertia time constant: how fast world velocity ramps
+                           // toward the composed flight-path velocity. Larger = smoother/heavier accel
+                           // & deaccel; smaller = snappier. This is the knob for the "fast accel/deaccel".
 
     // --- steering: mouse-x drives yaw RATE; mouse-y drives pitch ATTITUDE (holdable — the nose
     // eases toward the cursor's target angle and STAYS there; centered cursor = gentle glide trim,
     // which replaces the old hands-off auto-trim) ---
-    this.heading += input.yawRate * clamped;
-    const pitchGoal = Math.max(-0.7, Math.min(0.7, input.pitchTarget));
-    this.pitch += (pitchGoal - this.pitch) * Math.min(1, clamped * 3.5);
+    // --- STALL (entry airspeed): below stallSpeed the wing stops flying. The nose BREAKS down
+    // regardless of the held stick, yaw authority goes mushy, and the cubic sink (below) dumps the
+    // bird until the dive rebuilds speed past stall → recover. Manual flight can provoke it by holding
+    // the nose up; the autopilot's energy guard (nose-down at glideSpeed−5, well above stall) keeps the
+    // hands-off nanny out of it, and the break itself auto-recovers if it ever clips one. ---
+    const stallSpeed = T.minSpeed;                                          // wing quits below this airspeed
+    const stallDepth = Math.max(0, (stallSpeed - this.speed) / stallSpeed); // 0 flying .. →1 deep stall
+    const stalled = stallDepth > 0;
+
+    this.heading += input.yawRate * clamped * (stalled ? 0.35 : 1); // controls mush in the stall
+    let pitchGoal = Math.max(-0.7, Math.min(0.7, input.pitchTarget));
+    if (stalled) {
+      const breakPitch = -0.35 - 0.35 * stallDepth;   // nose drops harder the deeper the stall
+      pitchGoal = Math.min(pitchGoal, breakPitch);     // can't hold the nose up past the break
+    }
+    this.pitch += (pitchGoal - this.pitch) * Math.min(1, clamped * (stalled ? 6 : 3.5)); // snappier break
     const targetBank = -input.yawRate * 0.5; // roll into the turn
     this.bank += (targetBank - this.bank) * Math.min(1, clamped * 4);
 
@@ -221,36 +243,55 @@ export class Bird3D {
 
     // GLIDE, NO FLAP: no thrust input this pass. Airspeed is sustained by the dive↔zoom energy
     // exchange above and bled by drag toward trim; lift comes from glide + ridge updraft below.
-    this.speed = Math.max(T.minSpeed, Math.min(T.maxSpeed, this.speed));
+    // FLOOR at STALL_FLOOR, not minSpeed — airspeed may decay BELOW minSpeed into the stall regime;
+    // the floor only keeps the cubic sink finite. (minSpeed is now the stall THRESHOLD, not a hard floor.)
+    this.speed = Math.max(STALL_FLOOR, Math.min(T.maxSpeed, this.speed));
 
     // --- wind + lift: SHARED field (wind.ts) — the SAME field the streamline overlay draws.
     // CRANKED: windGain scales the field; the lateral component visibly shoves the glide off
     // heading (you must correct), and updraft (ridge + thermal) carries it up. ---
     const [bwx, bwz] = windAt(this.pos[0], this.pos[2], this.time);
-    const wx = bwx * T.windGain;
-    const wz = bwz * T.windGain;
-    this.lastWind = [wx, wz];
+    const rwx = bwx * T.windGain; // RAW gained horizontal — drives RIDGE LIFT (into-slope component intact)
+    const rwz = bwz * T.windGain;
     const eps = 6;
     const hC = this.terrain.sampleHeight(this.pos[0], this.pos[2]);
     const hX = this.terrain.sampleHeight(this.pos[0] + eps, this.pos[2]);
     const hZ = this.terrain.sampleHeight(this.pos[0], this.pos[2] + eps);
-    const gx = (hX - hC) / eps; // uphill gradient
+    const gx = (hX - hC) / eps; // uphill gradient (forward diff) — ridge lift, unchanged
     const gz = (hZ - hC) / eps;
+    // DRIFT uses the terrain-DEFLECTED wind (the SAME shared fn the motes ride) so the bird drifts with the
+    // VISIBLE flow, not the raw field. Central-diff gradient (e=eps) matches Wind.flowAt exactly — reuse
+    // hX/hZ and add the two −e samples (2 extra sampleHeight/frame, negligible). Ridge lift below keeps the
+    // RAW wind so windward soaring is unchanged (deflection sheds exactly the into-slope lift component).
+    const hXm = this.terrain.sampleHeight(this.pos[0] - eps, this.pos[2]);
+    const hZm = this.terrain.sampleHeight(this.pos[0], this.pos[2] - eps);
+    const [wx, wz] = flowHorizontal(rwx, rwz, (hX - hXm) / (2 * eps), (hZ - hZm) / (2 * eps), T.deflect);
+    this.lastWind = [wx, wz]; // telemetry (overlay + compass) shows the DRIFT the bird feels — matches the motes
     // (kept in sync via the exported updraftAt — same ridge+thermal+cap math; gx/gz reused above)
-    const into = wx * gx + wz * gz; // wind · uphill → ridge lift
+    const into = rwx * gx + rwz * gz; // RAW wind · uphill → ridge lift (undeflected, soaring intact)
     const ridge = Math.max(0, into) * T.liftGain;
     const thermal = thermalAt(this.pos[0], this.pos[2], this.time) * 1.8; // v8: stronger thermal cores (sparse but rewarding to find); NOT scaled by the horizontal-wind crank
-    const updraft = Math.min(5.5, ridge + thermal); // CAP: strong ridge/thermal lift sustains a soar without launching the bird (was spiking +25 on steep windward faces)
+    const updraft = Math.min(8.0, ridge + thermal); // CAP (v14: 5.5→8.0): strong ridge/thermal lift sustains a climb without launching the bird (was spiking +25 on steep windward faces)
     this.lastUpdraft = updraft;
 
     // --- sink: minimal at trim, mushes CUBICALLY when slow — at minSpeed full-nose-up the
     // sink exceeds sin(pitch)*speed, so a stalled climb falls instead of levitating ---
-    const sink = T.sinkRate * (T.glideSpeed / this.speed) ** 3;
+    const sink = Math.min(SINK_CAP, T.sinkRate * (T.glideSpeed / this.speed) ** 3);
 
-    // --- compose velocity: flight path + horizontal wind drift + ridge updraft − sink ---
-    this.vel[0] = dir[0] * this.speed + wx * T.windDrift;
-    this.vel[1] = dir[1] * this.speed + updraft - sink;
-    this.vel[2] = dir[2] * this.speed + wz * T.windDrift;
+    // --- compose TARGET velocity: flight path + horizontal wind drift + ridge updraft − sink ---
+    const tvx = dir[0] * this.speed + wx * T.windDrift;
+    const tvy = dir[1] * this.speed + updraft - sink;
+    const tvz = dir[2] * this.speed + wz * T.windDrift;
+
+    // --- velocity-vector INERTIA: the world velocity now carries MOMENTUM instead of being SET to
+    // dir·speed every frame. Low-pass this.vel toward the target with a dt-correct factor (1−e^(−dt/τ))
+    // so accel & deaccel RAMP over ~VEL_TAU rather than snapping to whatever pitch/speed/sink dictate
+    // this frame — the fix for "very fast accel/deaccel". Airspeed/pitch/sink physics are untouched;
+    // only the composition into world velocity is smoothed, so the soaring energy model is preserved. ---
+    const aVel = 1 - Math.exp(-clamped / VEL_TAU);
+    this.vel[0] += (tvx - this.vel[0]) * aVel;
+    this.vel[1] += (tvy - this.vel[1]) * aVel;
+    this.vel[2] += (tvz - this.vel[2]) * aVel;
 
     // --- BUFFETING: fast-varying turbulence so MOVING AIR is FELT (not the steady mean wind drift).
     // Three decorrelated fast oscillators sampled in (fast time + space) so the gust pattern shifts as
@@ -262,29 +303,30 @@ export class Bird3D {
     const g3 = Math.sin(bt * 1.9 + ph * 0.6 + 2.1);  // slow swell
     const gustV = 0.6 * g1 + 0.4 * g2;               // vertical bob driver  (-1..1)
     const gustL = 0.6 * g3 + 0.4 * g1;               // lateral shove driver (-1..1)
-    // (b) vertical BOB ±~1.5 m/s on vel[1] → lastVario oscillates (and the bird physically rises/falls).
-    this.vel[1] += gustV * 1.5;
-    // (c) lateral SHOVE in pulses: perpendicular to heading, ±~1.2 m/s, so the path twitches sideways.
+    // Buffet is an INSTANTANEOUS gust overlay added ON TOP of the smoothed base velocity for the position
+    // step — deliberately NOT fed back through the inertia filter, so the crisp gust texture (vertical bob
+    // ±~1.5 m/s, lateral shove ±~1.2 m/s perpendicular to heading) isn't low-passed into mush.
     const rightX = Math.cos(this.heading);  // heading-right unit (XZ): (cos h, -sin h)
     const rightZ = -Math.sin(this.heading);
     const shove = gustL * 1.2;
-    this.vel[0] += rightX * shove;
-    this.vel[2] += rightZ * shove;
+    const cvx = this.vel[0] + rightX * shove;
+    const cvy = this.vel[1] + gustV * 1.5;
+    const cvz = this.vel[2] + rightZ * shove;
 
-    this.pos[0] += this.vel[0] * clamped;
-    this.pos[1] += this.vel[1] * clamped;
-    this.pos[2] += this.vel[2] * clamped;
+    this.pos[0] += cvx * clamped;
+    this.pos[1] += cvy * clamped;
+    this.pos[2] += cvz * clamped;
 
     // --- altitude clamp above terrain ---
     const floorY = hC + T.minClearance;
     if (this.pos[1] < floorY) this.pos[1] = floorY;
 
     this.lastSpeed = this.speed;
-    this.lastVario = this.vel[1];
+    this.lastVario = cvy;
     this.lastClearance = this.pos[1] - hC;
     // ground-track: the ACTUAL horizontal travel direction. Wind drift makes it diverge from
     // heading — this is the felt-wind proof (overlay compares heading vs ground-track).
-    this.lastGroundTrack = Math.atan2(this.vel[0], this.vel[2]);
+    this.lastGroundTrack = Math.atan2(cvx, cvz);
 
     // --- render-bank: steady CRAB lean into the cross-wind + buffet ROCK (visual only, no physics) ---
     // Steady DC lean: cross-wind component (wind projected onto heading-right) tips the V into the

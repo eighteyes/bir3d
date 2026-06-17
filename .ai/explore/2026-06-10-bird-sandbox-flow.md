@@ -187,4 +187,26 @@ User: "i see wind all around, but not next to the bird. keep the long lines for 
 - **Respect terrain** (comets stay above ground and flow over it).
 Scope: wind.ts + wind.wgsl, plus the single `wind.draw(...)` call in bird-main.ts (to pass the bird position as the sphere center) — nothing else.
 
-**Done (v11):** distant wind reads as long curved lines; right around the bird a sphere of little comets shows the local air, so the wind is legible exactly where you are; airy, terrain-respecting.
+**Done (v11):** distant wind reads as long curved lines; right around the bird a sphere of little comets shows the local air, so the wind is legible exactly where you are; airy, terrain-respecting. (+ v12: motes fade in/out on recycle — no pop; + wind 50% opacity. + felt-wind: MANUAL default, camera follows ground-track → bird crabs.)
+
+---
+
+## v13 (2026-06-13) — wire the REAL GPU fluid as the wind source (AUTHENTICITY pass, not a feel fix)
+
+User: "yes, real gpu fluid." Replace the analytic curl-noise BASE with the real GPU Stam fluid (src/host/gpu/fluid.ts GpuFluid — step(encoder,dt,iters), exposes velocityX/Y GPU buffers). Success = real EVOLVING wind, NOTHING regressed, still 60fps. (Feel was already fixed by camera+control — do NOT crank fluid force to chase feel; that's the +61° blown-around bug returning.)
+
+**Architecture (advisor, non-negotiable): FLUID = the new curl-noise (the structured horizontal SOURCE), NOT the new windAt. Everything wrapping windAt STAYS.**
+- `windAt(x,z,t)` BASE = bird-local GPU-fluid sample (async readback) + KEEP the PREVAILING DRIFT (driftAmp/driftDir). Fallback to analytic curl-noise until the first readback resolves. (A zero-mean Stam swirl with no drift collapses ground-track onto heading → bird stops crabbing → regresses "I don't feel it." Keep the drift.)
+- `flowAt` terrain-coupling (vertical pour over ridges + into-slope deflection) — UNCHANGED, wraps windAt exactly as today. Do NOT return the raw flat 2D fluid — the terrain-pour win must survive.
+- `thermalAt` — UNCHANGED. Bird physics (bird3d) + motes (Wind) both call windAt/flowAt → automatically ride the fluid; NO rewrite of either.
+
+**Wiring:** bird-main.ts instantiates GpuFluid (~256²) over a BIRD-LOCAL window that MOVES with the bird (never fly into dead air; world-pinned moving-window deferred); steps it each frame; FORCES it continuously with a PREVAILING flow + BOUNDED structure tuned to the ~10–15 m/s flyable band (NOT raw impulse spikes). Async-readback u/v via ReadbackRing (2–3 frames stale, fine). wind.ts gets a per-frame fluid-field setter + world→grid bilinear sampler. Vertical lift stays terrain-derived ridge lift (fluid is 2D/horizontal, §6.1 2.5D); deep fluid-as-terrain-boundary coupling is LATER.
+
+**NO-REGRESSION GATE (the still looks like v12 — verify by MEASUREMENT):**
+(a) 60fps HOLDS with the fluid step ADDED (measure).
+(b) terrain pour + crab/drift (non-zero DRIFT) + mote fade + near-sphere legibility ALL still present.
+(c) PROOF the field is the fluid: sample one FIXED world point across ~3s and show the wind vector EVOLVES (curl-noise was quasi-static; the fluid changes).
+
+**Scope:** bird-main.ts + wind.ts (+ small fluid-forcing helper if needed); REUSE GpuFluid + ReadbackRing. Do NOT touch bird3d.ts, terrain.ts/terrain_ekg.wgsl, camera.ts, autopilot.ts.
+
+**Done (v13):** the wind is the real GPU fluid — evolves over time (real gusts), motes + bird ride it, terrain-pour + crab + fade all intact, 60fps holds.
