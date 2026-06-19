@@ -23,8 +23,8 @@ const BASE_FREQ = 0.00142857; // ~1/700 per meter — features 2× wider; a vall
 const LACUNARITY = 2.0;
 const GAIN = 0.5;
 const OCTAVES = 4;            // extra octave restores mid-scale detail at the wider base
-const RELIEF = 320.0;
-const SHARP = 1.6;            // pow on the normalized ridge sum — deepens valleys, sharpens crests
+const RELIEF = 600.0;         // taller, more dramatic peaks (was 320) — the bird threads between mountains
+const SHARP = 1.8;            // pow on the normalized ridge sum — deepens valleys, sharpens crests
 const TERRACES = 5.0;         // cliff bands: flat shelves with steep risers (geology, not noise)
 const RISER_POW = 4.0;        // riser sharpness within each band — higher = cliffier
 const CLIFF_MIX = 0.65;       // blend terraced vs smooth (1 = hard ledges everywhere)
@@ -32,7 +32,10 @@ const CLIFF_MIX = 0.65;       // blend terraced vs smooth (1 = hard ledges every
 export interface TerrainParams {
   rows?: number;       // number of stacked depth rows
   cols?: number;       // horizontal samples per row (polyline resolution)
-  rowSpacing?: number; // world meters between rows (depth step)
+  rowSpacing?: number; // world meters between rows in the DENSE near band (the close-up step)
+  nearDenseDepth?: number; // rows stay at the full rowSpacing density out to this depth (m) → crisp foreground
+  farSpread?: number;  // beyond nearDenseDepth, spacing grows by one rowSpacing per this many meters of depth
+                       // (linear) → far rows spread out and declutter. Larger = gentler far thinning. ∞ = uniform.
   rowStart?: number;   // depth of the nearest row ahead of the camera (m)
   halfWidth?: number;  // half horizontal extent of each row (m)
   maxDist?: number;    // hard draw-distance cutoff (m) → clean horizon
@@ -46,6 +49,8 @@ export class TerrainEKG {
   readonly rows: number;
   readonly cols: number;
   readonly rowSpacing: number;
+  readonly nearDenseDepth: number;
+  readonly farSpread: number;
   readonly rowStart: number;
   readonly halfWidth: number;
   readonly maxDist: number;
@@ -66,6 +71,15 @@ export class TerrainEKG {
   private fogDensity: number;
   private baseline: number;
 
+  // Precomputed per-row depth (m ahead of camera). Built in the constructor: a DENSE near band at the full
+  // rowSpacing, then spacing that grows linearly with depth in the far field (declutter the far mush).
+  private rowDepths!: Float32Array;
+
+  // Depth (m ahead of the camera) of stacked row r — read from the precomputed rowDepths.
+  private rowDepthAt(r: number): number {
+    return this.rowDepths[r]!;
+  }
+
   constructor(
     private device: GPUDevice,
     shader: string,
@@ -83,6 +97,25 @@ export class TerrainEKG {
     this.fogDensity = p.fogDensity ?? 1 / 1600;
     this.baseline = p.baseline ?? -300; // terrain min is 0; drop curtains well below frame.
 
+    // GRADUATED DEPTH (declutter the far field WITHOUT thinning the foreground): hold the full rowSpacing
+    // density through the DENSE near band (depth ≤ nearDenseDepth — the crisp close-up the eye reads), then
+    // grow the step linearly with depth so far rows spread out where they'd otherwise compress into mush.
+    // Defaults (nearDenseDepth 0, farSpread ∞) reproduce uniform spacing exactly.
+    this.nearDenseDepth = p.nearDenseDepth ?? 0;
+    this.farSpread = p.farSpread ?? Infinity;
+    // Build the row depths by walking outward from rowStart to maxDist; the explicit `rows` is an upper cap.
+    // step(d) = rowSpacing·(1 + max(0, d − nearDenseDepth)/farSpread): flat (= rowSpacing) through the near
+    // band, then linearly increasing — fewer total rows, SAME far horizon, foreground density untouched.
+    const depths: number[] = [];
+    let d = this.rowStart;
+    while (d <= this.maxDist && depths.length < this.rows) {
+      depths.push(d);
+      const over = Math.max(0, d - this.nearDenseDepth);
+      d += this.rowSpacing * (1 + over / this.farSpread);
+    }
+    this.rowDepths = Float32Array.from(depths);
+    this.rows = depths.length;
+
     // --- line-list vertices: per row, (cols-1) segments = 2 verts each. ---
     // each vertex: xFrac(1) + rowDepth(1) + rowFade(1) = 3 floats.
     const segsPerRow = this.cols - 1;
@@ -91,7 +124,7 @@ export class TerrainEKG {
     const verts = new Float32Array(this.vertexCount * FPV);
     let vi = 0;
     for (let r = 0; r < this.rows; r++) {
-      const rowDepth = this.rowStart + r * this.rowSpacing;
+      const rowDepth = this.rowDepthAt(r);
       const rowFade = this.rows > 1 ? r / (this.rows - 1) : 0; // 0 near .. 1 far
       for (let c = 0; c < segsPerRow; c++) {
         const xA = (c / segsPerRow) * 2 - 1;       // [-1,1]
@@ -116,7 +149,7 @@ export class TerrainEKG {
       fverts[fi++] = x; fverts[fi++] = d; fverts[fi++] = top;
     };
     for (let r = 0; r < this.rows; r++) {
-      const rowDepth = this.rowStart + r * this.rowSpacing;
+      const rowDepth = this.rowDepthAt(r);
       for (let c = 0; c < segsPerRow; c++) {
         const xA = (c / segsPerRow) * 2 - 1;
         const xB = ((c + 1) / segsPerRow) * 2 - 1;

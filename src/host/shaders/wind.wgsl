@@ -86,9 +86,11 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
   let lenFade = pow(1.0 - clamp(in.along, 0.0, 1.0), 1.3); // head bright → tail fades to 0
   let glow = pow(perp, 1.6) * lenFade;
 
-  // faster wind → brighter + whiter core. Raised base so slow-wind motes still read against the dark.
+  // v17 "it's AIR — always SOME wind, visible everywhere" (user): raise the calm-air base 0.9→1.6 and
+  // soften the speed term 1.2→1.0 so slow/calm air READS brightly against the dark (it was dimming below
+  // the bloom threshold and reading as absent). Faster wind still brightens to a whiter core, just gentler.
   // density-fade visibility also modulates brightness so motes entering/leaving fade smoothly.
-  let intensity = glow * (0.9 + in.speedFrac * 1.2) * in.vis;
+  let intensity = glow * (1.6 + in.speedFrac * 1.0) * in.vis;
   let tint = mix(CYAN, WHITE, clamp(in.speedFrac, 0.0, 1.0));
 
   // distance fog → far motes dissolve into the haze.

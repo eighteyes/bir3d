@@ -273,6 +273,12 @@ interface DotParams {
   fadeInTime?: number;   // seconds over which a freshly seeded mote ramps vis 0→1 (smoothstep)
   fadeFarEdge?: number;  // meters before a FAR span boundary where the fade-OUT begins (→0 at the edge)
   fadeNearEdge?: number; // fraction (0..1) of the near ball radius at which the fade-OUT begins (→0 at R)
+  // --- BIRD WAKE (visuals only): the bird stirs the air INSIDE the near sphere. Added ONLY to the near-mote
+  //     advection (+ their tails); windAt / flight physics stay FROZEN. All three scale with bird speed and
+  //     fall off to 0 at the ball edge so motes circulate rather than eject. 0 = no stir. ---
+  bowGain?: number;    // radial OUTWARD push AHEAD of the bird — motes part at the nose (bow wave)
+  wakeGain?: number;   // along-motion DRAG behind the bird — slipstream the wake follows the bird
+  swirlGain?: number;  // TANGENTIAL swirl in the wake — trailing vortex tumble
 }
 
 export class Wind {
@@ -306,6 +312,12 @@ export class Wind {
   private fadeInTime: number;
   private fadeFarEdge: number;
   private fadeNearEdge: number;
+  // BIRD WAKE (visuals only) gains — see DotParams.
+  private bowGain: number;
+  private wakeGain: number;
+  private swirlGain: number;
+  // reusable scratch for the per-point bird-wake disturbance (avoids allocation in the hot near-tail loop).
+  private readonly _wake: [number, number, number] = [0, 0, 0];
   private nx: Float32Array;   // near-comet world x (per near mote)
   private ny: Float32Array;   // near-comet world y (advected height)
   private nz: Float32Array;   // near-comet world z
@@ -358,6 +370,9 @@ export class Wind {
   // The streak is now a CURVED ribbon: each segment is a quad between two integrated polyline points,
   // oriented along that segment's own screen-space direction; `along` is the head→tail fade fraction.
   private static FPV = 10;
+  // v17 anti-geyser: hard clamp (m/s) on the per-mote VERTICAL flow w. Bounds the up-and-over pour so steep
+  // faces (gradient ∝ RELIEF) lift into a believable arc instead of erupting straight up like a fountain.
+  private static W_CLAMP = 12;
   // far tail render-time smoothing: each coarse segment is subdivided into FAR_SUBDIV rendered segments
   // via Catmull-Rom (interpolating → passes through the original integrated points). Pure geometry; adds
   // NO flowAt/sampleHeight calls (those stay at the coarse `segments` count — the cited CPU cost).
@@ -380,7 +395,8 @@ export class Wind {
     this.cfg = { ...DEFAULTS, ...cfg };
     // v9: fewer motes than v8 (4200 → 2200) to AFFORD the multi-step curved-tail integration per mote
     // (each mote now integrates `segments` flow steps every frame). Still wind EVERYWHERE across the wedge.
-    this.count = p.numMotes ?? 2200;
+    this.count = p.numMotes ?? 1600; // v17: 2200→1600 — fewer motes for fps headroom (per user), paired with a HIGH
+                                     // always-on densityFloor below so the FEWER motes read as omnipresent air, not sparse.
     // spanAhead matches the terrain maxDist (~950) so every mote lives in the DRAWN terrain band —
     // dots past the cutoff floated over a void and read as detached sky specks, not wind in the scene.
     this.spanAhead = p.spanAhead ?? 950;
@@ -390,30 +406,35 @@ export class Wind {
     // ridges and follows the contour up and over each crest (v9's 55 floated a flat sheet above 220m relief).
     // height is advected by w (not pinned) so motes pour up/over ridges, with mild relaxation back to this low
     // nominal so the field doesn't deplete or pile at a ceiling.
-    this.clearance = p.clearance ?? 16;
-    this.minClear = p.minClear ?? 5;    // v10: hard floor 14→5 — motes hug right down onto the surface.
-    this.maxClear = p.maxClear ?? 170;  // v10: RAISE the ceiling 100→170 so actively-CLIMBING motes have room
-                                        // to stream up the windward face and SPILL over the crest (in flat/lee
-                                        // air w≈0 so relax keeps motes at the LOW clearance — the raised ceiling
-                                        // does not lift the baseline, it only frees the pour to read as a plume).
+    this.clearance = p.clearance ?? 30; // v17 UP-AND-OVER: was 16. Lofted modestly above the taller (RELIEF 600)
+                                        // ridges — but the ARCS (liftGain) do the "over the crest" work, so this base
+                                        // stays low to keep areal density UP (a high base spread the air too thin).
+    this.minClear = p.minClear ?? 12;   // v17c: 5→12. At 5 the motes hugged RIGHT at the neon ridgelines and read
+                                        // as "wind in the terrain" (the terrain is drawn as LINES; the depth-only
+                                        // fill curtains have gaps so surface-hugging motes show through). 12 floats
+                                        // the field clearly ABOVE the lines while still hugging close enough to interact.
+    this.maxClear = p.maxClear ?? 200;  // v17: ceiling 170→200 — headroom for the up-and-over arcs over the taller
+                                        // terrain WITHOUT the 260 over-spread that diluted areal density (flat/lee
+                                        // air w≈0 → relax keeps motes low, so the ceiling only frees the climbing pour).
     // v10 POUR: dh/dt = (liftGain−1)·d(terr)/dt along the path, so liftGain>1 lifts climbing motes OFF the
     // windward face into a visible arc; raise 3.2→2.4 — strong enough to pour up + spill (with the now-low
     // clearance the arcs read against the surface) but NOT the v9 "9" that pinned every mote at the ceiling.
-    this.vSpread = p.vSpread ?? 40;     // v14: spread mote HOME heights across ~[minClear .. clearance+40]m so
+    this.vSpread = p.vSpread ?? 38;     // v14/v17: spread mote HOME heights across ~[minClear .. clearance+38]m so
                                         //      the wedge reads as a VOLUME of moving air, not a flat sheet. The
                                         //      ridge-pour (liftGain/relax) rides ON TOP of this spread unchanged.
-    this.liftGain = p.liftGain ?? 0.3;  // v16 RUN-ALONGSIDE: was 2.4 — kill the vertical "pour UP" so the wind
-                                        // runs ALONGSIDE the terrain (horizontal, hugging the surface), not erupting off it.
-    this.relax = p.relax ?? 2.5;        // v16: was 0.1 — FAST track of terrain+home (τ~0.4s) so each mote HUGS the
-                                        // surface contour and rides ALONGSIDE it as the terrain undulates.
+    this.liftGain = p.liftGain ?? 0.6;  // v17 UP-AND-OVER: was 0.3 (flat slither) / 2.4 (geyser). Moderate pour, BUT
+                                        // the vertical w is CLAMPED to ±W_CLAMP in flowAt — so steep faces (gradient ∝
+                                        // RELIEF, now 1.9× steeper) lift into a visible arc instead of erupting.
+    this.relax = p.relax ?? 0.8;        // v17: was 2.5 (snapped flat to the surface) — slower track (τ~1.25s) lets the
+                                        // up-and-over arc BREATHE before it eases back toward home, so the pour reads.
     // v10 POUR over deflect: v9's strong deflection (0.9) routed motes AROUND ridges ALONG the contour —
     // flat horizontal streaks, the opposite of v10's "stream UP windward faces and SPILL over crests". Drop
     // to 0.25 so most of the into-slope horizontal wind is KEPT → motes drive UP and OVER the crest (the
     // minClear clamp rides them along the surface; once they crest, the gradient flips and w<0 spills them
     // down the lee). `w` is computed pre-deflection so the vertical pour is unchanged — only the horizontal
     // path reorients from along-contour to into-and-over, and more motes dwell in the bright climbing state.
-    this.deflect = p.deflect ?? 0.85;   // v16 RUN-ALONGSIDE: was 0.25 (drove motes UP+OVER crests) — restore strong
-                                        // into-slope deflection so the horizontal flow routes AROUND ridges ALONG the contour.
+    this.deflect = p.deflect ?? 0.45;   // v17 BOTH: was 0.85 (all-around) / 0.25 (all-over). Middle — sheds ~45% of the
+                                        // into-slope wind (routes AROUND peaks) while keeping ~55% to drive UP-AND-OVER crests.
     // v11 DISTANCE: the dedicated near comet SPHERE now owns the bird vicinity, so the FAR long-line tier
     // is freed to SPREAD into the distance (v11 wants distant wind = long curved lines). Drop nearBias
     // 2.6→1.3: at 2.6 ~61% of far motes piled in the near third (16% reached the far third) — they crowded
@@ -434,9 +455,10 @@ export class Wind {
     // calmest-air segment step = 25% (short stubby arc); fast air = full step (long arc). Kept LOW so the
     // speed contrast stays steep.
     this.tailFloor = p.tailFloor ?? 0.25;
-    // even the calmest air keeps ~30% of motes visible → wind EVERYWHERE, just sparse where slow. Raised
-    // from 0.2 so the full-frame read stays populated (the curved tails are sparser per-mote than v8 dots).
-    this.densityFloor = p.densityFloor ?? 0.3;
+    // v17 "it's AIR — always SOME wind" (user): 0.3→0.6 so the calmest air STILL keeps ~60% of motes visible.
+    // Air is omnipresent; it must never thin to bare patches. Paired with the lower count above so average
+    // surviving-mote count (the tail-loop cost) roughly holds 60fps while coverage becomes uniform everywhere.
+    this.densityFloor = p.densityFloor ?? 0.6;
     // calibrated to the field's real |windAt| distribution (sampled min ~0.03, max ~16.5, mean ~8.5):
     // smoothstep(2,15) stretches the contrast across the bulk so calm→fast spans the full 0..1.
     this.speedLo = p.speedLo ?? 2.0;
@@ -448,9 +470,10 @@ export class Wind {
     // the far streamlines. Tight radius + high count = a thick visible cloud right at the bird. Count chosen
     // to hold a clean 60fps (2200 read as borderline 56-59); the near tail reuses the head flow + a single
     // tip terrain clamp to stay cheap (no per-segment flowAt/sampleHeight).
-    this.nearCount = p.nearCount ?? 1600;
+    this.nearCount = p.nearCount ?? 1600; // NOTE: bird-main overrides this to 800 (the live near-sphere count);
+                                          // this default is the fallback only. Tune the sphere size there, not here.
     this.nearRadius = p.nearRadius ?? 65;
-    this.nearSegments = p.nearSegments ?? 3;
+    this.nearSegments = p.nearSegments ?? 4; // a 4th segment → smoother CURLING tail arcs
     this.nearSegStep = p.nearSegStep ?? 0.12;
 
     // v12 FADE: motes RECYCLE (far = span-boundary reseed; near = ball-edge reseed) and the position
@@ -462,6 +485,15 @@ export class Wind {
     this.fadeFarEdge = p.fadeFarEdge ?? 120;  // last 120m before a far span boundary fades to 0 — wide enough
                                               // to soften the outer wedge edge (the ball handoff is separate).
     this.fadeNearEdge = p.fadeNearEdge ?? 0.78; // start fading at 78% of the ball radius → 0 at the edge.
+
+    // BIRD WAKE (visuals only): the bird stirs the air inside the sphere — bow-wave outward AHEAD + drag/swirl
+    // slipstream BEHIND. Scales with bird speed (~26 m/s); peak ≈ gain·26·0.65. Balanced so BOW (push-aside,
+    // ~15 m/s) and DRAG (trailing slipstream, ~13 m/s) LEAD and SWIRL (~12 m/s) is secondary — reads as a wake
+    // that PARTS and TRAILS, not a pinwheel of pure spin (the "just spirals" fix). Drop swirlGain toward 0 for
+    // push+trail only; raise it for more tumble; all three to 0 disables. windAt / flight physics are frozen.
+    this.bowGain = p.bowGain ?? 0.9;
+    this.wakeGain = p.wakeGain ?? 0.75;
+    this.swirlGain = p.swirlGain ?? 0.7;
 
     this.px = new Float32Array(this.count);
     this.py = new Float32Array(this.count);
@@ -621,9 +653,13 @@ export class Wind {
     const e = 6.0; // meters
     const gx = (this.sampleHeight(x + e, z) - this.sampleHeight(x - e, z)) / (2 * e); // dH/dx
     const gz = (this.sampleHeight(x, z + e) - this.sampleHeight(x, z - e)) / (2 * e); // dH/dz
-    // VERTICAL: w = RAW (pre-deflection) horizontalWind · uphill-gradient — unchanged frozen behaviour
-    // (computed BEFORE the horizontal deflection, exactly as before).
-    const w = this.liftGain * (wx0 * gx + wz0 * gz);
+    // VERTICAL: w = RAW (pre-deflection) horizontalWind · uphill-gradient, then CLAMPED to ±W_CLAMP.
+    // The clamp is the anti-geyser keystone (v17): gradient ∝ RELIEF, so on steep faces wx·gx can spike
+    // huge — unclamped + a real liftGain = the eruption the v16 commit killed by zeroing liftGain. Clamping
+    // the OUTPUT (not the gain) lets gentle/moderate faces lift into a visible arc while steep faces cap out
+    // at a believable updraft instead of launching motes to the ceiling.
+    let w = this.liftGain * (wx0 * gx + wz0 * gz);
+    if (w > Wind.W_CLAMP) w = Wind.W_CLAMP; else if (w < -Wind.W_CLAMP) w = -Wind.W_CLAMP;
     // HORIZONTAL: shed the into-slope component via the SHARED fn (identical math, now also used by the bird).
     const [wx, wz] = flowHorizontal(wx0, wz0, gx, gz, this.deflect);
     return [wx, wz, w];
@@ -806,6 +842,13 @@ export class Wind {
           sptX[di] = catmullRom(ptX[i0]!, ptX[i]!, ptX[i2]!, ptX[i3]!, tt);
           sptY[di] = catmullRom(ptY[i0]!, ptY[i]!, ptY[i2]!, ptY[i3]!, tt);
           sptZ[di] = catmullRom(ptZ[i0]!, ptZ[i]!, ptZ[i2]!, ptZ[i3]!, tt);
+          // ANTI-PENETRATION (v17c): the Catmull-Rom can UNDERSHOOT below the chord of the (terrain-clamped)
+          // coarse points → the curved tail dips INTO the terrain (worse over the deep RELIEF-600 valleys —
+          // the user's "wind goes directly into terrain"). Clamp each dense point to ≥ the straight line
+          // between its bracketing coarse points (both already ≥ terrain+minClear). Overshoot ABOVE the chord
+          // (the up-and-over arc) is untouched; no new sampleHeight (reuses the coarse ptY).
+          const chordY = ptY[i]! * (1 - tt) + ptY[i2]! * tt;
+          if (sptY[di]! < chordY) sptY[di] = chordY;
         }
       }
       sptX[denseSeg] = ptX[seg]!; sptY[denseSeg] = ptY[seg]!; sptZ[denseSeg] = ptZ[seg]!;
@@ -836,11 +879,48 @@ export class Wind {
     }
   }
 
+  // Bird-wake disturbance velocity (visuals only) at world point (px,py,pz): bow-wave OUTWARD ahead of the
+  // bird + drag/swirl slipstream BEHIND, relative to the bird at birdPos moving along unit axis at speed bs.
+  // Linear falloff to 0 at the ball edge. Writes [x,y,z] into `out` (NO allocation — called per head AND per
+  // tail point so the near comets CURL along the wake). windAt / flight physics are untouched (render-only).
+  private birdWakeAt(
+    px: number, py: number, pz: number,
+    birdPos: [number, number, number],
+    axisX: number, axisY: number, axisZ: number,
+    bs: number,
+    out: [number, number, number]
+  ): void {
+    out[0] = 0; out[1] = 0; out[2] = 0;
+    const R = this.nearRadius;
+    const dx = px - birdPos[0], dy = py - birdPos[1], dz = pz - birdPos[2];
+    const rr = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1e-3;
+    const fall = 1 - rr / R;                                 // 1 at the bird → 0 at the ball edge
+    if (fall <= 0) return;
+    const along = dx * axisX + dy * axisY + dz * axisZ;      // signed distance along the motion axis
+    let rx = dx - along * axisX, ry = dy - along * axisY, rz = dz - along * axisZ; // radial-from-axis
+    const rho = Math.sqrt(rx * rx + ry * ry + rz * rz) || 1e-3;
+    rx /= rho; ry /= rho; rz /= rho;                         // unit outward (bow-wave push direction)
+    const tx = axisY * rz - axisZ * ry, ty = axisZ * rx - axisX * rz, tz = axisX * ry - axisY * rx; // swirl dir
+    const ahead = Math.min(1, Math.max(0, along) / (0.35 * R));  // saturating ahead/behind weights (reach
+    const behind = Math.min(1, Math.max(0, -along) / (0.35 * R)); // full strength within 35% of R along axis)
+    const push = this.bowGain * bs * fall * ahead;          // bow wave: outward, ahead of the bird
+    const drag = this.wakeGain * bs * fall * behind;        // slipstream: along the motion axis, behind
+    const spin = this.swirlGain * bs * fall * behind;       // swirl: tangential tumble, behind
+    out[0] = rx * push + axisX * drag + tx * spin;
+    out[1] = ry * push + axisY * drag + ty * spin;
+    out[2] = rz * push + axisZ * drag + tz * spin;
+  }
+
   // v11 NEAR SPHERE: advect the dense little comets around the bird, recycle any that leave the ball back
-  // inside, and emit their short curved tails into the SAME host vertex array (after the far tier's verts).
+  // inside, and emit their short CURLING tails into the SAME host vertex array (after the far tier's verts).
   // Same terrain-shaped flowAt → coherent with the shared flow + respects terrain. vis is forced to 1 (NO
   // density cull) so the sphere renders DENSE and unmistakably legible right where the bird is.
-  private stepNear(birdPos: [number, number, number], t: number, dt: number): void {
+  private stepNear(
+    birdPos: [number, number, number],
+    birdVel: [number, number, number],
+    t: number,
+    dt: number
+  ): void {
     // seed once we have a real bird position (first frame): fill the whole ball so it is immediately dense.
     if (!this.nearSeeded) {
       for (let i = 0; i < this.nearCount; i++) this.seedNearMote(i, birdPos);
@@ -856,6 +936,13 @@ export class Wind {
     // write after the far tier's verts.
     let vi = this.farVertexCount * Wind.FPV;
 
+    // BIRD WAKE setup (per-frame constants): unit motion axis + speed. Below a small threshold the bird is
+    // ~stationary so the relative air is calm → no stir. birdWakeAt() builds the bow/drag/swirl on this axis.
+    const bvx = birdVel[0], bvy = birdVel[1], bvz = birdVel[2];
+    const bs = Math.hypot(bvx, bvy, bvz);
+    const moving = bs > 0.5;
+    const axisX = moving ? bvx / bs : 0, axisY = moving ? bvy / bs : 0, axisZ = moving ? bvz / bs : 0;
+
     for (let i = 0; i < this.nearCount; i++) {
       let x0 = this.nx[i]!, y0 = this.ny[i]!, z0 = this.nz[i]!;
 
@@ -867,12 +954,20 @@ export class Wind {
         x0 = this.nx[i]!; y0 = this.ny[i]!; z0 = this.nz[i]!;
       }
 
-      // advect by the SAME terrain-shaped flow (horizontal deflected + vertical pour) → respects terrain.
+      // advect by the terrain-shaped flow (horizontal deflected + vertical pour) → respects terrain, PLUS the
+      // BIRD WAKE disturbance (visuals only): bow-wave outward ahead, drag + swirl slipstream behind. NOT
+      // added to windAt (flight physics frozen) — it lives only in this near-mote advection + the curling tail.
       const [wx, wz, w] = this.flowAt(x0, z0, t);
-      const x = x0 + wx * dt;
-      const z = z0 + wz * dt;
+      let ibx = 0, iby = 0, ibz = 0;
+      if (moving) {
+        this.birdWakeAt(x0, y0, z0, birdPos, axisX, axisY, axisZ, bs, this._wake);
+        ibx = this._wake[0]; iby = this._wake[1]; ibz = this._wake[2];
+      }
+      const fwx = wx + ibx, fwy = w + iby, fwz = wz + ibz; // disturbed flow at the HEAD drives advection
+      const x = x0 + fwx * dt;
+      const z = z0 + fwz * dt;
       const terr = this.sampleHeight(x, z);
-      let y = y0 + w * dt;
+      let y = y0 + fwy * dt;
       const loY = terr + this.minClear;        // stay above ground
       if (y < loY) y = loY;
       this.nx[i] = x; this.ny[i] = y; this.nz[i] = z;
@@ -889,30 +984,40 @@ export class Wind {
       const fadeOut = 1 - smoothstep(this.fadeNearEdge, 1, distFrac); // 1 inside → 0 at the ball edge
       const nearVis = fadeIn * fadeOut;
 
-      // speed tint (same calibration as the far tier) — little comets still brighten in fast air.
-      const wspeed = Math.hypot(wx, wz);
+      // speed tint (same calibration as the far tier) — little comets brighten in fast air; using the
+      // DISTURBED horizontal speed so the bird's stir lights up the air it churns around itself.
+      const wspeed = Math.hypot(fwx, fwz);
       const u = Math.min(1, Math.max(0, (wspeed - lo) / (hi - lo)));
       let sp = u * u * (3 - 2 * u);
       const climbFrac = Math.min(1, Math.max(0, w / 7.0));
       sp = Math.max(sp, climbFrac);
 
-      // SHORT tail: these tails are only ~3-4m, over which flowAt barely changes — so REUSE the head's
-      // already-computed flow vector [wx,wz,w] for every backward step instead of re-evaluating flowAt per
-      // segment. That removes `seg` flowAt calls (4 sampleHeight each) per comet — the dominant cost of the
-      // dense sphere — with no visible difference (a 4m streak doesn't curve). Per-point terrain clamp kept.
+      // CURLING tail: integrate BACKWARD along the LOCAL disturbed flow (wind + bird wake), re-sampling at
+      // each point so the tail CURVES with the swirl/slipstream instead of being a straight streak. Costs a
+      // flowAt + birdWakeAt per segment — affordable now that the near sphere is small. Per-point terrain
+      // clamp since a curling tail can swing toward a ridge.
       const stepLen = this.nearSegStep;
       ptX[0] = x; ptY[0] = y; ptZ[0] = z;
       let cx = x, cy = y, cz = z;
+      let tfx = fwx, tfy = fwy, tfz = fwz; // first backward step reuses the head's disturbed flow (free)
       for (let s = 1; s <= seg; s++) {
-        cx -= wx * stepLen;
-        cz -= wz * stepLen;
-        cy -= w * stepLen;
+        cx -= tfx * stepLen;
+        cy -= tfy * stepLen;
+        cz -= tfz * stepLen;
+        const tb = this.sampleHeight(cx, cz) + this.minClear; // keep the tail above the ridge
+        if (cy < tb) cy = tb;
         ptX[s] = cx; ptY[s] = cy; ptZ[s] = cz;
+        // re-sample the disturbed flow at the NEW point for the NEXT step → the tail curls along the wake.
+        if (s < seg) {
+          const [nwx, nwz, nw] = this.flowAt(cx, cz, t);
+          if (moving) {
+            this.birdWakeAt(cx, cy, cz, birdPos, axisX, axisY, axisZ, bs, this._wake);
+            tfx = nwx + this._wake[0]; tfy = nw + this._wake[1]; tfz = nwz + this._wake[2];
+          } else {
+            tfx = nwx; tfy = nw; tfz = nwz;
+          }
+        }
       }
-      // single terrain clamp at the tail tip only (the head is already above minClear and the ~4m streak
-      // can't sink through a ridge between consecutive points) — avoids a sampleHeight per segment.
-      const tipB = this.sampleHeight(cx, cz) + this.minClear;
-      if (ptY[seg]! < tipB) ptY[seg] = tipB;
 
       // emit a quad per segment; vis forced to 1 → DENSE (no cull). along = head→tail fade over the ribbon.
       for (let s = 0; s < seg; s++) {
@@ -940,7 +1045,7 @@ export class Wind {
   }
 
   // SECOND pass: LOAD terrain color+depth (no clear); draw the drifting dot motes over the ridges.
-  // Signature is UNCHANGED from the streamline version so the bird-main.ts call site is untouched.
+  // Takes the bird POS (near-sphere center) and VEL (orients the bird-wake stir inside that sphere).
   draw(
     encoder: GPUCommandEncoder,
     colorView: GPUTextureView,
@@ -954,14 +1059,15 @@ export class Wind {
     fogColor: [number, number, number],
     fogDensity: number,
     aspect: number,
-    birdPos: [number, number, number]
+    birdPos: [number, number, number],
+    birdVel: [number, number, number]
   ): void {
     // derive dt once (shared by both tiers) so the near sphere advances in lock-step with the far field.
     let dt = this.lastTime < 0 ? 0 : time - this.lastTime;
     if (dt < 0) dt = 0;
     if (dt > 0.05) dt = 0.05;
     this.step(camGround, camFwd, camRight, time, birdPos);
-    this.stepNear(birdPos, time, dt);
+    this.stepNear(birdPos, birdVel, time, dt);
     // single upload of the combined (far + near) vertex buffer.
     this.device.queue.writeBuffer(this.vbuf, 0, this.vertBytes);
 

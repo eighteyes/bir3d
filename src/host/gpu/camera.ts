@@ -33,6 +33,12 @@ export class ChaseCamera {
   lookPitch: number;
   smooth: number;
 
+  // v17 CAMERA-TERRAIN COLLISION: the bird is clamped above terrain, but the chase eye sits BEHIND+ABOVE it
+  // and — especially with the taller RELIEF — can end up INSIDE a peak, which renders the scene fully black
+  // (the user's "black when I run into a mountain"). Wired from bird-main; null = no collision handling.
+  terrainHeight: ((x: number, z: number) => number) | null = null;
+  eyeMargin = 10; // meters the eye is kept clear of terrain (boom pull-in + hard floor)
+
   constructor(p: ChaseParams = {}) {
     // v6: pulled in proportionally to the halved bird (SPAN 18→9) so it stays a readable V while the
     // big ridges dominate. followHeight is the real "terrain looms" lever (lower eye → ridges rise
@@ -60,6 +66,31 @@ export class ChaseCamera {
       this.target[2] - hz * this.followDist,
     ];
 
+    // CAMERA-TERRAIN COLLISION (v17): keep the eye out of the mountains so the scene never goes black.
+    // (1) PULL-IN: march the boom from the target out to goalEye; if terrain blocks the view partway, plant
+    //     the eye at the last clear point (a tighter over-the-shoulder shot, but the bird stays visible).
+    // (2) FLOOR: never let the eye sit below terrain at its own XZ (backstop for the straight-down boom).
+    if (this.terrainHeight) {
+      const m = this.eyeMargin;
+      const dx = goalEye[0] - this.target[0];
+      const dy = goalEye[1] - this.target[1];
+      const dz = goalEye[2] - this.target[2];
+      const steps = 12;
+      let clear = 1;
+      for (let s = 1; s <= steps; s++) {
+        const f = s / steps;
+        const px = this.target[0] + dx * f, py = this.target[1] + dy * f, pz = this.target[2] + dz * f;
+        if (py < this.terrainHeight(px, pz) + m) { clear = (s - 1) / steps; break; }
+      }
+      if (clear < 1) {
+        goalEye[0] = this.target[0] + dx * clear;
+        goalEye[1] = this.target[1] + dy * clear;
+        goalEye[2] = this.target[2] + dz * clear;
+      }
+      const minY = this.terrainHeight(goalEye[0], goalEye[2]) + m;
+      if (goalEye[1] < minY) goalEye[1] = minY;
+    }
+
     // Aim at a point lookAhead in front of the EYE (horizontal), dropped by a FIXED angle.
     // This is independent of the bird's altitude, so the ground stays framed no matter the pitch.
     const drop = this.lookAhead * Math.tan(this.lookPitch);
@@ -71,6 +102,12 @@ export class ChaseCamera {
 
     this.eye = lerp(this.eye, goalEye, this.smooth);
     this.lookTarget = lerp(this.lookTarget, goalLook, this.smooth);
+    // post-lerp backstop: the lerp can dwell inside terrain for a few frames while easing out to a freshly
+    // pulled-in goal — clamp the live eye above terrain at its XZ each frame so no single frame renders black.
+    if (this.terrainHeight) {
+      const minY = this.terrainHeight(this.eye[0], this.eye[2]) + this.eyeMargin;
+      if (this.eye[1] < minY) this.eye[1] = minY;
+    }
   }
 
   viewMatrix(): Mat4 {

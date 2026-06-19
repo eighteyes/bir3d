@@ -24,10 +24,13 @@
 
 import { acquireDevice } from "./gpu/device";
 import { TerrainEKG } from "./gpu/terrain";
+import { GridTerrain } from "./gpu/terrain-grid";
 import { Bird3D, type BirdInput } from "./gpu/bird3d";
 import { Wind, windAt, setFluidField } from "./gpu/wind";
 import { FluidWind } from "./gpu/fluid-wind";
 import { GroundMarker } from "./gpu/marker";
+import { Target } from "./gpu/target";
+import { Trees } from "./gpu/trees";
 import { ChaseCamera } from "./gpu/camera";
 import { AutoPilot } from "./autopilot";
 import { Bloom } from "./gpu/bloom";
@@ -37,6 +40,10 @@ import { FrameLoop } from "./frameloop";
 // AUTOPILOT MODE (this pass): manual controls OFF — the AutoPilot flies, proving autonomous
 // soaring (find lift, ride it, never touch the ground) before flapping/controls return.
 let autopilot = false; // default MANUAL — YOU fly and feel the wind; press P to hand it to the autopilot
+let showWind = false; // wind motes hidden for now (window.__showWind toggles); fluid sim still runs
+// terrain renderer: "ekg" = original camera-relative scan-lines (lines run away); "grid" = world-static
+// wireframe (parallax toward you); "topo" = world-static topographic contour lines. window.__terrainMode(m).
+let terrainMode: "ekg" | "grid" | "topo" = "ekg";
 
 const FOV_Y = (60 * Math.PI) / 180;
 const FOV_KICK = (16 * Math.PI) / 180; // extra FOV at dive ceiling — speed reads as widening view
@@ -66,10 +73,15 @@ const SKY: [number, number, number] = [0.01, 0.012, 0.03];
 
 // Mouse-steer gains. Yaw: cursor offset → turn RATE. Pitch: cursor HEIGHT → nose ATTITUDE
 // (holdable — park the cursor, the nose stays put; center = gentle glide trim).
-const YAW_GAIN = 1.8;        // rad/s at full deflection (v8: crisper, less sluggish maneuvering)
-const PITCH_RANGE = 0.6;     // rad of nose angle at full vertical deflection
-const GLIDE_TRIM = -0.03;    // rad — centered-cursor attitude: a gentle settling descent
+const YAW_GAIN = 1.8; // rad/s at full deflection (v8: crisper, less sluggish maneuvering)
+const PITCH_RANGE = 1.0; // rad of nose angle at full vertical deflection — steep dives/climbs reachable mid-screen
+const GLIDE_TRIM = -0.03; // rad — centered-cursor attitude: a gentle settling descent
 const DEADZONE = 0.05;
+
+// Fly-to-target basis: a target counts as reached within REACH_RADIUS (horizontal).
+const REACH_RADIUS = 55;
+const START_CLEARANCE = 400; // m above terrain at spawn — the altitude budget a bird spends reaching a
+// target (flap to regain it). Raise to reach farther/higher.
 
 async function boot() {
   const overlay = document.getElementById("overlay")!;
@@ -112,35 +124,76 @@ async function boot() {
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
   });
 
-  const terrainShader = await fetch("/src/host/shaders/terrain_ekg.wgsl").then((r) => r.text());
+  const terrainShader = await fetch("/src/host/shaders/terrain_ekg.wgsl").then(
+    (r) => r.text(),
+  );
   const terrain = new TerrainEKG(device, terrainShader, HDR_FORMAT, {
-    rows: 512,        // stacked EKG depth rows — covers the 2× maxDist at the same 4× spacing
-    cols: 1536,       // samples per row — 2× density: the wide halfWidth means near rows show only a
-                      // central slice, so more samples are needed to shrink the chord faceting up close.
+    rows: 512, // stacked EKG depth rows — covers the 2× maxDist at the same 4× spacing
+    cols: 1536, // samples per row — 2× density: the wide halfWidth means near rows show only a
+    // central slice, so more samples are needed to shrink the chord faceting up close.
     sampleCount: SAMPLES,
-    rowSpacing: 4.5,  // m between rows: 4× line density — ~455 visible rows inside maxDist
-    rowStart: -150,   // BEHIND the camera ground point. Rows are built ahead of the camera; start a
-                      // little behind so the near-ground under the camera isn't empty black.
-    halfWidth: 2400,  // horizontal extent per row (m) — at 1900 m depth the 76° dive-FOV frustum is
-                      // ~2300 m half-wide; 1500 would expose naked row ends near the new horizon.
-    maxDist: 1900,    // CLEAN HORIZON moved out 2× with the fog (950→1900) — fog still dissolves
-                      // rows before this cutoff so the far edge never shows as a shelf.
-    baseline: -300,   // fill curtains drop to this world-y (occlusion only; below the frame).
+    rowSpacing: 2, // near step (m). ~1/4 the rows (266→96) to cut the terrain pass ~14ms→~3ms (GPU-measured).
+    nearDenseDepth: 250, // crisp band shortened to 250 m, then the far field thins hard via farSpread.
+    farSpread: 100, // beyond 250 m, spacing grows by 7 m per 70 m of depth → aggressive far thinning (the
+    // "sparser further away" lever). Lower = thin far harder; raise rowSpacing/nearDenseDepth for crisper near.
+    rowStart: -150, // BEHIND the camera ground point. Rows are built ahead of the camera; start a
+    // little behind so the near-ground under the camera isn't empty black.
+    halfWidth: 2400, // horizontal extent per row (m) — at 1900 m depth the 76° dive-FOV frustum is
+    // ~2300 m half-wide; 1500 would expose naked row ends near the new horizon.
+    maxDist: 2850, // +50% view (1900→2850) paired with the thinner fog below — fog still dissolves
+    // rows before this cutoff so the far edge never shows as a shelf.
+    baseline: -300, // fill curtains drop to this world-y (occlusion only; below the frame).
     fogColor: SKY,
-    fogDensity: 1 / 1100, // FOG EXPANDED 2× (1/550→1/1100): visibility doubles; far ridges read
-                          // much deeper before dissolving into the haze band.
+    fogDensity: 0.25 / 2200, // +50% view distance (fog ÷1.5 from 0.75/1100): less haze over the far rows.
+    // = 1/2200; raise the 0.5 toward 1 for more fog / a shorter view.
   });
 
-  const birdShader = await fetch("/src/host/shaders/bird3d.wgsl").then((r) => r.text());
+  // WORLD-STATIC wireframe terrain (alternative renderer; default ON via gridMode). Lines pinned to world
+  // space → fly forward and they flow toward you with real parallax. Same fBm → trees/bird sit on it too.
+  const gridShader = await fetch("/src/host/shaders/terrain_grid.wgsl").then((r) => r.text());
+  const gridTerrain = new GridTerrain(device, gridShader, HDR_FORMAT, {
+    spacing: 26,
+    radius: 1650,
+    maxDist: 1500,
+    fogColor: SKY,
+    fogDensity: 0.5 / 1100,
+    sampleCount: SAMPLES,
+  });
+
+  const birdShader = await fetch("/src/host/shaders/bird3d.wgsl").then((r) =>
+    r.text(),
+  );
   const startH = terrain.sampleHeight(0, 0);
-  // HIGHER START (v4): begin well above terrain (~200 m clearance) so the flight is aerial from
-  // the first frame and the EKG stack sits below the eyeline (less horizon tangle).
-  const bird = new Bird3D(device, birdShader, HDR_FORMAT, terrain, [0, startH + 200, 0], {}, SAMPLES);
+  // HIGHER START: begin START_CLEARANCE above terrain so the still-air glider has the altitude budget to
+  // reach the first target, and the flight is aerial from the first frame (EKG stack below the eyeline).
+  const bird = new Bird3D(
+    device,
+    birdShader,
+    HDR_FORMAT,
+    terrain,
+    [0, startH + START_CLEARANCE, 0],
+    {},
+    SAMPLES,
+  );
+  // STILL-AIR BASIS: the bird flies dead-calm — no wind drift / ridge lift / thermal / buffet — so the
+  // core glide-and-steer-to-target reads cleanly. Rendering is untouched: the wind motes keep drifting
+  // as ambient atmosphere; the bird simply ignores them. Wind returns later as flair.
+  bird.stillAir = true;
 
   // VISIBLE WIND: neon streamline comets over the terrain, integrated from the SAME shared windAt
   // field that pushes the bird (src/host/gpu/wind.ts). Camera-relative like the EKG rows.
-  const windShader = await fetch("/src/host/shaders/wind.wgsl").then((r) => r.text());
-  const wind = new Wind(device, windShader, HDR_FORMAT, (x, z) => terrain.sampleHeight(x, z), {}, {}, SAMPLES);
+  const windShader = await fetch("/src/host/shaders/wind.wgsl").then((r) =>
+    r.text(),
+  );
+  const wind = new Wind(
+    device,
+    windShader,
+    HDR_FORMAT,
+    (x, z) => terrain.sampleHeight(x, z),
+    {},
+    { nearCount: 400 },
+    SAMPLES,
+  );
 
   // v13: the REAL GPU fluid is the EVOLVING wind SOURCE. windAt() (wind.ts) samples this field as its
   // base horizontal vector + keeps the prevailing drift; bird3d (physics) and the motes (via flowAt) ride
@@ -156,18 +209,63 @@ async function boot() {
   };
   const fluidShaders = Object.fromEntries(
     await Promise.all(
-      Object.entries(fluidShaderPaths).map(async ([k, p]) => [k, await fetch(p).then((r) => r.text())])
-    )
-  ) as { forces: string; divergence: string; jacobi: string; subtractGrad: string; advect: string; setBnd: string };
+      Object.entries(fluidShaderPaths).map(async ([k, p]) => [
+        k,
+        await fetch(p).then((r) => r.text()),
+      ]),
+    ),
+  ) as {
+    forces: string;
+    divergence: string;
+    jacobi: string;
+    subtractGrad: string;
+    advect: string;
+    setBnd: string;
+  };
   // iters is the perf lever: step() records ~2×iters×3 jacobi/set_bnd passes/frame, and the per-dispatch
   // encode cost (not per-cell GPU work) dominates — so iters, NOT grid, sets the frame budget. A wind
   // field needs no converged divergence-free projection, so low iters is visually fine and holds 60fps.
-  const fluidWind = new FluidWind(device, fluidShaders, { grid: 256, iters: 10 });
+  const fluidWind = new FluidWind(device, fluidShaders, {
+    grid: 256,
+    iters: 10,
+  });
 
   // ALTITUDE PLUMB-LINE: dashed neon drop-line bird→ground (one dash per ~9 m = readable altimeter)
   // + pulsing ground diamond. THE direct how-close-is-the-ground cue for swoops.
-  const markerShader = await fetch("/src/host/shaders/marker.wgsl").then((r) => r.text());
+  const markerShader = await fetch("/src/host/shaders/marker.wgsl").then((r) =>
+    r.text(),
+  );
   const marker = new GroundMarker(device, markerShader, HDR_FORMAT, SAMPLES);
+
+  // FLIGHT TARGET: an amber beam of light out in the distance — fly to it and it respawns ahead. The
+  // playable basis ("see a target, fly toward it"). Drawn always-on-top so it stays visible behind ridges.
+  const targetShader = await fetch("/src/host/shaders/target.wgsl").then((r) =>
+    r.text(),
+  );
+  const target = new Target(
+    device,
+    targetShader,
+    HDR_FORMAT,
+    (x, z) => terrain.sampleHeight(x, z),
+    SAMPLES,
+  );
+
+  // TREES: mountaintop neon forests of recursive glow-branch trees, streamed in a grid window around
+  // the camera (placed only where terrain clears the peak threshold). Depth-tested so ridges occlude them.
+  const treeShader = await fetch("/src/host/shaders/trees.wgsl").then((r) =>
+    r.text(),
+  );
+  const treeGroundShader = await fetch(
+    "/src/host/shaders/trees_ground.wgsl",
+  ).then((r) => r.text());
+  const trees = new Trees(
+    device,
+    treeShader,
+    treeGroundShader,
+    HDR_FORMAT,
+    (x, z) => terrain.sampleHeight(x, z),
+    SAMPLES,
+  );
 
   // BLOOM post-process: reads the resolved HDR scene texture, writes the final image to the swapchain.
   // RE-TUNED for the additive-neon double-count risk (dense comet sphere + 50%-opacity wind + bright
@@ -175,17 +273,23 @@ async function boot() {
   // tone-map in the composite keeps blown pixels HUE-COLORED instead of smearing to white. Half-res
   // blur (downsample 2) gives a wide soft glow AND holds the 60fps budget.
   const bloomShaders = {
-    threshold: await fetch("/src/host/shaders/bloom_threshold.wgsl").then((r) => r.text()),
-    blur: await fetch("/src/host/shaders/bloom_blur.wgsl").then((r) => r.text()),
-    composite: await fetch("/src/host/shaders/bloom_composite.wgsl").then((r) => r.text()),
+    threshold: await fetch("/src/host/shaders/bloom_threshold.wgsl").then((r) =>
+      r.text(),
+    ),
+    blur: await fetch("/src/host/shaders/bloom_blur.wgsl").then((r) =>
+      r.text(),
+    ),
+    composite: await fetch("/src/host/shaders/bloom_composite.wgsl").then((r) =>
+      r.text(),
+    ),
   };
   const bloom = new Bloom(device, format, bloomShaders, {
     threshold: 0.85, // only neon cores above this luminance bloom (dark ground / dim far lines do not)
-    knee: 0.5,       // soft ramp above the threshold so the glow fades in, no hard edge
-    intensity: 0.9,  // bloom add weight — glow, not wash
-    exposure: 1.0,   // scene exposure into the tone-map
-    downsample: 2,   // half-res bloom chain (wide soft glow + perf)
-    blurPasses: 2,   // H+V iterations — widens the glow; 2 holds 60fps
+    knee: 0.5, // soft ramp above the threshold so the glow fades in, no hard edge
+    intensity: 0.9, // bloom add weight — glow, not wash
+    exposure: 1.0, // scene exposure into the tone-map
+    downsample: 2, // half-res bloom chain (wide soft glow + perf)
+    blurPasses: 2, // H+V iterations — widens the glow; 2 holds 60fps
   });
   bloom.resize(pxW, pxH);
 
@@ -203,38 +307,84 @@ async function boot() {
     lookPitch: (28 * Math.PI) / 180, // fixed ~28° down; steeper → EKG stack spreads down the frame
     smooth: 0.14,
   });
+  // v17: give the chase cam the terrain sampler so it can keep its eye OUT of the mountains (the taller
+  // RELIEF made the eye embed in peaks → black frames when the bird runs into a mountain).
+  cam.terrainHeight = (x, z) => terrain.sampleHeight(x, z);
 
   // --- input: mouse-steer only (pure glide) ---
-  const input: BirdInput = { yawRate: 0, pitchTarget: GLIDE_TRIM };
+  const input: BirdInput = { yawRate: 0, pitchTarget: GLIDE_TRIM, flap: false };
   // normalized cursor offset from screen-center (-1..1); start centered (no steer before first move).
-  let mouseX = 0, mouseY = 0;
+  let mouseX = 0,
+    mouseY = 0;
+  let flapHeld = false; // Space held → powered wingbeat (tap = one beat, hold = sustained climb)
 
+  // MOUSE-LEAVE AUTOPILOT (QOL): the cursor leaving the viewport ("off the screen") hands the bird to the
+  // autopilot; any mouse movement back inside grabs the controls straight back (manual). 'P' still toggles.
   canvas.addEventListener("mousemove", (e) => {
     const r = canvas.getBoundingClientRect();
-    mouseX = ((e.clientX - r.left) / r.width) * 2 - 1;  // -1..1
-    mouseY = ((e.clientY - r.top) / r.height) * 2 - 1;  // -1..1
+    mouseX = ((e.clientX - r.left) / r.width) * 2 - 1; // -1..1
+    mouseY = ((e.clientY - r.top) / r.height) * 2 - 1; // -1..1
+    autopilot = false; // you moved the mouse → you have the controls back
     // a real player moved the mouse → the scripted wobble yields control immediately.
     (window as any).__autoWobble = false;
   });
+  // (DISABLED) cursor-leaves-page → autopilot: it stole control during steep dives (reaching the top
+  // edge briefly exits the viewport). Manual flight now HOLDS its last input when the cursor leaves;
+  // press P for hands-off autopilot instead.
 
   // --- tuning panel: sliders write straight into bird.tuning; 'T' toggles visibility ---
   const tunePanel = buildTunePanel(bird.tuning, [
     ["glideSpeed", 14, 40, 0.5],
     ["sinkRate", 0.3, 4, 0.1],
-    ["divePower", 0.2, 2, 0.05],
+    ["divePower", 0.2, 3, 0.05],
     ["dragK", 0.1, 1.5, 0.05],
     ["liftGain", 0, 6, 0.1],
     ["windGain", 0, 15, 0.5],
     ["windDrift", 0, 2, 0.1],
     ["minSpeed", 8, 20, 0.5],
     ["maxSpeed", 30, 80, 1],
+    ["beatLift", 0, 30, 1],
+    ["beatThrust", 0, 25, 1],
+    ["beatHz", 1, 6, 0.5],
+    ["crashSpeed", 5, 40, 1],
   ]);
+  // --- terrain render controls in the same panel: a mode button + live topo sliders ---
+  const sep = document.createElement("div");
+  sep.style.cssText = "border-top:1px solid #3a3360;margin:8px 0 6px;padding-top:6px;color:#c9a8ff;";
+  sep.textContent = "terrain render";
+  tunePanel.appendChild(sep);
+  const modeBtn = document.createElement("button");
+  const modes: ("ekg" | "grid" | "topo")[] = ["ekg", "grid", "topo"];
+  modeBtn.textContent = `mode: ${terrainMode}  ▸`;
+  modeBtn.style.cssText =
+    "width:100%;margin:0 0 6px;padding:4px;background:#241d40;color:#9fe8ff;" +
+    "border:1px solid #4a4070;border-radius:4px;font:12px monospace;cursor:pointer;";
+  modeBtn.onclick = () => {
+    terrainMode = modes[(modes.indexOf(terrainMode) + 1) % modes.length]!;
+    modeBtn.textContent = `mode: ${terrainMode}  ▸`;
+  };
+  tunePanel.appendChild(modeBtn);
+  // topo line params (live; visible effect in topo mode)
+  const gt = gridTerrain as unknown as Record<string, number>;
+  sliderRow(tunePanel, gt, "interval", 8, 80, 1);
+  sliderRow(tunePanel, gt, "floorFade", 0, 1, 0.02);
+  sliderRow(tunePanel, gt, "peakGain", 0.5, 3, 0.1);
+  sliderRow(tunePanel, gt, "lineWidth", 0.5, 3, 0.1);
+
   document.body.appendChild(tunePanel);
   window.addEventListener("keydown", (e) => {
     if (e.code === "KeyT") {
-      tunePanel.style.display = tunePanel.style.display === "none" ? "block" : "none";
+      tunePanel.style.display =
+        tunePanel.style.display === "none" ? "block" : "none";
     }
     if (e.code === "KeyP") autopilot = !autopilot; // toggle hands-off autopilot <-> manual
+    if (e.code === "Space") {
+      flapHeld = true;
+      e.preventDefault(); // stop Space from scrolling the page
+    }
+  });
+  window.addEventListener("keyup", (e) => {
+    if (e.code === "Space") flapHeld = false;
   });
 
   // --- compass overlay canvas: large heading-vs-ground-track-vs-wind vectors (the felt-wind proof) ---
@@ -274,7 +424,8 @@ async function boot() {
     sceneTex = device.createTexture({
       size: [pxW, pxH],
       format: HDR_FORMAT,
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+      usage:
+        GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
     });
     bloom.resize(pxW, pxH); // recreate the downsampled bloom-chain textures + bind groups
   };
@@ -282,15 +433,18 @@ async function boot() {
 
   // Scripted pitch wobble (THIS task): auto nose up/down so the screenshot proves the camera keeps
   // the ground framed no matter how hard the BIRD pitches. Off in AUTOPILOT mode (the pilot flies).
-  (window as any).__autoWobble = !autopilot;
+  // PLAYABLE: no scripted pitch wobble — the player has clean manual control from the first frame.
+  (window as any).__autoWobble = false;
   let wobbleT = 0;
 
   let frame = 0;
   let fps = 0;
+  let reached = 0; // targets reached this run (HUD score)
   let fovCur = FOV_Y; // eased per-frame toward FOV_Y + speed kick
   // smoothed horizontal MOMENTUM (low-passed bird velocity) — the camera aims along this, not heading,
   // so buffet/gust jitter and stall thrashing don't shake the view.
-  let momX = bird.vel[0], momZ = bird.vel[2];
+  let momX = bird.vel[0],
+    momZ = bird.vel[2];
   const loop = new FrameLoop((dt) => {
     fps = fps * 0.9 + (1 / Math.max(dt, 1e-3)) * 0.1;
 
@@ -302,8 +456,9 @@ async function boot() {
       (window as any).__autoMode = auto.mode;
     } else {
       input.yawRate = applyDead(mouseX) * YAW_GAIN;
-      input.pitchTarget = GLIDE_TRIM - applyDead(mouseY) * PITCH_RANGE; // mouse-up = nose-up, holdable
+      input.pitchTarget = GLIDE_TRIM + applyDead(mouseY) * PITCH_RANGE; // INVERTED yoke: cursor BELOW center (under bird) = nose-up/climb; ABOVE = dive
     }
+    input.flap = !autopilot && flapHeld; // powered wingbeat (manual flight only)
 
     // scripted pitch wobble drives the bird hard up/down; the camera must NOT follow the pitch.
     // PITCH ONLY (no yaw) → heading stays 0 so the world-axis EKG rows render as clean horizontal
@@ -320,18 +475,42 @@ async function boot() {
     const field = fluidWind.read();
     if (field) {
       const [oX, oZ] = fluidWind.originXZ;
-      setFluidField(field.u, field.v, fluidWind.gridW, fluidWind.gridH, oX, oZ,
-        fluidWind.cellMeters, fluidWind.currentScale);
+      setFluidField(
+        field.u,
+        field.v,
+        fluidWind.gridW,
+        fluidWind.gridH,
+        oX,
+        oZ,
+        fluidWind.cellMeters,
+        fluidWind.currentScale,
+      );
     }
 
     bird.integrate(dt, input);
 
+    // fly-to-target: reached → score + respawn ahead. (No ground-reset teleport — the bird now FLAPS to
+    // climb out of low passes; the altitude clamp just lets it skim the terrain.)
+    if (target.checkReached(bird.pos, REACH_RADIUS)) {
+      reached++;
+      target.respawn(bird.pos[0], bird.pos[2], bird.heading);
+    }
+
     // altitude-adaptive camera: low clearance → eye drops + look flattens (ground rush);
     // high clearance → exact v3/v4 framing. cam.update() smooths the transition.
-    const cf = Math.min(1, Math.max(0,
-      (bird.lastClearance - CAM_LOW.clearance) / (CAM_HIGH.clearance - CAM_LOW.clearance)));
+    const cf = Math.min(
+      1,
+      Math.max(
+        0,
+        (bird.lastClearance - CAM_LOW.clearance) /
+          (CAM_HIGH.clearance - CAM_LOW.clearance),
+      ),
+    );
     cam.followHeight = CAM_LOW.height + cf * (CAM_HIGH.height - CAM_LOW.height);
-    cam.lookPitch = ((CAM_LOW.pitchDeg + cf * (CAM_HIGH.pitchDeg - CAM_LOW.pitchDeg)) * Math.PI) / 180;
+    cam.lookPitch =
+      ((CAM_LOW.pitchDeg + cf * (CAM_HIGH.pitchDeg - CAM_LOW.pitchDeg)) *
+        Math.PI) /
+      180;
 
     // camera follows the bird
     cam.target = [bird.pos[0], bird.pos[1], bird.pos[2]];
@@ -346,17 +525,23 @@ async function boot() {
     cam.update();
 
     // speed FOV kick: diving widens the view (eases, never snaps).
-    const speedFrac = Math.min(1, Math.max(0,
-      (bird.lastSpeed - bird.tuning.glideSpeed) / (bird.tuning.maxSpeed - bird.tuning.glideSpeed)));
+    const speedFrac = Math.min(
+      1,
+      Math.max(
+        0,
+        (bird.lastSpeed - bird.tuning.glideSpeed) /
+          (bird.tuning.maxSpeed - bird.tuning.glideSpeed),
+      ),
+    );
     fovCur += (FOV_Y + speedFrac * FOV_KICK - fovCur) * Math.min(1, dt * 5);
 
     const proj = perspective(fovCur, pxW / pxH, NEAR, FAR);
     const view = cam.viewMatrix();
     const viewProj = multiply(proj, view);
 
-    const colorView = msaaTex.createView();                   // all scene passes render into the HDR MSAA target
-    const resolveView = sceneTex.createView();                // final scene pass resolves into the HDR scene texture
-    const swapView = ctx.getCurrentTexture().createView();    // bloom composite writes the final image here
+    const colorView = msaaTex.createView(); // all scene passes render into the HDR MSAA target
+    const resolveView = sceneTex.createView(); // final scene pass resolves into the HDR scene texture
+    const swapView = ctx.getCurrentTexture().createView(); // bloom composite writes the final image here
     const depthView = depthTex.createView();
     const eye = cam.getEye();
 
@@ -370,20 +555,78 @@ async function boot() {
     const camGround = cam.groundPos();
     const camFwd = cam.forwardHoriz();
     const camRight = cam.rightHoriz();
-    terrain.draw(enc, colorView, depthView, viewProj, camGround, camFwd, camRight, eye, {
-      r: SKY[0], g: SKY[1], b: SKY[2], a: 1,
-    });
+    if (terrainMode !== "ekg") {
+      // WORLD-STATIC renderer (grid wireframe or topo contours); first pass, clears color+depth.
+      gridTerrain.mode = terrainMode;
+      gridTerrain.draw(enc, colorView, depthView, viewProj, camGround, eye, {
+        r: SKY[0], g: SKY[1], b: SKY[2], a: 1,
+      });
+    } else {
+      terrain.draw(
+        enc,
+        colorView,
+        depthView,
+        viewProj,
+        camGround,
+        camFwd,
+        camRight,
+        eye,
+        {
+          r: SKY[0],
+          g: SKY[1],
+          b: SKY[2],
+          a: 1,
+        },
+      );
+    }
     // wind pass: loads color+depth (no clear); drifting neon DOT motes over the ridges (depth-tested,
     // no depth-write) — advected by the bird's sim time so the drawn field matches the field that pushes.
-    wind.draw(enc, colorView, depthView, viewProj, camGround, camFwd, camRight, eye,
-      bird.simTime, SKY, 1 / 1400, pxW / pxH, bird.pos); // fog expanded 2× alongside the terrain's; bird.pos = near-sphere center
+    // HIDDEN for now (window.__showWind = true to restore). The fluid sim still runs (drives the bird).
+    if (showWind) {
+      wind.draw(
+        enc,
+        colorView,
+        depthView,
+        viewProj,
+        camGround,
+        camFwd,
+        camRight,
+        eye,
+        bird.simTime,
+        SKY,
+        0.5 / 1400,
+        pxW / pxH,
+        bird.pos,
+        bird.vel,
+      ); // −25% mote fog (was 1/1400), kept coupled to the terrain's; bird.pos = near-sphere center; bird.vel orients the wake stir
+    }
     // bird pass: loads color+depth, depth-tested → ridges occlude the bird.
     bird.draw(enc, colorView, depthView, viewProj);
+    // trees pass: mountaintop forests, depth-tested → ridges occlude them; rebuilt on cell crossing.
+    trees.draw(
+      enc,
+      colorView,
+      depthView,
+      viewProj,
+      camGround,
+      eye,
+      bird.simTime,
+      0.5 / 1100, // fog density == terrain's → trees haze identically with distance
+    );
+    // target beam: always-on-top amber waypoint, drawn after the bird so it composites over the scene.
+    target.draw(enc, colorView, depthView, viewProj, eye, bird.simTime);
     // altitude plumb-line + ground diamond under the bird (depth-tested → ridges occlude it).
     // LAST scene pass — resolves the HDR MSAA target into the single-sample scene texture.
-    marker.draw(enc, colorView, depthView, viewProj,
+    marker.draw(
+      enc,
+      colorView,
+      depthView,
+      viewProj,
       [bird.pos[0], bird.pos[1], bird.pos[2]],
-      bird.pos[1] - bird.lastClearance, bird.simTime, resolveView);
+      bird.pos[1] - bird.lastClearance,
+      bird.simTime,
+      resolveView,
+    );
     // BLOOM: threshold → separable blur → composite/tone-map the HDR scene into the swapchain.
     bloom.apply(enc, resolveView, swapView);
     device.queue.submit([enc.finish()]);
@@ -392,10 +635,10 @@ async function boot() {
 
     (window as any).__camPos = eye;
     (window as any).__birdPos = bird.pos;
-    (window as any).__birdPitch = bird.pitch;     // live pitch (rad)
+    (window as any).__birdPitch = bird.pitch; // live pitch (rad)
     (window as any).__birdHeading = bird.heading; // live heading (rad) — capture harness waits for a real turn
     (window as any).__birdGroundTrack = bird.lastGroundTrack; // actual travel dir (rad) — drift proof
-    (window as any).__birdWind = bird.lastWind;   // [wx,wz] m/s — overlay/diagnostics
+    (window as any).__birdWind = bird.lastWind; // [wx,wz] m/s — overlay/diagnostics
     (window as any).__birdVario = bird.lastVario; // climb m/s — lift proof
     frame++;
     const headingDeg = ((bird.heading * 180) / Math.PI) % 360;
@@ -406,22 +649,47 @@ async function boot() {
     const vario = bird.lastVario;
     const varioStr = `${vario >= 0 ? "+" : ""}${vario.toFixed(1)}`;
     const windSpeed = Math.hypot(bird.lastWind[0], bird.lastWind[1]);
+    // target nav readout: horizontal distance + relative steer bearing (◄ left / ► right / ▲ ahead).
+    const tDist = target.distanceTo(bird.pos);
+    let tRel =
+      ((Math.atan2(target.x - bird.pos[0], target.z - bird.pos[2]) -
+        bird.heading) *
+        180) /
+      Math.PI;
+    tRel = ((((tRel + 180) % 360) + 360) % 360) - 180;
+    const tArrow = tRel > 5 ? "►" : tRel < -5 ? "◄" : "▲";
     overlay.textContent =
-      `vector-system — bird3d (soaring glider chase)${autopilot ? `   AUTO: ${auto.mode}` : "   MANUAL (P=autopilot)"}\n` +
+      `vector-system — bird3d (still-air glider · fly to target)${autopilot ? `   AUTO: ${auto.mode}` : "   MANUAL (P=autopilot)"}${bird.lastFlapping ? "   ▲ FLAP" : ""}${bird.lastCrashing ? "   ✖ CRASH" : ""}\n` +
+      `TARGET: ${tDist.toFixed(0)} m   steer ${tArrow} ${Math.abs(tRel).toFixed(0)}°   reached: ${reached}\n` +
       `alt over terrain: ${bird.lastClearance.toFixed(0)} m   air: ${bird.lastSpeed.toFixed(0)} m/s\n` +
       `vario: ${varioStr} m/s ${vario > 0.5 ? "▲" : vario < -0.5 ? "▼" : "—"}   updraft: +${bird.lastUpdraft.toFixed(1)} m/s\n` +
       `heading: ${headingDeg.toFixed(0)}°   ground-track: ${trackDeg.toFixed(0)}°   DRIFT: ${drift >= 0 ? "+" : ""}${drift.toFixed(0)}°\n` +
       `wind: ${bird.lastWind[0].toFixed(1)}, ${bird.lastWind[1].toFixed(1)} m/s  (|${windSpeed.toFixed(1)}|)\n` +
-      `fps: ${fps.toFixed(0)}   frame ${frame}   (mouse=steer: down=dive/speed, up=zoom-climb, T=tuning)`;
+      `fps: ${fps.toFixed(0)}   frame ${frame}   (steer=mouse · SPACE=flap · cursor under bird=climb, over=dive · T=tuning)`;
 
     // compass overlay: large vectors — heading (cyan), ground-track (yellow), wind (magenta).
-    drawCompass(compassCtx, bird.heading, bird.lastGroundTrack, bird.lastWind, windSpeed, drift);
+    drawCompass(
+      compassCtx,
+      bird.heading,
+      bird.lastGroundTrack,
+      bird.lastWind,
+      windSpeed,
+      drift,
+    );
   });
 
   // v13 EVOLUTION PROBE: sample windAt at a FIXED world point with a FIXED t. Because t is fixed, any
   // change across calls comes ONLY from the fluid readback replacing the field each frame — that IS the
   // proof the wind is the evolving fluid (the old analytic curl-noise at a fixed point was quasi-static).
   (window as any).__windAt = (x: number, z: number) => windAt(x, z, 0);
+
+  // perf A/B handle: window.__trees.enabled = false disables the forest pass; window.__trees.treeCount
+  // reports how many trees the current window baked.
+  (window as any).__trees = trees;
+  // toggle the wind motes back on from the console: __showWind(true)
+  (window as any).__showWind = (v: boolean) => { showWind = v; };
+  // switch terrain renderer from the console: __terrainMode("ekg" | "grid" | "topo")
+  (window as any).__terrainMode = (m: "ekg" | "grid" | "topo") => { terrainMode = m; };
 
   loop.start();
   (window as any).__birdBooted = true;
@@ -431,7 +699,7 @@ async function boot() {
 // rows: [key, min, max, step][] — each slider writes tuning[key] on input.
 function buildTunePanel(
   tuning: Record<string, number>,
-  rows: [string, number, number, number][]
+  rows: [string, number, number, number][],
 ): HTMLDivElement {
   const panel = document.createElement("div");
   panel.id = "tune";
@@ -439,27 +707,37 @@ function buildTunePanel(
     "position:fixed;right:12px;top:12px;display:none;padding:10px 12px;" +
     "background:rgba(8,6,20,0.85);border:1px solid #3a3360;border-radius:6px;" +
     "font:12px/1.6 monospace;color:#9fe8ff;z-index:10;min-width:240px;";
-  for (const [key, min, max, step] of rows) {
-    const row = document.createElement("div");
-    const label = document.createElement("span");
-    const val = document.createElement("span");
-    const slider = document.createElement("input");
-    slider.type = "range";
-    slider.min = String(min);
-    slider.max = String(max);
-    slider.step = String(step);
-    slider.value = String(tuning[key]);
-    slider.style.cssText = "width:110px;vertical-align:middle;margin:0 6px;";
-    label.textContent = key.padEnd(11);
-    val.textContent = String(tuning[key]);
-    slider.addEventListener("input", () => {
-      tuning[key] = Number(slider.value);
-      val.textContent = slider.value;
-    });
-    row.append(label, slider, val);
-    panel.appendChild(row);
-  }
+  for (const [key, min, max, step] of rows) sliderRow(panel, tuning, key, min, max, step);
   return panel;
+}
+
+// one slider row bound to obj[key]; reused for bird.tuning and the terrain render controls.
+function sliderRow(
+  panel: HTMLElement,
+  obj: Record<string, number>,
+  key: string,
+  min: number,
+  max: number,
+  step: number,
+): void {
+  const row = document.createElement("div");
+  const label = document.createElement("span");
+  const val = document.createElement("span");
+  const slider = document.createElement("input");
+  slider.type = "range";
+  slider.min = String(min);
+  slider.max = String(max);
+  slider.step = String(step);
+  slider.value = String(obj[key]);
+  slider.style.cssText = "width:110px;vertical-align:middle;margin:0 6px;";
+  label.textContent = key.padEnd(11);
+  val.textContent = String(obj[key]);
+  slider.addEventListener("input", () => {
+    obj[key] = Number(slider.value);
+    val.textContent = slider.value;
+  });
+  row.append(label, slider, val);
+  panel.appendChild(row);
 }
 
 // Draw the felt-wind compass: heading (cyan), ground-track (yellow), wind (magenta) as vectors from
@@ -471,10 +749,12 @@ function drawCompass(
   track: number,
   wind: [number, number],
   windSpeed: number,
-  driftDeg: number
+  driftDeg: number,
 ): void {
-  const w = ctx.canvas.width, h = ctx.canvas.height;
-  const cx = w / 2, cy = h / 2;
+  const w = ctx.canvas.width,
+    h = ctx.canvas.height;
+  const cx = w / 2,
+    cy = h / 2;
   ctx.clearRect(0, 0, w, h);
 
   // ring
@@ -512,15 +792,22 @@ function drawCompass(
   const windAng = Math.atan2(wind[0], wind[1]); // atan2(x,z) → heading-convention angle
   const windLen = Math.min(70, 14 + windSpeed * 3.0);
   arrow(windAng, windLen, "rgba(230,90,230,0.95)", 5); // wind — magenta, thick
-  arrow(heading, 66, "rgba(80,220,255,0.95)", 3);        // heading — cyan
-  arrow(track, 66, "rgba(255,225,70,0.95)", 3);          // ground-track — yellow
+  arrow(heading, 66, "rgba(80,220,255,0.95)", 3); // heading — cyan
+  arrow(track, 66, "rgba(255,225,70,0.95)", 3); // ground-track — yellow
 
   ctx.font = "11px monospace";
-  ctx.fillStyle = "#9fe8ff"; ctx.fillText("heading", 8, 16);
-  ctx.fillStyle = "#ffe146"; ctx.fillText("track", 8, 30);
-  ctx.fillStyle = "#e65ae6"; ctx.fillText("wind", 8, 44);
+  ctx.fillStyle = "#9fe8ff";
+  ctx.fillText("heading", 8, 16);
+  ctx.fillStyle = "#ffe146";
+  ctx.fillText("track", 8, 30);
+  ctx.fillStyle = "#e65ae6";
+  ctx.fillText("wind", 8, 44);
   ctx.fillStyle = "#fff";
-  ctx.fillText(`drift ${driftDeg >= 0 ? "+" : ""}${driftDeg.toFixed(0)}°`, 8, h - 10);
+  ctx.fillText(
+    `drift ${driftDeg >= 0 ? "+" : ""}${driftDeg.toFixed(0)}°`,
+    8,
+    h - 10,
+  );
 }
 
 boot().catch((e) => {

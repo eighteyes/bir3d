@@ -119,6 +119,6 @@ export class AutoPilot {
         `vario=${bird.lastVario.toFixed(1)} lift=${here.toFixed(1)} bestProbe=${bestU.toFixed(1)}`
       );
     }
-    return { yawRate: this.yawCmd, pitchTarget: this.pitchCmd };
+    return { yawRate: this.yawCmd, pitchTarget: this.pitchCmd, flap: false }; // autopilot glides, no flap
   }
 }

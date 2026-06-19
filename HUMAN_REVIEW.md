@@ -1,5 +1,247 @@
 # Human Review Steps
 
+## mountaintop neon forests (algorithmic trees)
+**Date:** 2026-06-18
+**Commit:** (uncommitted — worktree `.claude/worktrees/mountaintop-forests`, branch `worktree-mountaintop-forests`, based on 99bfc9a)
+**Session:** mountaintop-forests (isolated worktree; core was being edited by another agent)
+
+### What changed
+- TREES MODULE (`gpu/trees.ts` + `shaders/trees.wgsl`, NEW): a dense, elevation-banded neon forest streamed around the camera, baked CPU-side into ONE line-list vertex buffer (no instancing). SPECIES BY ELEVATION — deciduous (oak/maple, warm-green) in the valleys, conifers (fir/pine, cool blue-green) on the tops, blended through a treeline; density THINS above the alpine line. CLUSTERED into TIGHT isolated stands — a high density-field threshold (only the noise peaks grow forest) with a narrow band for sharp stand edges (treeline feel), not a wide sprinkle. SIMPLE glyph geometry (conifer ≈7 segments, deciduous ≈5) so the forest can be DENSE — ~1900 trees in view (cap 4000). Small (deciduous ≈9 m, conifer ≈12 m; ~4% larger "ancient"). ANCHORING (root-cause fix): trees no longer trust the CPU height mirror — each tree's ground Y is computed in the VERTEX SHADER with the terrain's exact fBm (same function + f32 precision as the rendered terrain). The old `sampleHeight` (TS, f64) diverged from the GPU (f32) in the `sin`-hash and drifted MORE with distance from origin → the "floating" the user saw, worst far out. Now trees sit on the surface at any distance (verified at world x=9000). Vertices store local offsets + base XZ; the shader adds `fbm(baseXZ)`. Bases sunk 4 m. Per-vertex HDR color (additive → bloom). DISTANCE FADE (radial + exp fog) so trees rise from nothing at the window rim instead of popping. Depth-tested (`depthCompare "less"`) so ridges occlude. Vertex buffer rebuilt only on camera cell-crossing (≈2.3 ms CPU — simple geometry kept the rebuild cheap).
+- WIRING (`bird-main.ts`): construct `Trees` after the target with `(x,z)=>terrain.sampleHeight(x,z)`; draw depth-tested between bird and target (ridges occlude); `window.__trees` exposed (`.enabled`, `.treeCount`) for the perf A/B.
+- TESTS (`tests/gpu/trees-perf.spec.ts`, `tests/gpu/trees-live.spec.ts`, NEW): FPS A/B + tree count + rebuild cost; offscreen GPU-readback proof the trees render green in the EXACT live config (rgba16float + MSAA 4 + resolve + depth24plus) with a `popErrorScope` guard that catches WGSL pipeline-compile regressions. Visual iteration tool: `.ai/tmp/trees-png.spec.ts` (renders a forest PNG to `.ai/tmp/`).
+
+### Render budget (GPU timestamps, headless ANGLE/Metal @ 1280×720 MSAA4 — relative, real HW is faster)
+- Frame budget: **16.67 ms** (60 fps). Holds 60 fps.
+- Profiling found: `terrain` ≈14 ms (dominant) and the trees' per-vertex 4-octave fBm = **92%** of the trees cost.
+- DONE — terrain rows cut to ~1/4 (266→96) via `rowSpacing 7 / nearDenseDepth 250 / farSpread 70` in
+  bird-main (leans on the far-thinning lever): terrain **≈14 ms → ≈3 ms**. Foreground a touch coarser.
+- DONE — trees fBm moved from per-vertex to a once-per-tree COMPUTE PREPASS (`shaders/trees_ground.wgsl`):
+  ground computed once per tree on rebuild, stored in a buffer the vertex shader reads. Anchoring identical
+  (same GPU fBm; verified at x=9000). ~2× on this backend (the vertex-stage storage read costs on ANGLE;
+  real HW better). Rebuild dropped to ~1.1 ms (CPU no longer touches fBm).
+- `trees.draw(...)` takes an optional trailing `timestampWrites` (profiling hook). `terrain.ts` left pristine.
+- NOTE: terrain params live in bird-main (`new TerrainEKG({...})`); `terrain.ts`/`terrain_ekg.wgsl` core unchanged.
+
+### Latest iteration (denser / brighter / wind-off / landmarks / fog)
+- WAY MORE TREES: `CELL 14`, `MAX_TREES 9000`, lower COVER thresholds → ~3500 in view. 60 fps, rebuild ~2 ms.
+- BRIGHTER foliage (HDR > 1 → bloom fattens them, reading as "thicker" in the neon scene).
+- TREES FOG = TERRAIN FOG: `trees.draw(..., fogDensity)` now passed `0.5/1100` from bird-main (was 0.5/1400).
+- WIND HIDDEN: `showWind=false` in bird-main gates the mote pass (fluid sim still runs); `window.__showWind(true)` restores.
+- LANDMARK GIANTS: a few big recursive (L-system, depth 6) trees on PEAKS as waypoints — coarse-grid placement
+  at local high points above `LANDMARK_MIN_E`, bright cyan-white. `trees.landmarks` lists their world XZ.
+- Terrain animation is camera-relative world sampling (no time term); user set `rowSpacing 2` (denser near lines).
+- THREE TERRAIN MODES (`window.__terrainMode("ekg" | "grid" | "topo")`), default **ekg**:
+  - `ekg` — original camera-relative scan-lines (lines run AWAY as you fly). `terrain.ts` UNTOUCHED.
+  - `grid` — world-static wireframe grid draped on the fBm; flows toward you with parallax.
+  - `topo` — world-static TOPOGRAPHIC contour lines (constant-elevation, per-fragment fBm → smooth).
+  - Both world-static modes live in `gpu/terrain-grid.ts` + `shaders/terrain_grid.wgsl` (new, separate from
+    the EKG core): a windowed draped mesh; FILL gives hidden-surface removal; same fBm so trees/bird sit on
+    it. Valid in live MSAA4/rgba16float, 60 fps.
+  - TOPO tuning: contours computed from the SMOOTH (pre-terrace) fBm → even spacing; elevation brightness
+    ramp (`floorFade` dims lowlands, `peakGain` lights peaks; dark between lines). Live tuning-panel (T)
+    controls: a mode button (cycles ekg/grid/topo) + sliders `interval` / `floorFade` / `peakGain` / `lineWidth`.
+
+### Verify — typecheck (from the worktree)
+```
+cd /Users/god/projects/ai-jank/vector-system/.claude/worktrees/mountaintop-forests && ./node_modules/.bin/tsc --noEmit && echo OK
+```
+
+### Verify — perf + render proof (GPU readback; no live server needed beyond the test's own)
+```
+cd /Users/god/projects/ai-jank/vector-system/.claude/worktrees/mountaintop-forests && ./node_modules/.bin/playwright test tests/gpu/trees-perf.spec.ts tests/gpu/trees-live.spec.ts --reporter=list
+```
+
+### Verify — run the sim, then open the bird page
+PORT WARNING: this is a worktree and another agent holds 5173–5175, so vite auto-bumps to the next free
+port. READ the "Local:" URL vite prints — do NOT assume 5173.
+```
+cd /Users/god/projects/ai-jank/vector-system/.claude/worktrees/mountaintop-forests && ./node_modules/.bin/vite
+```
+Then browse to the printed URL + `/index-bird.html` (e.g. http://localhost:5176/index-bird.html). Confirm
+trees with `window.__trees.treeCount` in the console (should be > 0) — and check `bird-main.ts` on that
+port actually imports Trees if unsure: `curl -s http://localhost:PORT/src/host/bird-main.ts | grep Trees`.
+
+### Visual checklist (human eyeball — fly across valleys AND peaks)
+- [ ] SPECIES BY ELEVATION: warm-green broadleaves (oak/maple) in the valleys; cool blue-green conifers (fir/pine) on the high ground; a mixed treeline band between.
+- [ ] SMALL + ROOTED: trees are small and sit ON the terrain — no floating, no giants towering over the hills.
+- [ ] NATURALISTIC CLUMPS: forests cluster into stands with clearings between, not an even scatter; tops thin out toward bare rock above the alpine line.
+- [ ] FADE, NO POP: as you fly, new trees fade UP from nothing at the far edge rather than popping in; distant trees fade into the haze.
+- [ ] OCCLUSION: trees behind a nearer ridge are hidden by it (depth-tested).
+- [ ] BLOOM: branches glow softly (additive HDR), consistent with the bird/terrain neon.
+- [ ] FPS ~60 with the forest on screen (toggle `window.__trees.enabled = false` in the console to A/B).
+
+### Tuning knobs (`gpu/trees.ts`)
+- Density / reach: `CELL` (spacing), `RADIUS` (stream distance), `MAX_TREES` (cap).
+- Species split: `DECID_MAX` / `CONIFER_MIN` (treeline band, fraction of `PEAK_RELIEF`); `ALPINE` (bare-rock line).
+- Clustering: `CLUMP_FREQ` (forest wavelength), `COVER_LO` / `COVER_HI` (clearing↔full-cover thresholds).
+- Size: `DECID_H`, `CONIFER_H`, `CONIFER_RAD`, `ANCIENT_FRAC`, `ANCIENT_SCALE`; anchor `ROOT_SINK`.
+- Color: `DECID_FOLIAGE` / `CONIFER_FOLIAGE` (+ trunk variants). Fade: `FOG_DENSITY`, fadeStart/End in `draw()`.
+
+---
+## powered two-wing flap (climb engine) + view-fog extension
+**Date:** 2026-06-18
+**Commit:** (uncommitted — working tree on top of 99bfc9a, branch build/foundation)
+**Session:** 5b3183c3-54f2-4a41-99a5-7dc3551d3cd2 (flap-to-climb + fog)
+
+### What changed
+- POWERED FLAP — climb engine (`gpu/bird3d.ts` + `shaders/bird3d.wgsl`). Modeled as **two wings, NOT a unified force**: each wing makes its own beat force. Their **SUM** = climb (vertical lift + forward thrust so a climb HOLDS airspeed instead of stalling); their **DIFFERENCE** (driven by steering) = turn assist (yaw) + visual bank. **Tap** Space = one beat (runs to completion); **hold** Space = beats repeat → sustained climb. Per-wing visual beat is independent (`ampL`/`ampR`) so an asymmetric beat is *visible* when turning. Bird uniform grown 96→112 B (added `flapPhase`, `ampL`, `ampR`).
+- SPACE INPUT + HUD (`bird-main.ts`): `keydown`/`keyup` → `input.flap` (manual flight only; `preventDefault` stops page-scroll). `BirdInput` gained `flap` (autopilot returns `flap:false`). T-panel sliders added: `beatLift`, `beatThrust`, `beatHz`. HUD shows `▲ FLAP` while beating; controls hint updated (`SPACE=flap/climb`).
+- VIEW/FOG +50% (`bird-main.ts`): terrain `fogDensity` 0.75/1100→0.5/1100 and mote fog 0.75/1400→0.5/1400 (fog ÷1.5), plus `maxDist` 1900→2850 so the farther-reaching fog doesn't expose a hard horizon shelf.
+- `START_CLEARANCE` = 400 (spawn/reset altitude; user-tuned).
+
+### Verify — typecheck (standalone)
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/tsc --noEmit && echo OK
+```
+
+### Verify — run the sim, then open the bird page
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/vite
+```
+Then browse to http://localhost:5173/index-bird.html
+
+### Visual checklist (human eyeball — fly with mouse + Space)
+- [ ] FLAP CLIMB: hold Space → the bird climbs steadily and HOLDS the climb (airspeed doesn't bleed to a stall); release → back to the dive/zoom glide. `▲ FLAP` shows in the HUD, vario goes positive.
+- [ ] TAP = ONE BEAT: a single Space tap = one wingbeat — a small felt hop up, not nothing.
+- [ ] BOTH WINGS BEAT: you can SEE both wings flapping (no longer a static V).
+- [ ] ASYMMETRIC TURN: flap while steering hard → the OUTER wing visibly beats harder, banking/yawing into the turn (the "two wings, not unified" proof).
+- [ ] CLIMB TO TARGETS: you can now gain altitude to reach high/far beacons (flap up to them).
+- [ ] VIEW/FOG: the horizon sits ~50% farther out; no hard shelf/line at the far edge.
+- [ ] FPS ~60.
+
+### Tuning knobs
+- Flap feel (live, T panel): `beatLift` (climb strength), `beatThrust` (airspeed hold), `beatHz` (beat cadence).
+- Flap feel (code, `bird3d.ts` tuning defaults): `beatAmp` (visual amplitude), `flapAsym` (turn-from-asymmetry strength), `flapTurn` (yaw assist).
+- View/fog (`bird-main.ts` terrain config): `fogDensity` + `maxDist`; mote fog at the `wind.draw` call.
+
+### Machine verification done (2026-06-18)
+- `tsc --noEmit` clean (exit 0).
+- Live dev server serves changed assets: `bird3d.wgsl` 200 (new `ampL`/`ampR` uniform present), `bird3d.ts` 200, `bird-main.ts` 200.
+- NOT verified by machine: live WebGPU rendering / flap feel — human flight test required.
+
+## still-air glider basis + fly-to-target beacon
+**Date:** 2026-06-18
+**Commit:** (uncommitted — working tree on top of 99bfc9a, branch build/foundation)
+**Session:** 5b3183c3-54f2-4a41-99a5-7dc3551d3cd2 (still-air-glider-fly-to-target)
+
+### What changed
+- STILL-AIR FLAG (`gpu/bird3d.ts`): new public `bird.stillAir` (set true in `bird-main.ts`). When true, `integrate()` zeros the wind drift, ridge lift, thermal, and buffet/rock terms — the bird flies a dead-calm downhill glider (gravity + drag + pitch↔speed energy exchange + sink + control). `wind.ts` and the mote overlay are UNTOUCHED (they keep drifting as ambient atmosphere; the bird just ignores them). Set `stillAir = false` to restore the full soaring model.
+- SOFT GROUND RESET (`gpu/bird3d.ts`): new `resetAltitude(y)` — lifts the bird back to altitude + restores trim airspeed/forward velocity. Called from the loop when clearance drops to `minClearance + GROUND_RESET` so a downhill run continues instead of dead-skimming the deck.
+- FLIGHT TARGET (`gpu/target.ts` + `shaders/target.wgsl`, NEW): `Target` class — a world waypoint rendered as a camera-facing amber beam of light, drawn always-on-top (`depthCompare "always"`) so it stays visible behind ridges. `respawn()` places a fresh target 700–1000 m ahead within a ±0.35 rad cone; `checkReached()` is horizontal-distance only. HDR amber color (>1) so it blooms.
+- WIRING (`bird-main.ts`): instantiate Target; `bird.stillAir = true`; per-frame reach-detect → score + respawn and ground-reset; draw the beam after the bird; TARGET HUD line (distance / steer ◄►▲ / reached). Scripted pitch-wobble DISABLED (`__autoWobble = false`) so manual control is clean from frame 1. Constants `REACH_RADIUS=55`, `GROUND_RESET=3`.
+- Rendering kept entirely intact: terrain, wind motes, fluid, bloom, ground marker, compass, tuning panel all unchanged.
+
+### Verify — typecheck (standalone)
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/tsc --noEmit && echo OK
+```
+
+### Verify — run the sim, then open the bird page
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/vite
+```
+Then browse to http://localhost:5173/index-bird.html
+
+### Visual checklist (human eyeball — fly with the mouse)
+- [ ] STILL AIR: no buffet/jitter; HUD reads `wind: 0.0, 0.0` and `DRIFT 0°`; vario moves only with your own dive/zoom, not random gusts.
+- [ ] GLIDE FEEL: mouse-down = nose down, speed builds; mouse-up = zoom-climb then speed bleeds; centered cursor = gentle settling descent.
+- [ ] TARGET BEAM: an amber column stands in the distance, pulsing, visible even when a ridge is in front of it.
+- [ ] FLY TO IT: HUD `TARGET` distance counts down and `steer ◄/►/▲` points the way; within ~55 m `reached:` increments and a new beam appears ahead (you must turn for it).
+- [ ] GROUND RESET: glide all the way to the deck — at min-clearance you're lifted back to altitude and the run continues (no stuck skimming).
+- [ ] RENDERING INTACT: terrain ridgelines, drifting wind motes, bloom glow, plumb-line + ground diamond, compass — all still present.
+- [ ] MOTES vs BIRD: motes drift (ambient air) but the bird's path is NOT pushed by them (expected — dead air on the bird).
+- [ ] FPS ~60.
+
+### Tuning knobs (the by-feel pass)
+- Glide feel: `bird.tuning` live via the 'T' panel — `glideSpeed`, `sinkRate`, `divePower`, `dragK` (also `gravity`, `minSpeed`, `maxSpeed`).
+- Target: `BEAM_HEIGHT` / `BEAM_HALF_WIDTH` / `BEAM_COLOR` / `SPAWN_MIN` / `SPAWN_MAX` / `SPAWN_SPREAD` in `gpu/target.ts`; `REACH_RADIUS` / `GROUND_RESET` in `bird-main.ts`.
+- Undo the strip (wind back on): `bird.stillAir = false` in `bird-main.ts`.
+
+### Machine verification done (2026-06-18)
+- `tsc --noEmit` clean (exit 0).
+- Live dev server serves new assets: `target.wgsl` 200, `target.ts` 200, `index-bird.html` 200 (no 404; module transforms).
+- NOT verified by machine: live WebGPU rendering / flight feel (no browser harness this session) — human flight test required.
+
+## v17 — taller mountains, up-and-over wind, omnipresent air, camera-vs-mountain fix
+**Date:** 2026-06-17
+**Commit:** (uncommitted — working tree on top of 99bfc9a)
+**Session:** 2026-06-17 taller-terrain-wind-interplay
+
+### What changed
+- TALLER TERRAIN (`gpu/terrain.ts`, `shaders/terrain_ekg.wgsl`, `gpu/fluid-wind.ts` — 3 mirrors): `RELIEF 320→600`, `SHARP 1.6→1.8`. Dramatic peaks/valleys the bird threads between (was rolling dunes). All three fBm twins kept in lock-step.
+- WIND UP-AND-OVER + AROUND (`gpu/wind.ts`): `liftGain 0.3→0.6`, `deflect 0.85→0.45`, `relax 2.5→0.8`. Wind rides up windward faces and arcs over crests AND routes around peaks (was a flat low slither that vanished behind ridges). Anti-geyser keystone: new `W_CLAMP=12` clamps the per-mote vertical flow `w` in `flowAt` so steep faces (gradient ∝ RELIEF) lift into a visible arc instead of erupting.
+- OMNIPRESENT AIR (`gpu/wind.ts` + `shaders/wind.wgsl`): "it's air — always some wind, visible everywhere." `densityFloor 0.3→0.6` (calm air keeps ~60% of motes, never bare). Band concentrated (`clearance 40→30`, `vSpread 55→38`, `maxClear 260→200`) so motes aren't diluted across a tall column. Far-mote `count 2200→1600` for fps headroom. Shader brightness floor raised: `intensity = glow*(0.9+sp*1.2)` → `(1.6+sp*1.0)` so calm air READS instead of dimming below the bloom threshold.
+- BIRD DRIFT SYNCED (`gpu/bird3d.ts`): `deflect 0.25→0.45` to match the wind motes (the code comment demanded they match; they didn't — bird now drifts with the air you see).
+- CAMERA-VS-MOUNTAIN (`gpu/camera.ts` + `bird-main.ts`): chase eye now gets the terrain sampler and (1) PULLS IN along the boom until the view clears terrain, (2) FLOORS above terrain at its XZ, (3) post-lerp backstop. Fixes the fully-black screen when running into a mountain (the taller RELIEF embedded the eye in peaks).
+- `nearCount` left at 800 (bird-main override, your QOL-pass value — untouched).
+
+### Verify — typecheck (standalone)
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/tsc --noEmit && echo OK
+```
+
+### Verify — run the sim, then open the bird page
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/vite
+```
+Then browse to http://localhost:5173/index-bird.html
+
+### Visual checklist (human eyeball — fly with the mouse)
+- [ ] TERRAIN: peaks are tall and dramatic with deep valleys (not rolling hills); the bird flies among/between mountains, not just on top.
+- [ ] AIR EVERYWHERE: wind is visible across the WHOLE frame at any altitude — never bare patches, even in calm air; dense legible cloud around the bird.
+- [ ] UP-AND-OVER: motes ride up windward faces and arc over crests; near steep peaks the flow also bends around them. No vertical geyser/fountain eruptions.
+- [ ] NOTHING CLIPS: wind motes and the bird stay above the terrain surface (never sink through it).
+- [ ] RUN INTO A MOUNTAIN: dive the nose down (mouse to bottom) straight into a slope — the screen must NOT go fully black; you stay looking at the bird against the mountain.
+- [ ] FPS: overlay holds ~60 throughout.
+
+### Measured results (2026-06-17, headless WebGPU autopilot + forced-dive capture)
+- fps: 60 held across autopilot flight AND a forced nose-down dive to the terrain (clearance floored at 6 m).
+- Air visible everywhere at clearance 63-70 m (dense bright field over the ridges); taller relief confirmed in-frame.
+- Forced dive to clearance 6 m (pinned to a steep slope) renders terrain+wind — NO black frame (camera-collision fix verified). Bird floored at minClearance (never passed into terrain).
+- Typecheck clean. Zero pageerrors.
+- Tuning knobs: wind `liftGain`/`deflect`/`relax`/`densityFloor`/`clearance`/`vSpread`/`maxClear` + `W_CLAMP` (vertical clamp) in the `Wind` ctor defaults; shader brightness `(1.6 + sp*1.0)` in `wind.wgsl` fs; camera `eyeMargin` (clearance the eye keeps from terrain) in `camera.ts`.
+
+## QOL pass — mouse-leave autopilot, graduated terrain, halved near-sphere, bird wake
+**Date:** 2026-06-17
+**Commit:** (uncommitted — branch build/foundation)
+**Session:** 2026-06-17 mouse-leave-autopilot QOL
+
+### What changed
+- MOUSE-LEAVE AUTOPILOT (`bird-main.ts`): cursor leaving the viewport (`document` mouseleave) sets `autopilot = true`; any canvas mousemove sets it back to `false` (manual). `P` still toggles either way.
+- GRADUATED TERRAIN (`gpu/terrain.ts` + `bird-main.ts`): DENSE near band + far spread. `rowSpacing` (4.5 m) holds the FULL original density out to `nearDenseDepth` (500 m) so the foreground is unchanged; beyond it the step grows linearly (`farSpread` 220 m per +4.5 m). Row depths are precomputed by walking rowStart→maxDist; SAME horizon. Result: 4.5 m spacing at 0/250/500 m (identical to original), 14.7 m at 1000 m, 31.2 m at the horizon — **244 rows vs 456**, the cut entirely in the far field. Defaults (nearDenseDepth 0, farSpread ∞) reproduce uniform spacing exactly. One shared `rowDepthAt(r)` feeds both the line and fill-curtain loops so occlusion can't desync. (Supersedes a first geometric `rowSpacingGrowth` attempt that compounded from behind the camera and thinned the foreground — "too sparse up close".)
+- DISTANCE FOG −25% (`bird-main.ts`): terrain fog `1/1100 → 0.75/1100` (= 1/1467) and wind-mote fog `1/1400 → 0.75/1400`, kept coupled — the sparser far rows + motes read deeper before dissolving into haze. Raise the `0.75` factors toward 1 for more fog.
+- NEAR WIND SPHERE (`bird-main.ts`): `nearCount` 1600 → 800 → 400 (fewer particles).
+- BIRD WAKE — VISUALS ONLY (`gpu/wind.ts` + `bird-main.ts`): inside the near sphere the bird now stirs the air it flies through — bow-wave push outward AHEAD + drag/swirl slipstream BEHIND, scaled by bird speed, falling to 0 at the ball edge. Added ONLY to the near-mote advection + their tails (and the speed-tint, so stirred air brightens). `windAt` / flight physics are UNTOUCHED (frozen). New gains `bowGain`/`wakeGain`/`swirlGain` (0 disables). `bird.vel` is now threaded into `wind.draw` to orient the stir.
+
+### Verify — typecheck (standalone)
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/tsc --noEmit && echo OK
+```
+
+### Verify — run the sim (standalone), then open the bird page
+```
+cd /Users/god/projects/ai-jank/vector-system && ./node_modules/.bin/vite
+```
+Then browse to http://localhost:5173/index-bird.html
+
+### Visual checklist (human eyeball — fly with the mouse)
+- [ ] TERRAIN: close-up ridgelines are dense and crisp; lines spread progressively farther apart toward the horizon; the far horizon is in the SAME place as before (not pulled in).
+- [ ] NEAR SPHERE: the dense ball of little comets around the bird is about half as thick as before (still legible).
+- [ ] BIRD WAKE: while gliding, motes part/push outward just AHEAD of the bird (bow wave) and drag + swirl in a slipstream just BEHIND it; stirred air reads brighter. Bank into a turn — the wake reorients to follow the new heading.
+- [ ] WAKE IS LOCAL: only the near sphere is disturbed; the far streamlines and the bird's actual drift/crab (compass: cyan heading vs yellow ground-track gap) are unchanged (physics frozen).
+
+### Verify — mouse-leave autopilot (human)
+- [ ] Move the cursor OFF the browser window → the top overlay line flips to `AUTO: <mode>` and the bird flies itself (climbs/avoids ground hands-off).
+- [ ] Move the cursor back over the canvas and wiggle → the overlay returns to `MANUAL (P=autopilot)` and you steer again.
+- [ ] `P` still toggles autopilot manually regardless of the mouse.
+
+### Measured results (2026-06-17, headless WebGPU boot-check)
+- fps: 60 held with graduated terrain + halved sphere + bird-wake all active (no perf regression).
+- mouse-leave → overlay `AUTO: ENERGY`; mouse-move → overlay `MANUAL`. Fluid window still stepping. Zero pageerrors / console errors. Typecheck clean.
+- WAKE LEGIBILITY FIX (2026-06-17): first wake was invisible — squared falloff × an `along/R` directional weight peaked at ~15% of gain, so the stir was ~1-2 m/s against ~10 m/s ambient wind. Fixed: SATURATING ahead/behind weights (reach full strength within 35% of the ball radius) + LINEAR falloff, gains raised to `bowGain` 0.9 / `wakeGain` 0.75 / `swirlGain` 1.2. Peak stir now ~20 m/s swirl / ~15 m/s bow ≈ 2× ambient → the wake dominates the local flow. 60fps held.
+- WAKE v2 — CURLING TAILS + PUSH/TRAIL REBALANCE (2026-06-17): user read v1 as "just spirals". Extracted `birdWakeAt()` (per-point wake velocity) and made the near tail RE-SAMPLE the disturbed flow per segment (4 segments now) so tails CURVE along the wake instead of straight streaks. Rebalanced so bow (push-aside ~15 m/s) + drag (trailing slipstream ~13 m/s) LEAD and swirl dropped 1.2 → 0.7 (~12 m/s) — reads as part+trail, not a pinwheel. `nearCount` 800 → 400. 60fps held (4/4 samples).
+- NOTE: tuning knobs — wake character: `swirlGain` → 0 = pure push+trail (no rotation), raise for more tumble; all three (`bowGain`/`wakeGain`/`swirlGain`) → 0 disables the wake entirely; `nearSegStep`/`nearSegments` lengthen/smooth the curl. Terrain declutter — raise `nearDenseDepth` (denser/deeper crisp foreground) or lower `farSpread` (sparser far).
+
 ## Bird 3D v15 (world-pinned fluid window + terrain coupling)
 **Date:** 2026-06-13
 **Commit:** fda3f2f

@@ -11,11 +11,15 @@
 struct Uniforms {
   viewProj : mat4x4<f32>,
   pos : vec3<f32>,        // bird world position
-  flexPhase : f32,        // time * flexHz (radians) — subtle living flex, NOT a flap beat
+  flexPhase : f32,        // idle living-flex phase (radians) — subtle, NOT a flap beat
   heading : f32,          // yaw about +Y (atan2 forward.x, forward.z)
   bank : f32,             // roll about local +Z (banks into turns)
-  flexHz : f32,           // unused in shader (kept for parity)
-  flexAmp : f32,          // subtle flex angle (radians) — wings held OUT, no flap cycle
+  flexAmp : f32,          // idle flex amplitude (radians) — small living wobble
+  flapPhase : f32,        // POWERED beat phase 0..PI during a downstroke (0 when idle)
+  ampL : f32,             // LEFT wing beat amplitude this frame (rad) — independent of right
+  ampR : f32,             // RIGHT wing beat amplitude this frame (rad)
+  pitch : f32,            // nose attitude (rad), + = nose up — tilts the WHOLE model (climb/dive)
+  pad1 : f32,
 };
 
 @group(0) @binding(0) var<uniform> U : Uniforms;
@@ -34,6 +38,10 @@ fn rotY(a : f32) -> mat3x3<f32> {
   let c = cos(a); let s = sin(a);
   return mat3x3<f32>(vec3<f32>(c, 0.0, -s), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(s, 0.0, c));
 }
+fn rotX(a : f32) -> mat3x3<f32> { // + a = nose up: +Z (forward) tilts toward +Y
+  let c = cos(a); let s = sin(a);
+  return mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, c, -s), vec3<f32>(0.0, s, c));
+}
 
 // Per-vertex attributes:
 //   loc0 = local position (span x, 0, chord z) in meters
@@ -47,19 +55,24 @@ fn vs(@location(0) local : vec3<f32>, @location(1) attr : vec3<f32>) -> VSOut {
 
   var p = local;
 
-  // GLIDE, NO FLAP: wings held OUT. A SUBTLE flex about local forward (Z) reads as a living
-  // glide, not a flap beat. Tip lags by phase ∝ |spanFrac| so the flex feels organic.
+  // IDLE FLEX + POWERED FLAP. The subtle flex (flexAmp) reads as a living glide; the beat (per-wing
+  // ampL/ampR, NOT one shared amplitude) is the powered downstroke. Tip lags by phase ∝ |spanFrac| so
+  // both feel organic. ampL≠ampR (steering) makes the two wings beat asymmetrically — visibly.
   if (isWing > 0.5) {
-    let lag = abs(spanFrac) * 1.4;                 // wingtip phase offset
-    let flex = sin(U.flexPhase - lag) * U.flexAmp; // tiny dihedral wobble (flexAmp small)
-    // both wings flex together: rotate +span up, -span up → sign by side, magnitude by |span|.
-    let ang = flex * sign(spanFrac);
+    let lag = abs(spanFrac) * 1.4;                    // wingtip phase offset
+    let flex = sin(U.flexPhase - lag) * U.flexAmp;    // idle living wobble
+    let amp = select(U.ampR, U.ampL, spanFrac < 0.0); // LEFT (span<0) → ampL, RIGHT → ampR
+    let beat = sin(U.flapPhase - lag) * amp;          // powered per-wing downstroke
+    // dihedral rotation about forward (Z): magnitude per side, sign by side → wings beat up/down.
+    let ang = (flex + beat) * sign(spanFrac);
     p = rotZ(ang) * p;
   }
 
-  // Model: bank (roll about forward Z) → yaw (heading about Y) → translate.
+  // Model: bank (roll about forward Z) → pitch (nose up/down about right X) → yaw (heading about Y)
+  // → translate. Pitch tilts the whole V so a climb noses up and a dive noses down.
   let rolled = rotZ(U.bank) * p;
-  let yawed = rotY(U.heading) * rolled;
+  let pitched = rotX(U.pitch) * rolled;
+  let yawed = rotY(U.heading) * pitched;
   let world = yawed + U.pos;
 
   out.clip = U.viewProj * vec4<f32>(world, 1.0);
