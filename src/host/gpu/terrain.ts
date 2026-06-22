@@ -237,18 +237,25 @@ export class TerrainEKG {
     });
   }
 
-  // TS mirror of the WGSL fBm — CPU height reference for the bird ridge-lift.
-  private hash2(px: number, py: number): number {
-    const s = Math.sin(px * 127.1 + py * 311.7) * 43758.5453;
-    return s - Math.floor(s);
+  // TS mirror of the WGSL fBm — CPU height reference the bird COLLIDES against. The hash must be
+  // bit-identical to the GPU's, or the bird crashes into invisible terrain. The old fract(sin()*N)
+  // hash could NOT be mirrored: the *43758 amplifies the f32(GPU)-vs-f64(JS) sin difference into a
+  // totally different field (measured: ~100 m mean, 460 m max disagreement on a 600 m relief).
+  // An integer lattice hash uses only exact uint32 ops, so GPU and CPU agree to <1 mm.
+  // MUST stay identical to ihash() in terrain_ekg.wgsl / terrain_grid.wgsl / trees_ground.wgsl.
+  private ihash(ix: number, iy: number): number {
+    let h = (Math.imul(ix | 0, 374761393) + Math.imul(iy | 0, 668265263)) >>> 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177) >>> 0;
+    h = (h ^ (h >>> 16)) >>> 0;
+    return h / 4294967295;
   }
   private valueNoise(px: number, py: number): number {
     const ix = Math.floor(px), iy = Math.floor(py);
     const fx = px - ix, fy = py - iy;
-    const a = this.hash2(ix, iy);
-    const b = this.hash2(ix + 1, iy);
-    const c = this.hash2(ix, iy + 1);
-    const d = this.hash2(ix + 1, iy + 1);
+    const a = this.ihash(ix, iy);
+    const b = this.ihash(ix + 1, iy);
+    const c = this.ihash(ix, iy + 1);
+    const d = this.ihash(ix + 1, iy + 1);
     const ux = fx * fx * (3 - 2 * fx);
     const uy = fy * fy * (3 - 2 * fy);
     const mx0 = a + (b - a) * ux;

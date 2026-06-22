@@ -12,11 +12,18 @@ const TERRACES: f32 = 5.0;
 const RISER_POW: f32 = 4.0;
 const CLIFF_MIX: f32 = 0.65;
 
-fn hash2(p: vec2<f32>) -> f32 { return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453); }
+// Integer lattice hash — MUST stay bit-identical to ihash() in terrain.ts / terrain_ekg.wgsl
+// so trees sit on the SAME ground the bird collides with (old sin-hash diverged f32-vs-f64).
+fn ihash(c: vec2<i32>) -> f32 {
+  var h: u32 = bitcast<u32>(c.x) * 374761393u + bitcast<u32>(c.y) * 668265263u;
+  h = (h ^ (h >> 13u)) * 1274126177u;
+  h = h ^ (h >> 16u);
+  return f32(h) / 4294967295.0;
+}
 fn valueNoise(p: vec2<f32>) -> f32 {
-  let i = floor(p); let f = fract(p);
-  let a = hash2(i); let b = hash2(i + vec2<f32>(1.0, 0.0));
-  let c = hash2(i + vec2<f32>(0.0, 1.0)); let d = hash2(i + vec2<f32>(1.0, 1.0));
+  let pf = floor(p); let ci = vec2<i32>(pf); let f = p - pf;
+  let a = ihash(ci); let b = ihash(ci + vec2<i32>(1, 0));
+  let c = ihash(ci + vec2<i32>(0, 1)); let d = ihash(ci + vec2<i32>(1, 1));
   let uu = f * f * (3.0 - 2.0 * f);
   return mix(mix(a, b, uu.x), mix(c, d, uu.x), uu.y);
 }
