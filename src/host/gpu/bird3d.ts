@@ -34,7 +34,8 @@ export interface BirdTuning {
   minSpeed?: number;     // stall floor (m/s)
   maxSpeed?: number;     // dive ceiling (m/s)
   dragK?: number;        // per-second relaxation of airspeed toward trim
-  divePower?: number;    // scale on gravity-along-path energy exchange (dive↔zoom)
+  divePower?: number;    // scale on gravity-along-path when DIVING (nose down) — dive acceleration
+  climbPower?: number;   // scale on gravity-along-path when CLIMBING (nose up) — ~1 conserves energy (swoosh)
   gravity?: number;      // m/s^2 — only enters via sin(pitch) energy exchange + sink
   sinkRate?: number;     // base sink at trim speed (m/s); scales (trim/speed)^2 when slow
   windGain?: number;     // analytic wind push scale
@@ -88,7 +89,13 @@ export class Bird3D {
   heading = 0;   // yaw, +Z forward at 0
   pitch = 0;     // radians, + = nose up
   bank = 0;      // roll, banks into turns
-  renderBank = 0; // bank actually drawn: steering bank + crab lean + buffet rock (visual only)
+  renderBank = 0; // bank actually drawn: steering bank + crab lean + buffet rock + stall wing-drop (visual only)
+  renderPitch = 0; // pitch actually drawn: control attitude + a gentle nose-up while climbing (visual only)
+  stallYaw = 0;    // stall departure: signed wing-drop direction (-1..1), 0 when flying
+  tumbleRoll = 0;  // crash tumble: extra roll angle (rad) from a terrain hit — winds up then settles
+  tumblePitch = 0; // crash tumble: extra pitch angle (rad) from a terrain hit
+  private tumbleRollVel = 0;  // crash tumble angular velocity (rad/s), decays
+  private tumblePitchVel = 0;
   // STILL_AIR: dead-calm airframe basis — when true the bird ignores wind drift, ridge lift, thermal,
   // and buffet/rock. The wind.ts field + motes keep evolving (rendering untouched); the BIRD just flies
   // through dead air. This is the hook to re-introduce wind as "flair" later — set false to restore the
@@ -137,11 +144,12 @@ export class Bird3D {
     this.tuning = {
       glideSpeed: t.glideSpeed ?? 26,
       minSpeed: t.minSpeed ?? 13,
-      maxSpeed: t.maxSpeed ?? 70,  // headroom so a committed dive keeps gaining (was 55 — capped early)
-      dragK: t.dragK ?? 0.2,       // low bleed: dive speed HOLDS through the swoop (feeds the zoom)
-      divePower: t.divePower ?? 2.0, // STRONG gravity dive — nose-down alone screams (no flap needed)
+      maxSpeed: t.maxSpeed ?? 120, // v18: big dive headroom (70→120) — a committed dive KEEPS accelerating instead of pinning at the cap
+      dragK: t.dragK ?? 0.1,       // v18: low bleed (dialed in by feel) — dive speed HOLDS through the swoop, feeding big zooms
+      divePower: t.divePower ?? 2.4, // v18: STRONG nose-down dive — accelerates hard, no flap needed
+      climbPower: t.climbPower ?? 1.0, // v18: energy-CONSERVING zoom — the dive's speed carries up into a swoosh (was symmetric 2.4 = heavy climb)
       gravity: t.gravity ?? 9.0,
-      sinkRate: t.sinkRate ?? 1.0,   // v14: gentler sink (1.4→1.0) — glide efficiently, more time to find lift
+      sinkRate: t.sinkRate ?? 0.8,   // v18: floatier (1.0→0.8) → ~32:1 glide, long hang time between energy trades
       windGain: t.windGain ?? 1.6,  // multiplier on the shared windAt field (CRANKED)
       windDrift: t.windDrift ?? 1.0, // fraction of horizontal wind the glider drifts with
       liftGain: t.liftGain ?? 3.5,   // v14: stronger ridge lift (2.5→3.5) — soaring the windward ridges sustains you
@@ -256,8 +264,14 @@ export class Bird3D {
     this.heading += input.yawRate * clamped * (stalled ? 0.35 : 1) * stumble; // mush in stall/crash
     let pitchGoal = Math.max(-1.0, Math.min(1.0, input.pitchTarget)); // ±~57° — steep dives/climbs
     if (stalled) {
-      const breakPitch = -0.35 - 0.35 * stallDepth;   // nose drops harder the deeper the stall
-      pitchGoal = Math.min(pitchGoal, breakPitch);     // can't hold the nose up past the break
+      // SOFT STALL (landing-flare feel): the wing MUSHES, it does not depart. The nose sags only gently so
+      // you can hold it high and SETTLE, the airframe sinks softly (below), and a faint lean hints the mush.
+      // No wing-drop, no uncommanded yaw — coordinated and controllable; ease off or dive to fly out.
+      const breakPitch = -0.05 - 0.18 * stallDepth;   // nose SAGS gently the deeper the stall (was a hard break)
+      pitchGoal = Math.min(pitchGoal, breakPitch);     // mush — don't slam the nose down
+      this.stallYaw = Math.sign(this.bank || 1) * stallDepth; // gentle visual lean only — NO heading kick
+    } else {
+      this.stallYaw = 0;
     }
     this.pitch += (pitchGoal - this.pitch) * Math.min(1, clamped * (stalled ? 6 : 3.5)); // snappier break
     const targetBank = -input.yawRate * 0.5; // roll into the turn
@@ -303,8 +317,13 @@ export class Bird3D {
     // pitch down → speed builds; pull up → speed bleeds into climb (zoom). Drag only bleeds
     // speed ABOVE trim (parasitic): a pure glider gets no free thrust back toward trim —
     // speed lost to a climb is recovered only by diving. This is the soaring energy contract.
+    // ASYMMETRIC dive↔zoom: a DIVE (nose down, sin<0) accelerates hard (divePower); a CLIMB (nose up,
+    // sin>0) bleeds speed only gently (climbPower ≈ energy-conserving) so the dive's speed CARRIES UP into
+    // a long swoosh instead of feeling heavy. divePower > climbPower = punchy dives + floaty zoom-climbs.
+    const pitchSin = Math.sin(this.pitch);
+    const energyK = pitchSin < 0 ? T.divePower : T.climbPower;
     this.speed +=
-      (-T.gravity * Math.sin(this.pitch) * T.divePower -
+      (-T.gravity * pitchSin * energyK -
         T.dragK * Math.max(0, this.speed - T.glideSpeed) +
         flapThrust) * // POWERED FLAP adds forward thrust so a climb holds airspeed (no stall-out)
       clamped;
@@ -346,7 +365,9 @@ export class Bird3D {
 
     // --- sink: minimal at trim, mushes CUBICALLY when slow — at minSpeed full-nose-up the
     // sink exceeds sin(pitch)*speed, so a stalled climb falls instead of levitating ---
-    const sink = Math.min(SINK_CAP, T.sinkRate * (T.glideSpeed / this.speed) ** 3);
+    const sink =
+      Math.min(SINK_CAP, T.sinkRate * (T.glideSpeed / this.speed) ** 3) +
+      (stalled ? T.sinkRate * stallDepth * 0.6 : 0); // STALL: a GENTLE settle (flare-soft mush, not a drop)
 
     // --- compose TARGET velocity: flight path + horizontal wind drift + ridge updraft − sink ---
     const tvx = dir[0] * this.speed + wx * T.windDrift;
@@ -399,6 +420,13 @@ export class Bird3D {
         // CRASH — hit too hard: dump most of the airspeed + start the stumble (degraded steering).
         this.speed = Math.max(STALL_FLOOR, this.speed * (1 - T.crashBleed));
         this.crashT = T.crashTime;
+        // UNCOMFORTABLE TUMBLE: the hit throws the bird into a disorienting roll+pitch lurch that winds up
+        // and then settles back to level (integrated below). Harder hit → more violent. Direction follows
+        // the current lean so it reads like the ground tripped the low wing.
+        const hit = Math.min(2.2, impactRate / T.crashSpeed); // 1 .. ~2.2 severity
+        const dirR = this.renderBank >= 0 ? 1 : -1;
+        this.tumbleRollVel = dirR * (7 + 7 * hit);   // ~14 .. 22 rad/s — a violent roll
+        this.tumblePitchVel = -(4 + 4 * hit);        // nose pitches down into the deck
       }
       if (this.vel[1] < 0) this.vel[1] = 0; // ride the contour (no into-ground velocity)
     }
@@ -412,6 +440,16 @@ export class Bird3D {
     // heading — this is the felt-wind proof (overlay compares heading vs ground-track).
     this.lastGroundTrack = Math.atan2(cvx, cvz);
 
+    // --- crash TUMBLE integrator: a terrain hit injects roll/pitch angular velocity (above); here it winds
+    // the angle up then eases everything back to level. Velocity bleeds fast (~0.25 s) and the angle returns
+    // (~0.5 s), so the bird rolls hard and disorientingly, then recovers. Visual only (no physics kick). ---
+    this.tumbleRoll += this.tumbleRollVel * clamped;
+    this.tumblePitch += this.tumblePitchVel * clamped;
+    this.tumbleRollVel *= Math.exp(-clamped / 0.25);
+    this.tumblePitchVel *= Math.exp(-clamped / 0.25);
+    this.tumbleRoll *= Math.exp(-clamped / 0.5);
+    this.tumblePitch *= Math.exp(-clamped / 0.5);
+
     // --- render-bank: steady CRAB lean into the cross-wind + buffet ROCK (visual only, no physics) ---
     // Steady DC lean: cross-wind component (wind projected onto heading-right) tips the V into the
     // breeze, like a glider crabbing. Proportional, capped, so it's a visible steady offset (not a wobble).
@@ -419,8 +457,15 @@ export class Bird3D {
     const crab = Math.max(-0.18, Math.min(0.18, crossWind * 0.012)); // ~±10° cap, leans with the gust DC
     // Buffet ROCK: fast roll oscillation ±~0.12 rad (~7°) so the V visibly rolls back and forth.
     const rock = this.stillAir ? 0 : (0.6 * g1 - 0.4 * g3) * 0.12;
-    this.renderBank = this.bank + crab + rock + flapBank; // + flap-asymmetry bank
+    const stallRoll = this.stallYaw * 0.15; // stall: a FAINT settling lean (flare mush, not a wing-drop)
+    this.renderBank = this.bank + crab + rock + flapBank + stallRoll + this.tumbleRoll; // + crash tumble
     if (typeof window !== "undefined") (window as any).__birdBank = this.renderBank;
+
+    // --- render-pitch: a gentle nose-UP while actually CLIMBING (vario > 0), mirroring the way a dive
+    // already noses down via control pitch. Tied to real vertical speed so ridge-lift / zoom / flap climbs
+    // show attitude too, not just stick-commanded ones. Visual only, clamped small ("a little"). ---
+    const climbTilt = Math.min(0.30, Math.max(0, this.vel[1]) * 0.045); // rad per m/s up, cap ~17°
+    this.renderPitch = this.pitch + climbTilt + this.tumblePitch; // + crash tumble lurch
   }
 
   // soft reset for the downhill glide: lift back to world-y `y`, restore trim airspeed and a clean
@@ -449,7 +494,7 @@ export class Bird3D {
     u[23] = this.flapBeatPhase;  // powered beat phase 0..PI (0 when idle)
     u[24] = this.ampL;           // LEFT wing beat amplitude (independent of right)
     u[25] = this.ampR;           // RIGHT wing beat amplitude
-    u[26] = this.pitch;          // nose attitude → tilts the whole model (climb noses up, dive noses down)
+    u[26] = this.renderPitch;    // nose attitude → tilts the whole model (climb noses up, dive noses down)
     this.device.queue.writeBuffer(this.ubuf, 0, this.uniformHost);
 
     // SECOND pass: LOAD terrain color+depth (no clear) so the bird composites over the ridges
@@ -474,51 +519,77 @@ export class Bird3D {
 // Local frame: +X right, +Y up, +Z forward (heading). Wings sweep back (-Z) toward the tips.
 function buildVMesh(): number[] {
   const verts: number[] = [];
-  // v6: halved vs v5 (SPAN 18→9 etc.) — a SMALL glider dwarfed by the ~120 m ridge relief. Same V
-  // shape, just smaller; the chase camera is pulled in proportionally (camera.ts followDist/Height)
-  // so it stays a clear readable V while the terrain dominates the frame.
-  const SPAN = 9;      // half-wingspan (m) → ~18 m tip-to-tip
-  const SWEEP = 3;     // how far back the tip sits (-Z)
+  // v6: halved vs v5 (SPAN 18→9 etc.) — a SMALL glider dwarfed by the ~120 m ridge relief. The chase
+  // camera is pulled in proportionally (camera.ts followDist/Height) so it stays readable while the
+  // terrain dominates. v18: SOLID triangular body (no longer a flat paper sheet) + gently CURVED wings.
+  const SPAN = 9;       // half-wingspan (m) → ~18 m tip-to-tip
+  const SWEEP = 3.2;    // how far back the tip sits (-Z) at full span — now reached on a CURVE
   const DIHEDRAL = 4.5; // tip rise (m) at full span → clear static gliding V
-  const RIBBON = 1.7;  // ribbon half-width (m) — neon, not a hairline
+  const RIBBON = 1.7;   // wing chord half-width at the ROOT (m); tapers toward the tip
   const BODY_LEN = 5.5; // body spine length (m)
-  const BODY_W = 1.0;
 
-  // push a quad (two tris) as a ribbon between two centerline points pA,pB.
-  // attr = (signed spanFrac, wingFlag, edgeFrac); edgeFrac 0/1 marks ribbon edges.
+  // wing ribbon quad (two tris) between centerline points pA,pB, width along `axis`, tapering halfWA→halfWB.
+  // attr = (signed spanFrac, wingFlag 1, edgeFrac 0/1 at the ribbon edges → line-like spine in the shader).
   const quad = (
-    pA: Vec3, pB: Vec3, halfW: number, axis: Vec3,
-    spanA: number, spanB: number, wing: number
+    pA: Vec3, pB: Vec3, halfWA: number, halfWB: number, axis: Vec3,
+    spanA: number, spanB: number
   ) => {
-    const a0: Vec3 = [pA[0] - axis[0] * halfW, pA[1] - axis[1] * halfW, pA[2] - axis[2] * halfW];
-    const a1: Vec3 = [pA[0] + axis[0] * halfW, pA[1] + axis[1] * halfW, pA[2] + axis[2] * halfW];
-    const b0: Vec3 = [pB[0] - axis[0] * halfW, pB[1] - axis[1] * halfW, pB[2] - axis[2] * halfW];
-    const b1: Vec3 = [pB[0] + axis[0] * halfW, pB[1] + axis[1] * halfW, pB[2] + axis[2] * halfW];
-    const v = (p: Vec3, span: number, edge: number) =>
-      verts.push(p[0], p[1], p[2], span, wing, edge);
-    // tri 1: a0,a1,b0   tri 2: b0,a1,b1
+    const off = (p: Vec3, hw: number, s: number): Vec3 =>
+      [p[0] + axis[0] * hw * s, p[1] + axis[1] * hw * s, p[2] + axis[2] * hw * s];
+    const a0 = off(pA, halfWA, -1), a1 = off(pA, halfWA, 1);
+    const b0 = off(pB, halfWB, -1), b1 = off(pB, halfWB, 1);
+    const v = (p: Vec3, span: number, edge: number) => verts.push(p[0], p[1], p[2], span, 1, edge);
     v(a0, spanA, 0); v(a1, spanA, 1); v(b0, spanB, 0);
     v(b0, spanB, 0); v(a1, spanA, 1); v(b1, spanB, 1);
   };
 
-  // --- body spine ribbon (along Z), spanFrac 0, wing flag 0 ---
-  quad([0, 0, BODY_LEN * 0.5], [0, 0, -BODY_LEN * 0.5], BODY_W, [1, 0, 0], 0, 0, 0);
+  // solid-body facet: a flat triangle a,b,c — spanFrac 0 (teal core) / wing flag 0 (no flap). `shade`
+  // rides the edgeFrac→brightness path in the shader so each face gets a constant tone: a faked top-light
+  // (right-upper brightest, left-upper mid, belly dim) that makes the facets read as 3D VOLUME, not paper.
+  const facet = (a: Vec3, b: Vec3, c: Vec3, shade: number) => {
+    verts.push(a[0], a[1], a[2], 0, 0, shade);
+    verts.push(b[0], b[1], b[2], 0, 0, shade);
+    verts.push(c[0], c[1], c[2], 0, 0, shade);
+  };
 
-  // --- each wing: a swept ribbon from root (near body) to tip; subdivided so flap bends it ---
-  const SEGS = 4;
+  // --- SOLID BODY: a faceted spindle with a TRAPEZOID cross-section (apex cut off) — a wide flat top and a
+  // narrower flat bottom, reading like a rounded bird torso rather than a sharp triangle. The mid quad
+  // tapers to a NOSE (+Z, forward) and TAIL (−Z) point. Eight facets = a closed volume. ---
+  const BW = 1.05;  // top-edge half-width (m) — the wide flat back
+  const BWb = 0.6;  // bottom-edge half-width (m) — narrower flat belly (trapezoid)
+  const BT = 0.55;  // top rise above the spine (m)
+  const BH = 0.95;  // belly drop below the spine (m)
+  const TL: Vec3 = [-BW, BT, 0];                   // top-left corner (mid)
+  const TR: Vec3 = [ BW, BT, 0];                   // top-right corner (mid)
+  const BL: Vec3 = [-BWb, -BH, 0];                 // bottom-left corner (mid)
+  const BR: Vec3 = [ BWb, -BH, 0];                 // bottom-right corner (mid)
+  const N:  Vec3 = [0, 0.0,  BODY_LEN * 0.62];     // nose point (front)
+  const Tl: Vec3 = [0, 0.1, -BODY_LEN * 0.55];     // tail point (back)
+  const TOP = 0.5, SIDE_R = 0.20, SIDE_L = 0.12, BOTTOM = 0.04; // per-face tones (see `facet`)
+  facet(N, TL, TR, TOP);    facet(Tl, TR, TL, TOP);    // flat TOP face (front, back) — catches the light
+  facet(N, TR, BR, SIDE_R); facet(Tl, BR, TR, SIDE_R); // right side
+  facet(N, BL, TL, SIDE_L); facet(Tl, TL, BL, SIDE_L); // left side
+  facet(N, BR, BL, BOTTOM); facet(Tl, BL, BR, BOTTOM); // flat BOTTOM face (belly) — darkest
+
+  // --- CURVED WINGS: swept ribbon root→tip. Sweep & dihedral follow a gentle power CURVE (not a straight
+  // line), the chord TAPERS toward the tip, and the tip CURLS up a touch — an organic gull wing. More
+  // segments so the curve is smooth; the shader still flaps it per-vertex by spanFrac. ---
+  const SEGS = 6;
   for (const side of [-1, 1]) {
     let prev: Vec3 = [0, 0, 0];
     let prevSpan = 0;
+    let prevW = RIBBON;
     for (let i = 1; i <= SEGS; i++) {
       const f = i / SEGS;
       const x = side * SPAN * f;
-      const z = -SWEEP * f;           // sweep back toward tip
-      const y = DIHEDRAL * f;         // base dihedral rise → static V even mid-flap
+      const z = -SWEEP * Math.pow(f, 1.5);                          // curved leading-edge sweep
+      const y = DIHEDRAL * Math.pow(f, 1.35) + 0.6 * Math.pow(f, 3); // gull dihedral + tip up-curl
       const cur: Vec3 = [x, y, z];
-      const span = side * f;          // signed spanFrac -1..1
-      // ribbon width axis = forward (Z): gives the swept wing a flat chord facing the camera.
-      quad(prev, cur, RIBBON, [0, 0, 1], prevSpan, span, 1);
-      prev = cur; prevSpan = span;
+      const span = side * f;                                         // signed spanFrac -1..1
+      const w = RIBBON * (1 - 0.55 * f);                             // chord tapers toward the tip
+      // ribbon width axis = forward (Z): a flat chord facing the camera, narrowing to the tip.
+      quad(prev, cur, prevW, w, [0, 0, 1], prevSpan, span);
+      prev = cur; prevSpan = span; prevW = w;
     }
   }
 

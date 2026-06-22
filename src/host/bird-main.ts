@@ -32,6 +32,7 @@ import { GroundMarker } from "./gpu/marker";
 import { Target } from "./gpu/target";
 import { Trees } from "./gpu/trees";
 import { ChaseCamera } from "./gpu/camera";
+import { checkTerrain } from "./gpu/terrain-selfcheck";
 import { AutoPilot } from "./autopilot";
 import { Bloom } from "./gpu/bloom";
 import { perspective, multiply } from "./gpu/mat4";
@@ -318,31 +319,41 @@ async function boot() {
     mouseY = 0;
   let flapHeld = false; // Space held → powered wingbeat (tap = one beat, hold = sustained climb)
 
-  // MOUSE-LEAVE AUTOPILOT (QOL): the cursor leaving the viewport ("off the screen") hands the bird to the
-  // autopilot; any mouse movement back inside grabs the controls straight back (manual). 'P' still toggles.
+  // STICKY AUTOPILOT: 'P' toggles autopilot and it HOLDS regardless of mouse motion — so you can press P
+  // and move the cursor out of the window to walk away without the bird veering off. Mouse movement updates
+  // the steering origin but does NOT cancel autopilot; take manual control back with an EXPLICIT gesture
+  // (click the canvas, or press P again).
   canvas.addEventListener("mousemove", (e) => {
     const r = canvas.getBoundingClientRect();
     mouseX = ((e.clientX - r.left) / r.width) * 2 - 1; // -1..1
     mouseY = ((e.clientY - r.top) / r.height) * 2 - 1; // -1..1
-    autopilot = false; // you moved the mouse → you have the controls back
-    // a real player moved the mouse → the scripted wobble yields control immediately.
+    // a real player moved the mouse → the scripted intro wobble yields, but autopilot stays (sticky).
     (window as any).__autoWobble = false;
   });
-  // (DISABLED) cursor-leaves-page → autopilot: it stole control during steep dives (reaching the top
-  // edge briefly exits the viewport). Manual flight now HOLDS its last input when the cursor leaves;
-  // press P for hands-off autopilot instead.
+  // EXPLICIT manual takeback: clicking the canvas grabs the controls from autopilot.
+  canvas.addEventListener("mousedown", () => {
+    autopilot = false;
+    (window as any).__autoWobble = false;
+  });
+  // INPUT HYGIENE: when the cursor leaves the canvas or the tab loses focus, recenter the steering so
+  // MANUAL flight can't freeze on a hard edge-deflection (the old "holds last input" spiral). Autopilot is
+  // sticky and reads neither mouseX/mouseY, so it is unaffected.
+  const neutralizeSteer = () => { mouseX = 0; mouseY = 0; };
+  canvas.addEventListener("mouseleave", neutralizeSteer);
+  window.addEventListener("blur", neutralizeSteer);
 
   // --- tuning panel: sliders write straight into bird.tuning; 'T' toggles visibility ---
   const tunePanel = buildTunePanel(bird.tuning, [
     ["glideSpeed", 14, 40, 0.5],
     ["sinkRate", 0.3, 4, 0.1],
     ["divePower", 0.2, 3, 0.05],
+    ["climbPower", 0.3, 2.5, 0.05],
     ["dragK", 0.1, 1.5, 0.05],
     ["liftGain", 0, 6, 0.1],
     ["windGain", 0, 15, 0.5],
     ["windDrift", 0, 2, 0.1],
     ["minSpeed", 8, 20, 0.5],
-    ["maxSpeed", 30, 80, 1],
+    ["maxSpeed", 30, 160, 1],
     ["beatLift", 0, 30, 1],
     ["beatThrust", 0, 25, 1],
     ["beatHz", 1, 6, 0.5],
@@ -659,7 +670,7 @@ async function boot() {
     tRel = ((((tRel + 180) % 360) + 360) % 360) - 180;
     const tArrow = tRel > 5 ? "►" : tRel < -5 ? "◄" : "▲";
     overlay.textContent =
-      `vector-system — bird3d (still-air glider · fly to target)${autopilot ? `   AUTO: ${auto.mode}` : "   MANUAL (P=autopilot)"}${bird.lastFlapping ? "   ▲ FLAP" : ""}${bird.lastCrashing ? "   ✖ CRASH" : ""}\n` +
+      `vector-system — bird3d (still-air glider · fly to target)${autopilot ? `   AUTO: ${auto.mode} (click/P=manual)` : "   MANUAL (P=autopilot)"}${bird.lastFlapping ? "   ▲ FLAP" : ""}${bird.lastCrashing ? "   ✖ CRASH" : ""}\n` +
       `TARGET: ${tDist.toFixed(0)} m   steer ${tArrow} ${Math.abs(tRel).toFixed(0)}°   reached: ${reached}\n` +
       `alt over terrain: ${bird.lastClearance.toFixed(0)} m   air: ${bird.lastSpeed.toFixed(0)} m/s\n` +
       `vario: ${varioStr} m/s ${vario > 0.5 ? "▲" : vario < -0.5 ? "▼" : "—"}   updraft: +${bird.lastUpdraft.toFixed(1)} m/s\n` +
@@ -690,6 +701,22 @@ async function boot() {
   (window as any).__showWind = (v: boolean) => { showWind = v; };
   // switch terrain renderer from the console: __terrainMode("ekg" | "grid" | "topo")
   (window as any).__terrainMode = (m: "ekg" | "grid" | "topo") => { terrainMode = m; };
+
+  // TERRAIN SELF-CHECK: does the GPU terrain the bird COLLIDES against equal the one it's DRAWN on?
+  // Runs once at boot and logs a verdict; re-run live with __terrainCheck(). A FAIL means the bird is
+  // hitting invisible terrain (CPU/GPU height fields disagree); a PASS with a stale scene means hard-reload.
+  const runTerrainCheck = async () => {
+    const r = await checkTerrain(device, (x, z) => terrain.sampleHeight(x, z));
+    const tag = r.maxDiff < 1 ? "PASS" : "FAIL";
+    console.log(
+      `[terrain-selfcheck] ${tag}  points=${r.points}  maxDiff=${r.maxDiff.toFixed(2)}m  meanDiff=${r.meanDiff.toFixed(3)}m\n` +
+        `  worst @ (${r.worst.x}, ${r.worst.z})  cpu=${r.worst.cpu.toFixed(1)}m  gpu=${r.worst.gpu.toFixed(1)}m\n` +
+        `  ${r.verdict}`,
+    );
+    return r;
+  };
+  (window as any).__terrainCheck = runTerrainCheck;
+  void runTerrainCheck();
 
   loop.start();
   (window as any).__birdBooted = true;

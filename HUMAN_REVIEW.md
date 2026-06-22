@@ -1371,3 +1371,212 @@ Open http://localhost:5174/index-bird.html (falls back to 5173). Overlay `fps:` 
 ### Watch for
 - `perf-final.mjs` reads the overlay EMA `fps:` field (smoothed); it pinned 60 here. If you want raw rAF too, the v13 raw probes are at `.ai/tmp/v13-fps-probe.mjs`.
 - Levers if it regresses again (all `wind.ts`, far tier): `segments` (6), `segStep` (0.8), the every-2nd-segment subsample cadence, or capping how many far motes build full tails.
+
+---
+
+## bird respects the dirt — f32/f64 terrain-hash divergence (CRASH in clear sky)
+**Date:** 2026-06-19
+**Commit:** (uncommitted — worktree `.claude/worktrees/mountaintop-forests`, branch `worktree-mountaintop-forests`)
+**Session:** mountaintop-forests (bird "says crash when nowhere near the ground")
+
+### Root cause
+Terrain height uses `fract(sin(dot(p,(127.1,311.7)))*43758.5453)`. The GPU computes it in f32, the
+CPU mirror (`terrain.ts sampleHeight`, what the bird COLLIDES against) in f64. The `*43758` amplifies
+the tiny f32-vs-f64 `sin` difference into a totally different random field. Measured divergence:
+mean ~104 m, max ~461 m on a 600 m relief — e.g. at (-1500,300) the GPU draws ground at 42 m while
+the CPU collision field thinks there's a 364 m peak. Bird at 200 m over visually-empty sky hits an
+invisible wall. (Same divergence the trees module already documented and worked around on the GPU.)
+
+### Fix
+Replaced the `sin`-hash with an integer lattice hash (`ihash`, pure uint32 ops) in all four coupled
+files so CPU and GPU agree to <1 mm:
+- `src/host/gpu/terrain.ts` (collision field)
+- `src/host/shaders/terrain_ekg.wgsl` (neon terrain)
+- `src/host/shaders/terrain_grid.wgsl` (grid/topo mode)
+- `src/host/shaders/trees_ground.wgsl` (tree ground)
+`terrain3d.wgsl` left untouched (separate scene, not in the bird pipeline).
+NOTE: terrain SHAPE changes (it's a new random field) — peaks/valleys move. That's unavoidable to
+make CPU match GPU; the bird now respects what you see.
+
+### Verify — divergence collapses (offline, no browser)
+```
+/opt/homebrew/bin/node .ai/tmp/terrain-fix-probe.mjs
+```
+Expect: `mean ... diff (m): 0.0000`, `max ... diff (m): 0.0006`.
+
+### Verify — typecheck
+```
+./node_modules/.bin/tsc --noEmit && echo OK
+```
+
+### Verify — in the app (the real test)
+```
+npm run dev
+```
+Open `http://localhost:5173/index-bird.html`. Fly far from spawn (the bug worsened with distance).
+- Bird's altimeter plumb-line should touch the VISIBLE ground, not stop in mid-air.
+- "CRASH" (HUD `lastCrashing` / steering goes mushy) only fires when the bird visibly skims terrain.
+- Trees sit ON the neon ridges (already true; confirms tree-ground field still matches).
+- Toggle grid/topo terrain mode — same ridgelines, bird still collides correctly.
+
+---
+
+## terrain self-check — diagnose persistent invisible-terrain crash
+**Date:** 2026-06-21
+**Commit:** (uncommitted — worktree `.claude/worktrees/mountaintop-forests`)
+**Session:** mountaintop-forests (bird STILL crashes in clear sky after the ihash fix; "invisible terrain impacting camera/ground")
+
+### Why
+The ihash fix is present in the worktree but the symptom persists. Three live hypotheses, different fixes:
+H1 stale build / wrong dir (dev server running main repo, not this worktree) → old sin-hash still active.
+H2 my WGSL ihash != JS ihash on the real GPU → CPU/GPU fields still disagree.
+H3 unrelated bug (camera clamp), not the hash at all.
+"Can't tell if terrain changed" + "random invisible walls mid-air" can't disambiguate by eye → added a
+runtime GPU-vs-CPU height probe (`gpu/terrain-selfcheck.ts`, wired in `bird-main.ts`).
+
+### Run the probe (decisive)
+```
+cd /Users/god/projects/ai-jank/vector-system/.claude/worktrees/mountaintop-forests
+npm run dev
+```
+Open the bird page, hard-reload (Cmd+Shift+R), read the browser console for `[terrain-selfcheck]`:
+- `PASS  maxDiff<1m`  → GPU==CPU. Fix is correct. Crash-in-sky is then NOT the hash (chase H3 camera clamp).
+- `FAIL  maxDiff=NNNm` → GPU!=CPU on this hardware (H2). The `worst @ (x,z)` is the invisible wall; rewrite hash.
+- no line at all → wrong directory / stale build (H1). Start dev from the worktree above.
+Re-run live anytime in the console: `__terrainCheck()`.
+
+---
+
+## sticky autopilot — P survives the mouse leaving the window
+**Date:** 2026-06-21
+**Commit:** (uncommitted — worktree `.claude/worktrees/mountaintop-forests`)
+**Session:** mountaintop-forests (bird "loses" when pressing P then leaving the window)
+
+### Root cause
+`mousemove` set `autopilot = false` on EVERY cursor move. Pressing P then moving the mouse toward the
+window edge to leave instantly cancelled autopilot, and the frozen edge cursor position (≈ full
+deflection) was held as manual steering → the bird banked hard and spiralled off.
+
+### Fix (bird-main.ts) — "Sticky P"
+- `mousemove` no longer cancels autopilot; it only updates the steering origin.
+- Manual takeback is now an EXPLICIT gesture: click the canvas (`mousedown`) or press P again.
+- `mouseleave` / window `blur` recenter steering (mouseX=mouseY=0) so MANUAL flight can't freeze on a
+  hard edge-deflection. Autopilot ignores mouseX/mouseY, so it is unaffected.
+- HUD shows `AUTO: <mode> (click/P=manual)` so the takeback is discoverable.
+
+### Verify (dev server already running on :5180 from the worktree)
+```
+open http://localhost:5180/index-bird.html
+```
+1. Press `P` → HUD reads `AUTO: ... (click/P=manual)`; bird flies itself.
+2. Move the mouse OUT of the window → bird KEEPS flying straight on autopilot (no veer/spiral).
+3. Move mouse back over canvas → still autopilot (sticky); HUD still AUTO.
+4. Click the canvas (or press P) → HUD flips to `MANUAL (P=autopilot)`; mouse steers again.
+5. In MANUAL, fling the cursor off the edge → bird centers (glides straight), does not spiral.
+
+---
+
+## climb nose-up + painful stall (bird feel)
+**Date:** 2026-06-21
+**Commit:** (uncommitted — worktree `.claude/worktrees/mountaintop-forests`)
+**Session:** mountaintop-forests
+
+### Changes (gpu/bird3d.ts)
+- CLIMB TILT: model noses UP proportional to real climb rate (vario>0), visual-only, additive to the
+  control pitch — mirrors the existing dive nose-down. So ridge-lift/zoom/flap climbs show attitude, not
+  just stick-held climbs (which stall). New `renderPitch` drives the uniform (was raw `this.pitch`).
+  Tunable: `climbTilt = min(0.30, max(0,vel.y) * 0.045)` (rad/(m/s), cap ~17°).
+- SOFT STALL (landing-flare feel): on stall the wing MUSHES, it does not depart. The nose sags only
+  gently (hold it high and settle), the airframe sinks softly, and a faint lean hints the mush — NO
+  uncommanded yaw, NO wing-drop. Coordinated and controllable; ease off or dive to fly out. (Retuned from
+  an earlier harsher "bite" per feedback: a plane settling onto a runway, not a stall-spin.)
+  Tunables: nose-sag `breakPitch -0.05 - 0.18*stallDepth`, settle sink `sinkRate*stallDepth*0.6`,
+  mush lean `stallYaw*0.15` (heading departure removed).
+
+### Verify (dev server on :5180)
+```
+open http://localhost:5180/index-bird.html
+```
+1. Dive (cursor above bird) → nose tilts DOWN (unchanged).
+2. Climb — pull up, OR ride ridge lift / thermal / flap (SPACE) to gain altitude → nose tilts UP a little.
+   Watch the vario (overlay) positive ⇒ visible nose-up even with the cursor near center.
+3. STALL it: hold the nose up in still air until airspeed decays below minSpeed (HUD shows the break).
+   Expect a LANDING-FLARE mush: the nose sags only gently, the bird settles/sinks softly with a faint lean,
+   wings stay level (no departure). Fully controllable — ease off or dive to fly out.
+
+---
+
+## solid triangular body + curved wings (bird model)
+**Date:** 2026-06-21
+**Commit:** (uncommitted — worktree `.claude/worktrees/mountaintop-forests`)
+**Session:** mountaintop-forests ("bird looks like it's made out of paper")
+
+### Changes (gpu/bird3d.ts buildVMesh)
+- BODY: was a single flat ribbon (paper). Now a SOLID faceted triangular spindle — triangular cross-section
+  (apex up) tapering to a nose (+Z) and tail (−Z) point, 6 facets / closed volume. Faked top-light via the
+  existing edgeFrac→brightness path (no shader change): upper-right facet brightest, upper-left mid, belly
+  dim → the facets read as 3D volume. Body stays teal (spanFrac 0), wings still ramp to magenta tips.
+- WINGS: were straight linear ribbons. Now gently CURVED — sweep `-SWEEP*f^1.5`, gull dihedral
+  `DIHEDRAL*f^1.35 + tip up-curl`, chord tapers to the tip `RIBBON*(1-0.55f)`, SEGS 4→6 for a smooth curve.
+- Vertex count 90 (body 18 + wings 72); draw uses dynamic `vertexCount`, nothing hardcoded.
+
+### Verify (dev server on :5180)
+```
+open http://localhost:5180/index-bird.html
+```
+- The body reads as a SOLID 3D wedge (visible top/side/belly facet tones), not a flat sheet.
+- Wings curve (swept + gull dihedral + slight tip up-curl) and taper toward the tips, not a straight V.
+- Flap (SPACE) and idle flex still bend the wings; bank/pitch/stall lean still apply to the whole model.
+- Tips still glow magenta; body teal. No z-fighting / no missing faces as it banks (cullMode none).
+
+---
+
+## glide feel pass + uncomfortable crash tumble (windless flight)
+**Date:** 2026-06-21
+**Commit:** (uncommitted — worktree `.claude/worktrees/mountaintop-forests`)
+**Session:** mountaintop-forests ("good glides" + "rotate uncomfortably when I hit terrain")
+**Context:** bird.stillAir = true (windless) — tuning PURE energy-glider flight; ridge lift/thermal are
+zeroed in still air and come alive only when wind is enabled later.
+
+### Changes (gpu/bird3d.ts)
+- GLIDE (floatier + more dynamic): sinkRate 1.0→0.8 (~32:1 glide, more hang time), divePower 2.0→2.4
+  (bigger dive↔zoom energy swings), dragK 0.2→0.16 (dive speed holds through the swoop → bigger zooms).
+  All three are still live sliders in the T panel for fine-tuning.
+- CRASH TUMBLE: a hard terrain hit (impactRate > crashSpeed) now throws the bird into a disorienting
+  roll + nose-down lurch, scaled by impact severity, direction following the current lean. Winds up over
+  ~0.25 s then settles back to level over ~0.5 s. Visual only (no physics kick); recoverable.
+  Tunables: roll kick `7 + 7*hit` rad/s, pitch kick `-(4 + 4*hit)`, decay 0.25 s (vel) / 0.5 s (angle).
+
+### Verify (dev server on :5180)
+```
+open http://localhost:5180/index-bird.html
+```
+1. GLIDE: level off (cursor near center) → long floaty descent. Dive (cursor up), build speed, then pull
+   up (cursor down) → a big zoom-climb that trades the speed back for altitude. Energy management reads.
+2. CRASH: dive hard into a ridge → the bird snaps into an uncomfortable tumble (roll + nose-down), then
+   rights itself. Harder hits tumble more violently.
+
+---
+
+## swoosh fix — asymmetric dive↔zoom energy (climb felt heavy) + dive ceiling
+**Date:** 2026-06-21
+**Commit:** (uncommitted — worktree `.claude/worktrees/mountaintop-forests`)
+**Session:** mountaintop-forests ("not getting a good swoosh, too HEAVY on the climb after a dive")
+
+### Root cause
+divePower scaled gravity-along-flight-path SYMMETRICALLY — so cranking it for punchy dives (2.4) also
+bled climb speed at 2.4× the natural rate, draining the dive's energy instead of carrying it up. Heavy zoom.
+
+### Changes (gpu/bird3d.ts + bird-main.ts)
+- Split into ASYMMETRIC energy: DIVE (nose down) uses divePower 2.4 (accelerates hard); CLIMB (nose up)
+  uses new climbPower 1.0 (≈ energy-conserving) so the dive's speed CARRIES UP into a swoosh. New
+  `climbPower` tuning param + live slider (0.3–2.5). Lower climbPower = floatier/longer zoom.
+- maxSpeed 70→120 (slider 30→160): committed dives keep accelerating instead of pinning at the cap.
+
+### Verify (dev server on :5180)
+```
+open http://localhost:5180/index-bird.html
+```
+- Dive to build speed, then pull up → a long light ZOOM-climb (swoosh), not a heavy stall-out. Speed
+  bleeds gracefully as you trade it for altitude.
+- T panel: drop `climbPower` toward ~0.7 for an even floatier zoom; raise toward divePower for heavier.
