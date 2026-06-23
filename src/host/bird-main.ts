@@ -26,7 +26,7 @@ import { acquireDevice } from "./gpu/device";
 import { TerrainEKG } from "./gpu/terrain";
 import { GridTerrain } from "./gpu/terrain-grid";
 import { Bird3D, updraftAt, type BirdInput } from "./gpu/bird3d";
-import { Wind, windAt, setFluidField, setWindProfile, windProfile, windProfileParams } from "./gpu/wind";
+import { Wind, windAt, setFluidField, setWindProfile, windProfile, windProfileParams, FAR_MODES, NEAR_MODES, WAKE_MODES } from "./gpu/wind";
 import type { FarMode, NearMode, WakeMode } from "./gpu/wind";
 import { FluidWind } from "./gpu/fluid-wind";
 import { GroundMarker } from "./gpu/marker";
@@ -402,9 +402,9 @@ async function boot() {
   // per-tier wind RENDER MODES (phase 1): switching is wired end-to-end but B/C currently fall through to
   // the comet/modulate look in the engine — no visible change yet; divergent geometry is a later phase.
   panelSep(tunePanel, "wind — render modes");
-  cycleBtn(tunePanel, "FAR", ["comet", "stipple", "chevron"], "comet", (m) => wind.setFarMode(m as FarMode));
-  cycleBtn(tunePanel, "NEAR", ["comet", "flecks", "filaments"], "comet", (m) => wind.setNearMode(m as NearMode));
-  cycleBtn(tunePanel, "WAKE", ["modulate", "helix", "rings"], "modulate", (m) => wind.setWakeMode(m as WakeMode));
+  cycleBtn(tunePanel, "FAR", FAR_MODES, "comet", (m) => wind.setFarMode(m));
+  cycleBtn(tunePanel, "NEAR", NEAR_MODES, "comet", (m) => wind.setNearMode(m));
+  cycleBtn(tunePanel, "WAKE", WAKE_MODES, "modulate", (m) => wind.setWakeMode(m));
   panelSep(tunePanel, "local sphere + wake (off — solving global)");
   toggleBtn(tunePanel, "local sphere", false, (v) => wind.setShowNear(v));
   toggleBtn(tunePanel, "wake", false, (v) => wind.setShowWake(v));
@@ -819,12 +819,12 @@ function toggleBtn(panel: HTMLElement, label: string, initial: boolean, onSet: (
 
 // a cycle button that advances through a list of string options on each click (wraps), then fires
 // onSet with the new value; reused for the per-tier wind render modes (FAR/NEAR/WAKE).
-function cycleBtn(
+function cycleBtn<T extends string>(
   panel: HTMLElement,
   label: string,
-  opts: string[],
-  initial: string,
-  onSet: (v: string) => void,
+  opts: readonly T[],
+  initial: T,
+  onSet: (v: T) => void,
 ): void {
   let i = Math.max(0, opts.indexOf(initial));
   const btn = document.createElement("button");

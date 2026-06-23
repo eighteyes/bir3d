@@ -329,9 +329,14 @@ interface DotParams {
 // format; the mode only switches which geometry is emitted into that tier's buffer span. The "A" default
 // of each tier ("comet"/"comet"/"modulate") reproduces today's look — the divergent B/C geometries land
 // in a later phase (their branches currently fall through to the A emission).
-export type FarMode = "comet" | "stipple" | "chevron";   // FAR / distance long-line tier
-export type NearMode = "comet" | "flecks" | "filaments"; // NEAR / local sphere tier
-export type WakeMode = "modulate" | "helix" | "rings";   // WAKE: "modulate" = today's velocity overlay (no own geometry); helix/rings = future shed geometry into the reserved span
+// The mode ARRAYS are the single source of truth; each union type is DERIVED from its array so the
+// UI cycle-buttons (which pass these arrays directly) can never drift from the engine's accepted modes.
+export const FAR_MODES = ["comet", "stipple", "chevron"] as const;   // FAR / distance long-line tier
+export type FarMode = typeof FAR_MODES[number];
+export const NEAR_MODES = ["comet", "flecks", "filaments"] as const; // NEAR / local sphere tier
+export type NearMode = typeof NEAR_MODES[number];
+export const WAKE_MODES = ["modulate", "helix", "rings"] as const;   // WAKE: "modulate" = today's velocity overlay (no own geometry); helix/rings = future shed geometry into the reserved span
+export type WakeMode = typeof WAKE_MODES[number];
 
 export class Wind {
   private cfg: Required<WindConfig>;
