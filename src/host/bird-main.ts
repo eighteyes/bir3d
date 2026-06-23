@@ -27,6 +27,7 @@ import { TerrainEKG } from "./gpu/terrain";
 import { GridTerrain } from "./gpu/terrain-grid";
 import { Bird3D, updraftAt, type BirdInput } from "./gpu/bird3d";
 import { Wind, windAt, setFluidField, setWindProfile, windProfile, windProfileParams } from "./gpu/wind";
+import type { FarMode, NearMode, WakeMode } from "./gpu/wind";
 import { FluidWind } from "./gpu/fluid-wind";
 import { GroundMarker } from "./gpu/marker";
 import { Target } from "./gpu/target";
@@ -398,6 +399,12 @@ async function boot() {
   sliderRow(tunePanel, wr, "clearance", 5, 150, 5);                 // band height above terrain
   sliderRow(tunePanel, wr, "vSpread", 10, 150, 5);                  // band thickness / tail
   sliderRow(tunePanel, wr, "homeBias", 1, 5, 0.2);                  // hug-terrain bias (higher = more hug)
+  // per-tier wind RENDER MODES (phase 1): switching is wired end-to-end but B/C currently fall through to
+  // the comet/modulate look in the engine — no visible change yet; divergent geometry is a later phase.
+  panelSep(tunePanel, "wind — render modes");
+  cycleBtn(tunePanel, "FAR", ["comet", "stipple", "chevron"], "comet", (m) => wind.setFarMode(m as FarMode));
+  cycleBtn(tunePanel, "NEAR", ["comet", "flecks", "filaments"], "comet", (m) => wind.setNearMode(m as NearMode));
+  cycleBtn(tunePanel, "WAKE", ["modulate", "helix", "rings"], "modulate", (m) => wind.setWakeMode(m as WakeMode));
   panelSep(tunePanel, "local sphere + wake (off — solving global)");
   toggleBtn(tunePanel, "local sphere", false, (v) => wind.setShowNear(v));
   toggleBtn(tunePanel, "wake", false, (v) => wind.setShowWake(v));
@@ -739,6 +746,11 @@ async function boot() {
   (window as any).__windProfileAt = (y: number) => windProfile(y); // read the altitude curve (gate + tuning)
   (window as any).__nearWake = (x: number, y: number, z: number) => wind.sampleWake(x, y, z);
   (window as any).__nearFrame = () => wind.nearFrame();
+  // per-tier RENDER MODE switches (phase 1): drive the same setters the T-panel buttons call.
+  // e.g. __farMode("chevron"), __nearMode("flecks"), __wakeMode("rings"). B/C fall through to comet now.
+  (window as any).__farMode = (m: FarMode) => wind.setFarMode(m);
+  (window as any).__nearMode = (m: NearMode) => wind.setNearMode(m);
+  (window as any).__wakeMode = (m: WakeMode) => wind.setWakeMode(m);
 
   // perf A/B handle: window.__trees.enabled = false disables the forest pass; window.__trees.treeCount
   // reports how many trees the current window baked.
@@ -802,6 +814,26 @@ function toggleBtn(panel: HTMLElement, label: string, initial: boolean, onSet: (
   const render = () => { btn.textContent = `${label}: ${on ? "ON" : "OFF"}`; };
   render();
   btn.onclick = () => { on = !on; onSet(on); render(); };
+  panel.appendChild(btn);
+}
+
+// a cycle button that advances through a list of string options on each click (wraps), then fires
+// onSet with the new value; reused for the per-tier wind render modes (FAR/NEAR/WAKE).
+function cycleBtn(
+  panel: HTMLElement,
+  label: string,
+  opts: string[],
+  initial: string,
+  onSet: (v: string) => void,
+): void {
+  let i = Math.max(0, opts.indexOf(initial));
+  const btn = document.createElement("button");
+  btn.style.cssText =
+    "width:100%;margin:0 0 6px;padding:4px;background:#241d40;color:#9fe8ff;" +
+    "border:1px solid #4a4070;border-radius:4px;font:12px monospace;cursor:pointer;";
+  const render = () => { btn.textContent = `${label}: ${opts[i]} ▸`; };
+  render();
+  btn.onclick = () => { i = (i + 1) % opts.length; onSet(opts[i]!); render(); };
   panel.appendChild(btn);
 }
 
