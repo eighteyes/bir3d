@@ -1,5 +1,53 @@
 # Human Review Steps
 
+## wind render modes — phase 2 (6 divergent geometries) + phase 3 (wind-scaled buffet)
+**Date:** 2026-06-23
+**Commits:** 8d3b851 (FAR stipple+chevron), eb4484a (NEAR flecks+filaments), 0abafa1 (WAKE helix+rings), 00bf885 (buffet), d5c4fdb (per-mode T-panel dials)
+**Session:** wind-render-modes (f65433b5-2d4a-4594-85b6-036787d8f3af)
+**Design:** .ai/explore/2026-06-23-wind-render-modes-design.md · **Plan:** .ai/plan/wind-render-modes/
+
+### What changed (RENDER-ONLY — feel/physics frozen; wind.wgsl untouched)
+- All six B/C modes now have real divergent geometry (each its own `emit*`/`step*` method, written into the per-tier vertex spans with fixed-stride padding / the reserved wake-shed span):
+  - FAR-B Stipple (disconnected dashes tracing the flow arc), FAR-C Chevron (V heading glyphs).
+  - NEAR-B Shear Flecks (2-seg velocity tracers, length/brightness by local shear), NEAR-C Curl Filaments (corkscrew tails — needs local-sphere AND wake on to wrap the cores).
+  - WAKE-B Wingtip Helix (counter-rotating shed cords off the tips), WAKE-C Shed Rings (expanding hoops on a Strouhal cadence) — dedicated geometry in the reserved 3rd buffer span, capped/recycled by age.
+- Per-mode tuning DIALS wired into the T-panel (grouped sliders per mode).
+- Phase 3: wind-scaled VISUAL bird buffet — render-bank rock + a render-only position tremor (`buffetOffset`, added at draw to u[16..18], NOT to `pos`) ramp with local wind magnitude; velocity shove (feel) unchanged; camera follows `pos` so it stays smooth. Dials: `buffetGain`/`buffetWindRef`/`rockCapDeg`.
+
+### Verified (automated + visual)
+- tsc clean; all GPU specs green across the build (wind-render-modes, touched-air, slipstream, wind-live, updraft-buffer, bird-buffet) — fps 35–60, errors=0.
+- Buffet spec: bank variance ~15× higher at high gain, tremor 2.67 m on / 0 off, `pos` path unaffected (camera-shake separation proven).
+- Visual: all 8 modes screenshotted (.ai/tmp/shots/), render distinctly, errors=0. Helix shows warm spiral cords off the wingtips; rings show expanding hoops behind the bird.
+
+### Pre-work — launch a server FROM THIS WORKTREE (fresh strict port)
+```
+cd /Users/god/projects/ai-jank/vector-system/.claude/worktrees/mountaintop-forests && ./node_modules/.bin/vite --port 5274 --strictPort
+```
+
+### Verify — cycle the FAR modes (manual)
+```
+open -a "Google Chrome" "http://localhost:5274/index-bird.html"
+```
+- [ ] Press `T`; under "wind — render modes" click FAR to cycle comet▸stipple▸chevron. Confirm stipple reads as broken dashes (no corners) and chevron as directional glyphs.
+
+### Verify — NEAR modes (enable local sphere)
+- [ ] In the panel toggle "local sphere" on; click NEAR to cycle comet▸flecks▸filaments. Flecks = short oriented tracers; filaments curl (also toggle "wake" on so they corkscrew the wingtip cores).
+
+### Verify — WAKE shed geometry (enable wake)
+- [ ] Toggle "wake" on; click WAKE to cycle modulate▸helix▸rings. Helix = two spiral cords off the wingtips; rings = expanding hoops shedding behind the bird.
+
+### Verify — wind-scaled buffet (bird shakes, camera doesn't)
+```
+__birdTune({ buffetGain: 3 })
+```
+- [ ] Fly into strong wind (climb / open air): the bird visibly judders harder while the camera stays steady. In calm valleys it settles. Reset: `__birdTune({ buffetGain: 1 })`.
+
+### Verify — tune any mode live (console or T-panel sliders)
+```
+__farMode("stipple"); __wind.dashCountK = 4; __wind.gapRatio = 2.5
+```
+- [ ] Dials respond live. Other handles: `__nearMode`, `__wakeMode`, and the matching `__wind.*` fields per mode.
+
 ## wind render modes — phase 1 scaffold (per-tier A/B/C switch)
 **Date:** 2026-06-23
 **Commits:** 7c774f4, 06de41e, 4a37c60, 955a53c (Phase 1 of the plan; B/C deliberately inert)
