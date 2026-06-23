@@ -323,6 +323,17 @@ interface DotParams {
   heatRef?: number;         // wake speed (m/s) that maps to FULL heat (red + max length); gentler wake → yellow + shorter
   heatLenGain?: number;     // extra tail length at full heat (1 = up to 2× longer for the hardest-touched air)
   foreStretch?: number;     // forward reach of the near bubble as a multiple of nearRadius (>1 = bigger bubble AHEAD of the bird so motes read in front)
+  // --- FAR-B STIPPLE (disconnected dash streamline) — render-only, far tier ---
+  dashCountK?: number;      // number of DISCONNECTED dashes along the over-ridge flow arc (2-4)
+  dashLenM?: number;        // world-meters length of each dash along its LOCAL tangent
+  gapRatio?: number;        // dash spacing along the arc: gap length as a multiple of dash length (>1 = sparser)
+  lenByAltitude?: number;   // 0..1 — how strongly dash length scales with altitude (proxied by mote speedFrac/windProfile)
+  leadBoost?: number;       // brightness multiplier on the HEAD (lead) dash
+  // --- FAR-C CHEVRON (2-limb arrowhead glyph) — render-only, far tier ---
+  spreadAngleDeg?: number;  // half-angle (deg) between the two chevron limbs around the flow direction
+  limbLenM?: number;        // world-meters length of each chevron limb from apex to tip
+  apexBoost?: number;       // brightness multiplier at the apex (the bright point of the arrow)
+  rakeBySpeed?: number;     // 0..1 — how strongly speedFrac sharpens the spread + grows the limbs (faster = sharper dart)
 }
 
 // Per-TIER render MODE selectors (Phase 1 scaffold). Each tier shares the ONE pipeline/shader/vertex
@@ -385,6 +396,17 @@ export class Wind {
   private heatRef: number;
   private heatLenGain: number;
   private foreStretch: number;
+  // FAR-B STIPPLE dials (see DotParams).
+  private dashCountK: number;
+  private dashLenM: number;
+  private gapRatio: number;
+  private lenByAltitude: number;
+  private leadBoost: number;
+  // FAR-C CHEVRON dials (see DotParams).
+  private spreadAngleDeg: number;
+  private limbLenM: number;
+  private apexBoost: number;
+  private rakeBySpeed: number;
   // reusable scratch for the per-point bird-wake disturbance (avoids allocation in the hot near-tail loop).
   private readonly _wake: [number, number, number] = [0, 0, 0];
   // per-frame near-wake FRAME (motion axis + wing-right unit + speed + bird pos + moving flag) — set at the top
@@ -624,6 +646,19 @@ export class Wind {
     this.heatLenGain = p.heatLenGain ?? 1.0;
     this.foreStretch = p.foreStretch ?? 1.3; // mild forward reach (was 1.6): with FEWER motes, don't spread them thin
 
+    // FAR-B STIPPLE: K disconnected dashes tracing the over-ridge flow arc (the comet's integrated polyline),
+    // lead dash bright, trailing dashes dimmer. Defaults per spec.
+    this.dashCountK = p.dashCountK ?? 3;
+    this.dashLenM = p.dashLenM ?? 9;
+    this.gapRatio = p.gapRatio ?? 1.5;
+    this.lenByAltitude = p.lenByAltitude ?? 0.6;
+    this.leadBoost = p.leadBoost ?? 1.5;
+    // FAR-C CHEVRON: a 2-limb arrowhead glyph at the mote head, opening UPstream along the flow. Defaults per spec.
+    this.spreadAngleDeg = p.spreadAngleDeg ?? 28;
+    this.limbLenM = p.limbLenM ?? 14;
+    this.apexBoost = p.apexBoost ?? 1.5;
+    this.rakeBySpeed = p.rakeBySpeed ?? 0.5;
+
     this.px = new Float32Array(this.count);
     this.py = new Float32Array(this.count);
     this.pz = new Float32Array(this.count);
@@ -854,17 +889,20 @@ export class Wind {
 
     let vi = 0;
     for (let i = 0; i < this.count; i++) {
-      // FAR render-MODE branch (Phase 1 scaffold). Only "comet" (today's geometry) is implemented; the
-      // divergent stipple/chevron geometries fall through to comet for now so the branch + farMode field
-      // exist and are exercised.
+      // FAR render-MODE branch. Each mode emits into the SAME fixed per-mote stride (FAR_VERTS_PER_MOTE):
+      // comet writes the full subdivided ribbon; stipple/chevron emit FEWER real quads and PAD the remainder
+      // of the slot with degenerate (vis=0) verts, all returning vi advanced by exactly the comet stride.
       switch (this.farMode) {
         case "stipple":
+          vi = this.emitFarStipple(i, camGround, camFwd, camRight, t, birdPos, dt, vi);
+          break; // FAR-B: disconnected dash streamline
         case "chevron":
-          // Phase 2: divergent far geometry — for now emit the comet ribbon (identical output).
+          vi = this.emitFarChevron(i, camGround, camFwd, camRight, t, birdPos, dt, vi);
+          break; // FAR-C: 2-limb arrowhead glyph
         case "comet":
         default:
           vi = this.emitFarComet(i, camGround, camFwd, camRight, t, birdPos, dt, vi);
-          break; // end FAR "comet" mode emission (stipple/chevron fall through to here in Phase 1)
+          break; // FAR-A: continuous subdivided comet ribbon
       }
     }
   }
@@ -1079,6 +1117,347 @@ export class Wind {
         }
       }
       return vi;
+  }
+
+  // FIXED per-mote far-tier vertex stride. draw() always draws the FULL farVertexCount, and that span is
+  // sized count * segments * FAR_SUBDIV * 6 — so EVERY far mote owns exactly this many vertices regardless
+  // of which farMode emitted it. The divergent geometries (stipple/chevron) emit FEWER real quads, so they
+  // PAD the remainder of this slot with degenerate (vis=0) verts and advance the cursor by exactly this many
+  // so the next mote lands at the correct offset. Matches the comet's denseSeg*6 (= segments*FAR_SUBDIV*6).
+  private get FAR_VERTS_PER_MOTE(): number {
+    return this.segments * Wind.FAR_SUBDIV * 6;
+  }
+
+  // Emit ONE degenerate (collapsed, vis=0) far vertex at cursor `vi` and return the advanced cursor. All 11
+  // floats are 0 — the VS collapses vis<0.001 to a point and the FS discards vis<=0.001, so the reserved
+  // padding draws nothing. Used by the divergent far geometries to fill their fixed 48-vert slot after the
+  // real quads, keeping the per-mote stride constant (see FAR_VERTS_PER_MOTE).
+  private emitDegenerateFarVert(vi: number): number {
+    const v = this.vertHost;
+    v[vi++] = 0; v[vi++] = 0; v[vi++] = 0; // pos
+    v[vi++] = 0; v[vi++] = 0;              // corner
+    v[vi++] = 0;                           // speedFrac
+    v[vi++] = 0; v[vi++] = 0;              // segDir
+    v[vi++] = 0; v[vi++] = 0;              // along, vis (vis=0 → discarded)
+    v[vi++] = 0;                           // heat
+    return vi;
+  }
+
+  // FAR-B STIPPLE: the same over-ridge flow STREAMLINE the comet traces, shown as `dashCountK` DISCONNECTED
+  // single-segment dashes with dark gaps instead of one continuous ribbon. Reuses emitFarComet's coarse
+  // backward-flow integration (advection + recycle + speedFrac + vis + the integrated ptX/ptY/ptZ polyline),
+  // then picks K points at arc-fractions and emits ONE short quad (a dash) at each, oriented along the LOCAL
+  // tangent, length dashLenM. Lead dash bright (along≈0, ×leadBoost), trailing dashes ramp dimmer (along
+  // 0→~0.8). gapRatio spaces the dashes along the arc; lenByAltitude scales dash length with the mote's
+  // speedFrac (which already encodes windProfile/altitude). Real quads = K*6 verts; the slot is PADDED to
+  // FAR_VERTS_PER_MOTE with degenerate verts and the cursor advanced by exactly that. heat=0 (far air is cool).
+  private emitFarStipple(
+    i: number,
+    camGround: [number, number],
+    camFwd: [number, number],
+    camRight: [number, number],
+    t: number,
+    birdPos: [number, number, number],
+    dt: number,
+    vi: number
+  ): number {
+    const slotEnd = vi + this.FAR_VERTS_PER_MOTE * Wind.FPV; // exact end of this mote's fixed stride
+    const v = this.vertHost;
+    const corners = Wind.CORNERS;
+    const seg = this.segments;
+    const ptX = this.ptX, ptY = this.ptY, ptZ = this.ptZ;
+
+    let x0 = this.px[i]!;
+    let z0 = this.pz[i]!;
+    let y0 = this.py[i]!;
+
+    // Boundary-WRAP (identical to the comet so motes recycle the same way).
+    const rx = x0 - camGround[0];
+    const rz = z0 - camGround[1];
+    const fwdDist = rx * camFwd[0] + rz * camFwd[1];
+    const sideDist = rx * camRight[0] + rz * camRight[1];
+    if (fwdDist < -this.spanBehind || fwdDist > this.spanAhead) {
+      this.seedMote(i, camGround, camFwd, camRight, this.spanAhead * 0.6, 0);
+      x0 = this.px[i]!; z0 = this.pz[i]!; y0 = this.py[i]!;
+    } else if (Math.abs(sideDist) > this.spanWide) {
+      this.seedMote(i, camGround, camFwd, camRight, -this.spanBehind, sideDist > 0 ? -1 : 1);
+      x0 = this.px[i]!; z0 = this.pz[i]!; y0 = this.py[i]!;
+    }
+
+    // advect by the terrain-shaped, altitude-profiled flow (identical to the comet).
+    const [fwx0, fwz0, w] = this.flowAt(x0, z0, t);
+    const prof = windProfile(y0);
+    const wx = fwx0 * prof, wz = fwz0 * prof;
+    const x = x0 + wx * dt;
+    const z = z0 + wz * dt;
+    const terr = this.sampleHeight(x, z);
+    let y = y0 + w * dt;
+    y += (terr + this.pHome[i]! - y) * Math.min(1, this.relax * dt);
+    const loY = terr + this.minClear;
+    const hiY = terr + this.maxClear;
+    if (y < loY) y = loY;
+    if (y > hiY) y = hiY;
+    this.px[i] = x;
+    this.py[i] = y;
+    this.pz[i] = z;
+
+    const wspeed = Math.hypot(wx, wz);
+    const u = Math.min(1, Math.max(0, (wspeed - this.speedLo) / (this.speedHi - this.speedLo)));
+    let sp = u * u * (3 - 2 * u);
+    const climbFrac = Math.min(1, Math.max(0, w / 7.0));
+    sp = Math.max(sp, climbFrac);
+    this.speedFrac[i] = sp;
+
+    // DENSITY cull + tier crossfade + fade envelope (identical to the comet so stipple culls/fades the same).
+    const rank = hashRank(i);
+    const cutoff = this.densityFloor + (1 - this.densityFloor) * sp;
+    let vis = 1 - smoothstep(cutoff - 0.1, cutoff + 0.02, rank);
+    const bdx = x - birdPos[0], bdz = z - birdPos[2];
+    const bdist = Math.hypot(bdx, bdz);
+    const blendR = this.nearRadius * 1.6;
+    if (bdist < blendR) {
+      const proximity = 1 - smoothstep(this.nearRadius, blendR, bdist);
+      vis = Math.max(vis, 0.85 * proximity);
+    }
+    this.age[i]! += dt;
+    const fadeIn = smoothstep(0, this.fadeInTime, this.age[i]!);
+    const nrx = x - camGround[0], nrz = z - camGround[1];
+    const nFwd = nrx * camFwd[0] + nrz * camFwd[1];
+    const nSide = nrx * camRight[0] + nrz * camRight[1];
+    const distFront = this.spanAhead - nFwd;
+    const distBack = nFwd + this.spanBehind;
+    const distSide = this.spanWide - Math.abs(nSide);
+    const edgeDist = Math.min(distFront, distBack, distSide);
+    const fadeOut = smoothstep(0, this.fadeFarEdge, edgeDist);
+    const bdy = y - birdPos[1];
+    const d3 = this.bubbleFrac(bdx, bdy, bdz);
+    const nearHandoff = smoothstep(0.35, 1.0, d3);
+    vis *= fadeIn * fadeOut * nearHandoff;
+    if (vis <= 0.001) {
+      while (vi < slotEnd) vi = this.emitDegenerateFarVert(vi); // collapse the whole slot
+      return vi;
+    }
+
+    // CURVED STREAMLINE points: integrate BACKWARD along flowAt from the head (same as the comet's coarse
+    // tail), building ptX/ptY/ptZ[0..seg]. We trace the WHOLE potential arc (full segStep, not speed-scaled)
+    // so the K dashes sample the same over-ridge curve regardless of speed; speed shows through vis + length.
+    const stepLen = this.segStep;
+    ptX[0] = x; ptY[0] = y; ptZ[0] = z;
+    let cx = x, cy = y, cz = z;
+    let fwx = wx, fwz = wz, fw = w; // step 1 reuses the head flow
+    for (let s = 1; s <= seg; s++) {
+      if (s > 1 && (s & 1) === 1) { const f = this.flowAt(cx, cz, t); fwx = f[0] * prof; fwz = f[1] * prof; fw = f[2]; }
+      cx -= fwx * stepLen;
+      cz -= fwz * stepLen;
+      cy -= fw * stepLen;
+      const tb = this.sampleHeight(cx, cz) + this.minClear;
+      if (cy < tb) cy = tb;
+      ptX[s] = cx; ptY[s] = cy; ptZ[s] = cz;
+    }
+
+    // DASHES: place K dashes along the arc, spaced by gapRatio (dash : gap). The arc-fraction of dash k's
+    // CENTER is laid out so dash + gap tile [0,1]: pitch = (1+gapRatio)·unit, with K dashes the unit is
+    // 1/(K + (K-1)·gapRatio) of the arc... but we want the LEAD dash at the head (frac 0). So center_k =
+    // k·pitch where pitch = 1/max(1,K-1) when K>1 spaces them evenly head→~near-tail, and gapRatio biases
+    // the inter-dash spacing implicitly via where we stop (≤ ~0.85 so the last dash isn't at the very tail).
+    const K = Math.max(1, Math.round(this.dashCountK));
+    // dash length in world meters, scaled by altitude (proxied by speedFrac) via lenByAltitude:
+    // full length when lenByAltitude=0; at =1 the length scales 0.4→1 with sp (low altitude/calm → shorter).
+    const altScale = 1 - this.lenByAltitude * (1 - (0.4 + 0.6 * sp));
+    const halfLen = 0.5 * this.dashLenM * altScale;
+    // arc span the dashes occupy: more gap (gapRatio) packs the dashes toward the head (shorter occupied span).
+    const span = Math.min(0.85, 0.85 / (1 + 0.25 * (this.gapRatio - 1)));
+    for (let k = 0; k < K; k++) {
+      const frac = K > 1 ? span * (k / (K - 1)) : 0; // 0 (head) → span (toward tail)
+      // sample the streamline point + local tangent at this arc-fraction (linear interp over the coarse pts).
+      const fs = frac * seg;
+      const i0 = Math.min(seg - 1, Math.floor(fs));
+      const ft = fs - i0;
+      const i1 = i0 + 1;
+      const ax = ptX[i0]! * (1 - ft) + ptX[i1]! * ft;
+      const ay = ptY[i0]! * (1 - ft) + ptY[i1]! * ft;
+      const az = ptZ[i0]! * (1 - ft) + ptZ[i1]! * ft;
+      // local tangent = direction along the polyline at this point (XZ), normalized.
+      let tx = ptX[i1]! - ptX[i0]!, tz = ptZ[i1]! - ptZ[i0]!;
+      const ty = ptY[i1]! - ptY[i0]!;
+      const tl = Math.hypot(tx, ty, tz);
+      let utx: number, uty: number, utz: number;
+      if (tl > 1e-5) { utx = tx / tl; uty = ty / tl; utz = tz / tl; } else { utx = 1; uty = 0; utz = 0; }
+      // dash endpoints = point ± halfLen·tangent (world meters along the tangent).
+      const p0x = ax - utx * halfLen, p0y = ay - uty * halfLen, p0z = az - utz * halfLen; // near (head side)
+      const p1x = ax + utx * halfLen, p1y = ay + uty * halfLen, p1z = az + utz * halfLen; // far (tail side)
+      // segDir for screen-space perp (XZ), normalized.
+      let sdx = utx, sdz = utz;
+      const sdl = Math.hypot(sdx, sdz);
+      if (sdl > 1e-5) { sdx /= sdl; sdz /= sdl; } else { sdx = 1; sdz = 0; }
+      // brightness ramp: lead dash brightest, trailing dashes dimmer. `along` darkens toward the tail
+      // (shader lenFade = (1-along)^1.3), so trailing dashes ride a higher base `along` (0→~0.8 across K).
+      // The lead dash sits at along≈0 (already brightest by along); leadBoost adds EXTRA brightness on top
+      // via vis (the shader scales intensity by vis directly), clamped so additive blend doesn't blow out.
+      const baseAlong = K > 1 ? 0.8 * (k / (K - 1)) : 0;
+      const along0 = baseAlong;
+      const along1 = Math.min(1, along0 + 0.12); // tiny along gradient across the dash so it reads directional
+      const dashVis = k === 0 ? Math.min(1, vis * this.leadBoost) : vis; // head dash brightened by leadBoost
+      for (let c = 0; c < 6; c++) {
+        const [pick, perp] = corners[c]!;
+        const ex = pick > 0.5 ? p1x : p0x;
+        const ey = pick > 0.5 ? p1y : p0y;
+        const ez = pick > 0.5 ? p1z : p0z;
+        const al = pick > 0.5 ? along1 : along0;
+        v[vi++] = ex; v[vi++] = ey; v[vi++] = ez;
+        v[vi++] = pick; v[vi++] = perp;
+        v[vi++] = sp;
+        v[vi++] = sdx; v[vi++] = sdz;
+        v[vi++] = al; v[vi++] = dashVis;
+        v[vi++] = 0; // heat=0
+      }
+    }
+    // PAD the remainder of the fixed 48-vert slot with degenerate verts so the stride stays constant.
+    while (vi < slotEnd) vi = this.emitDegenerateFarVert(vi);
+    return vi;
+  }
+
+  // FAR-C CHEVRON: a 2-limb arrowhead glyph per mote, opening UPstream along the flow. Reuses the comet's
+  // advection + recycle + speedFrac + vis, samples the flow direction ONCE at the mote head (the same head
+  // flow the comet's first backward step uses), then emits TWO quads (one per limb) from the apex (the mote
+  // head world pos) back to two tip points = apex - limbLenM·rotate(flowDir, ±spreadAngleDeg). `along`=0 at
+  // the apex (bright, ×apexBoost) → 1 at each tip (fades). rakeBySpeed sharpens the spread + grows the limbs
+  // with speedFrac (faster = sharper dart). widthPx reuses the global dotPx ribbon half-width. Real quads =
+  // 2*6 verts; the slot is PADDED to FAR_VERTS_PER_MOTE with degenerate verts. heat=0 (far air is cool).
+  private emitFarChevron(
+    i: number,
+    camGround: [number, number],
+    camFwd: [number, number],
+    camRight: [number, number],
+    t: number,
+    birdPos: [number, number, number],
+    dt: number,
+    vi: number
+  ): number {
+    const slotEnd = vi + this.FAR_VERTS_PER_MOTE * Wind.FPV; // exact end of this mote's fixed stride
+    const v = this.vertHost;
+    const corners = Wind.CORNERS;
+
+    let x0 = this.px[i]!;
+    let z0 = this.pz[i]!;
+    let y0 = this.py[i]!;
+
+    // Boundary-WRAP (identical to the comet).
+    const rx = x0 - camGround[0];
+    const rz = z0 - camGround[1];
+    const fwdDist = rx * camFwd[0] + rz * camFwd[1];
+    const sideDist = rx * camRight[0] + rz * camRight[1];
+    if (fwdDist < -this.spanBehind || fwdDist > this.spanAhead) {
+      this.seedMote(i, camGround, camFwd, camRight, this.spanAhead * 0.6, 0);
+      x0 = this.px[i]!; z0 = this.pz[i]!; y0 = this.py[i]!;
+    } else if (Math.abs(sideDist) > this.spanWide) {
+      this.seedMote(i, camGround, camFwd, camRight, -this.spanBehind, sideDist > 0 ? -1 : 1);
+      x0 = this.px[i]!; z0 = this.pz[i]!; y0 = this.py[i]!;
+    }
+
+    // advect by the terrain-shaped, altitude-profiled flow (identical to the comet).
+    const [fwx0, fwz0, w] = this.flowAt(x0, z0, t);
+    const prof = windProfile(y0);
+    const wx = fwx0 * prof, wz = fwz0 * prof;
+    const x = x0 + wx * dt;
+    const z = z0 + wz * dt;
+    const terr = this.sampleHeight(x, z);
+    let y = y0 + w * dt;
+    y += (terr + this.pHome[i]! - y) * Math.min(1, this.relax * dt);
+    const loY = terr + this.minClear;
+    const hiY = terr + this.maxClear;
+    if (y < loY) y = loY;
+    if (y > hiY) y = hiY;
+    this.px[i] = x;
+    this.py[i] = y;
+    this.pz[i] = z;
+
+    const wspeed = Math.hypot(wx, wz);
+    const u = Math.min(1, Math.max(0, (wspeed - this.speedLo) / (this.speedHi - this.speedLo)));
+    let sp = u * u * (3 - 2 * u);
+    const climbFrac = Math.min(1, Math.max(0, w / 7.0));
+    sp = Math.max(sp, climbFrac);
+    this.speedFrac[i] = sp;
+
+    // DENSITY cull + tier crossfade + fade envelope (identical to the comet).
+    const rank = hashRank(i);
+    const cutoff = this.densityFloor + (1 - this.densityFloor) * sp;
+    let vis = 1 - smoothstep(cutoff - 0.1, cutoff + 0.02, rank);
+    const bdx = x - birdPos[0], bdz = z - birdPos[2];
+    const bdist = Math.hypot(bdx, bdz);
+    const blendR = this.nearRadius * 1.6;
+    if (bdist < blendR) {
+      const proximity = 1 - smoothstep(this.nearRadius, blendR, bdist);
+      vis = Math.max(vis, 0.85 * proximity);
+    }
+    this.age[i]! += dt;
+    const fadeIn = smoothstep(0, this.fadeInTime, this.age[i]!);
+    const nrx = x - camGround[0], nrz = z - camGround[1];
+    const nFwd = nrx * camFwd[0] + nrz * camFwd[1];
+    const nSide = nrx * camRight[0] + nrz * camRight[1];
+    const distFront = this.spanAhead - nFwd;
+    const distBack = nFwd + this.spanBehind;
+    const distSide = this.spanWide - Math.abs(nSide);
+    const edgeDist = Math.min(distFront, distBack, distSide);
+    const fadeOut = smoothstep(0, this.fadeFarEdge, edgeDist);
+    const bdy = y - birdPos[1];
+    const d3 = this.bubbleFrac(bdx, bdy, bdz);
+    const nearHandoff = smoothstep(0.35, 1.0, d3);
+    vis *= fadeIn * fadeOut * nearHandoff;
+    if (vis <= 0.001) {
+      while (vi < slotEnd) vi = this.emitDegenerateFarVert(vi); // collapse the whole slot
+      return vi;
+    }
+
+    // FLOW DIRECTION at the head (unit world-XZ), the same head flow the comet's first backward step uses.
+    let fdx = wx, fdz = wz;
+    const fdl = Math.hypot(fdx, fdz);
+    if (fdl > 1e-5) { fdx /= fdl; fdz /= fdl; } else { fdx = 1; fdz = 0; }
+
+    // apex = the mote head world pos. The arrowhead OPENS upstream: tips = apex - limbLen·rotate(flowDir,±θ).
+    // rakeBySpeed sharpens (narrows) the spread and grows the limbs with speedFrac (faster = longer, sharper).
+    const rake = this.rakeBySpeed * sp;
+    const spread = (this.spreadAngleDeg * (1 - 0.5 * rake) * Math.PI) / 180; // sharper (narrower) when fast
+    const limbLen = this.limbLenM * (1 + 0.6 * rake);                        // longer limbs when fast
+    const ca = Math.cos(spread), sa = Math.sin(spread);
+    const apx = x, apy = y, apz = z;
+    // two backward (upstream) directions: rotate the REVERSED flow dir by ±spread in the XZ plane.
+    const bx = -fdx, bz = -fdz; // upstream (opening) base direction
+    for (let limb = -1; limb <= 1; limb += 2) {
+      const s = limb * sa;
+      const rdx = bx * ca - bz * s; // rotate (bx,bz) by ±spread
+      const rdz = bx * s + bz * ca;
+      const tipx = apx + rdx * limbLen;
+      const tipz = apz + rdz * limbLen;
+      const tipy = apy; // keep the glyph in a near-horizontal plane (reads as an arrowhead from above/ahead)
+      // segDir for the limb's screen-space perp (XZ), normalized.
+      let sdx = rdx, sdz = rdz;
+      const sdl = Math.hypot(sdx, sdz);
+      if (sdl > 1e-5) { sdx /= sdl; sdz /= sdl; } else { sdx = 1; sdz = 0; }
+      // apex is the bright point: along=0 (brightest by the shader's head→tail fade) AND boosted further via
+      // vis (intensity scales by vis directly), clamped so the additive blend doesn't blow out. The tips fade
+      // to along=1 (dark) at the normal vis so the arrowhead reads as a bright point trailing two dim limbs.
+      const along0 = 0;
+      const along1 = 1;
+      const apexVis = Math.min(1, vis * this.apexBoost);
+      for (let c = 0; c < 6; c++) {
+        const [pick, perp] = corners[c]!;
+        const ex = pick > 0.5 ? tipx : apx;
+        const ey = pick > 0.5 ? tipy : apy;
+        const ez = pick > 0.5 ? tipz : apz;
+        const al = pick > 0.5 ? along1 : along0;
+        const vv = pick > 0.5 ? vis : apexVis; // apex-side verts brightened by apexBoost
+        v[vi++] = ex; v[vi++] = ey; v[vi++] = ez;
+        v[vi++] = pick; v[vi++] = perp;
+        v[vi++] = sp;
+        v[vi++] = sdx; v[vi++] = sdz;
+        v[vi++] = al; v[vi++] = vv;
+        v[vi++] = 0; // heat=0
+      }
+    }
+    // PAD the remainder of the fixed 48-vert slot with degenerate verts so the stride stays constant.
+    while (vi < slotEnd) vi = this.emitDegenerateFarVert(vi);
+    return vi;
   }
 
   // Bird-wake disturbance velocity (visuals only) at world point (px,py,pz): a bow-wave OUTWARD ahead of the
