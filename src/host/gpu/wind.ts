@@ -342,6 +342,24 @@ interface DotParams {
   orientLerp?: number;      // 0..1 slerp of the long axis toward the current velocity each frame (0 = snap to current dir)
   // --- NEAR-C CURL FILAMENTS (thin thread that corkscrews around the wingtip vortex cores) — render-only, near tier ---
   filSegStep?: number;      // seconds of flow integrated per filament tail segment (LONGER than nearSegStep → looser, readable spiral)
+  // --- WAKE-B WINGTIP HELIX FILAMENTS (counter-rotating cords SHED off the two wingtips) — render-only, wake-shed span ---
+  wakeEmitRate?: number;    // arcs SHED per wingtip per second (cadence of new shed elements)
+  wakeLife?: number;        // seconds a shed helix element persists before retiring
+  helixGain?: number;       // multiplies the tangential/swirl (twin-vortex) term FOR SHED GEOMETRY ONLY → tighter/looser corkscrew
+  wakeSeg?: number;         // backward-integrated polyline segments per shed element (KEEP SHORT, ≤4 — anti-corner)
+  wakeSegStep?: number;     // seconds of flow integrated per shed-element segment
+  wakeTaper?: number;       // head→tail width/brightness taper bias for a shed element (0..1)
+  counterRotate?: boolean;  // flip one tip's swirl sense so the two cords spiral in OPPOSITE senses
+  // --- WAKE-C SHED PRESSURE RINGS (periodic expanding hoops shed off the wings) — render-only, wake-shed span ---
+  ringRate?: number;        // rings SHED per second (cadence)
+  ringGrow?: number;        // m/s the ring radius expands each second after spawn
+  ringLife?: number;        // seconds a shed ring persists before retiring
+  ringSegN?: number;        // chords tessellating each ring loop (12-32)
+  ringStartRadius?: number; // ring radius (m) at spawn
+  ringTilt?: number;        // tilt of the ring normal by local shear (0 = face-on to the flight axis)
+  twinOffset?: number;      // >0 = one ring per wingtip (center at birdPos ± wingSpan·right); 0 = centerline train
+  convectFrac?: number;     // fraction of bird speed the ring center convects backward along the axis each frame
+  ringWarmBias?: number;    // warms the loaded (downstream) side of the loop (0..1)
 }
 
 // Per-TIER render MODE selectors (Phase 1 scaffold). Each tier shares the ONE pipeline/shader/vertex
@@ -423,6 +441,24 @@ export class Wind {
   private orientLerp: number;
   // NEAR-C CURL FILAMENTS dials (see DotParams).
   private filSegStep: number;
+  // WAKE-B WINGTIP HELIX dials (see DotParams).
+  private wakeEmitRate: number;
+  private wakeLife: number;
+  private helixGain: number;
+  private wakeSeg: number;
+  private wakeSegStep: number;
+  private wakeTaper: number;
+  private counterRotate: boolean;
+  // WAKE-C SHED RINGS dials (see DotParams).
+  private ringRate: number;
+  private ringGrow: number;
+  private ringLife: number;
+  private ringSegN: number;
+  private ringStartRadius: number;
+  private ringTilt: number;
+  private twinOffset: number;
+  private convectFrac: number;
+  private ringWarmBias: number;
   // NEAR-B per-mote long-axis (XZ unit dir) persisted so orientLerp can slerp it toward velocity each frame.
   private fleckDirX: Float32Array;
   private fleckDirZ: Float32Array;
@@ -458,7 +494,39 @@ export class Wind {
   // worst-case span is RESERVED in the buffer now (zero-filled this phase); wakeShedLiveCount tracks how
   // many verts were actually emitted this frame so draw() only issues the live count (0 until Phase 2).
   private wakeShedVertexCount: number; // reserved worst-case wake-shed vertices (buffer span)
-  private wakeShedLiveCount = 0;       // wake-shed verts ACTUALLY written this frame (0 this phase → draw skipped)
+  private wakeShedLiveCount = 0;       // wake-shed verts ACTUALLY written this frame (0 when wake off / modulate)
+
+  // --- WAKE-B HELIX shed pool (persistent, allocated once). Each live element is a short tube-arc SHED from a
+  //     wingtip: a seed point advected by flowAt + birdWakeAt, an age (retire at wakeLife), and which tip it
+  //     came from (side ±1, drives the counter-rotating sense). Capacity HELIX_TIPS*HELIX_LIVE so the worst
+  //     case (every slot live × wakeSeg quads) stays within WAKE_SHED_RESERVE. `helixActive` = live count. ---
+  private helixSeedX!: Float32Array;
+  private helixSeedY!: Float32Array;
+  private helixSeedZ!: Float32Array;
+  private helixAge!: Float32Array;
+  private helixSide!: Float32Array; // +1 / −1: which wingtip this cord was shed from
+  private helixActive = 0;          // number of live helix elements (≤ HELIX_TIPS*HELIX_LIVE)
+  private helixEmitAcc = 0;         // fractional emission accumulator (arcs owed, both tips) across frames
+  // --- WAKE-C RINGS shed pool (persistent, allocated once). Each live ring is a center, a radius (grows with
+  //     ringGrow), an age (retire at ringLife), a side (±1 wingtip or 0 centerline), and a spawn-time heat
+  //     sampled from |birdWakeAt(center)|. Capacity RING_COUNT so worst case (all rings × ringSegN chords)
+  //     stays within reserve. `ringActive` = live count. ---
+  private ringCx!: Float32Array;
+  private ringCy!: Float32Array;
+  private ringCz!: Float32Array;
+  private ringRadius!: Float32Array;
+  private ringAge!: Float32Array;
+  private ringSide!: Float32Array;  // +1 / −1 / 0 wingtip-or-centerline marker (drives the warm-bias direction)
+  private ringHeat!: Float32Array;  // spawn-time heat (0..1) sampled from |birdWakeAt(center)|
+  private ringActive = 0;           // number of live rings (≤ RING_COUNT)
+  private ringEmitAcc = 0;          // fractional ring-emission accumulator across frames
+  private wakeShedPoolsInit = false;// lazy one-time pool allocation guard
+  private wakeOverrunLogged = false;// log the cap-hit warning at most once
+  // reusable scratch for a shed element's integrated backward polyline (wakeSeg+1 points) and per-frame wake.
+  private wsPtX!: Float32Array;
+  private wsPtY!: Float32Array;
+  private wsPtZ!: Float32Array;
+  private readonly _wsWake: [number, number, number] = [0, 0, 0];
 
   // PERSISTENT world-space particle state (NOT regenerated each frame — that is what makes them drift).
   // v9: each mote carries a 3D position (x, y, z); y is ADVECTED by the vertical flow w (terrain-shaped),
@@ -689,6 +757,31 @@ export class Wind {
     // wingtip-vortex corkscrew reads as a loose spiral. Default per spec.
     this.filSegStep = p.filSegStep ?? 0.25;
 
+    // WAKE-B WINGTIP HELIX: short tube-arcs SHED from each wingtip, advected by flowAt + birdWakeAt and
+    // retired at wakeLife; each frame each live element integrates a SHORT backward polyline through the same
+    // disturbed flow (the twin-vortex tangential term makes it corkscrew). counterRotate flips one tip's
+    // sense. Cap: emitRate·life·2 tips must stay ≤ HELIX_TIPS·HELIX_LIVE (320) — the defaults below give
+    // 60·1.2·2 = 144 ≤ 320 (headroom for the cap, never overruns the reserve).
+    this.wakeEmitRate = p.wakeEmitRate ?? 60;
+    this.wakeLife = p.wakeLife ?? 1.2;
+    this.helixGain = p.helixGain ?? 1.0;
+    this.wakeSeg = Math.min(Wind.HELIX_SEGS, Math.max(1, Math.round(p.wakeSeg ?? 3))); // ≤4 (reserve sizing); KEEP SHORT
+    this.wakeSegStep = p.wakeSegStep ?? 0.1;
+    this.wakeTaper = p.wakeTaper ?? 0.7;
+    this.counterRotate = p.counterRotate ?? true;
+    // WAKE-C SHED RINGS: periodic expanding hoops shed face-on to the flight axis, center convected backward,
+    // radius grows, retire at ringLife. ringRate·ringLife must stay ≤ RING_COUNT (32) and ringSegN ≤ RING_CHORDS
+    // (32) so the worst case (all rings × chords × 6) stays within the reserve. Defaults: 6·1.5 = 9 ≤ 32.
+    this.ringRate = p.ringRate ?? 6;
+    this.ringGrow = p.ringGrow ?? 8;
+    this.ringLife = p.ringLife ?? 1.5;
+    this.ringSegN = Math.min(Wind.RING_CHORDS, Math.max(3, Math.round(p.ringSegN ?? 24))); // 12-32 (clamped ≤32)
+    this.ringStartRadius = p.ringStartRadius ?? 2;
+    this.ringTilt = p.ringTilt ?? 0.3;
+    this.twinOffset = p.twinOffset ?? 10; // >0 = per-wingtip; 0 = centerline train
+    this.convectFrac = p.convectFrac ?? 0.7;
+    this.ringWarmBias = p.ringWarmBias ?? 0.5;
+
     this.px = new Float32Array(this.count);
     this.py = new Float32Array(this.count);
     this.pz = new Float32Array(this.count);
@@ -714,6 +807,29 @@ export class Wind {
     this.nptX = new Float32Array(this.nearSegments + 1);
     this.nptY = new Float32Array(this.nearSegments + 1);
     this.nptZ = new Float32Array(this.nearSegments + 1);
+
+    // WAKE-SHED pools (helix cords + shed rings) — allocated ONCE here, sized to the reserve caps so the
+    // worst-case emission can never overrun the third buffer span. The arrays persist across frames (that
+    // persistence is what makes the shed geometry trail and live); only the pool matching wakeMode is
+    // advanced/emitted each frame. See stepWakeShed.
+    const HELIX_CAP = Wind.HELIX_TIPS * Wind.HELIX_LIVE; // 320 live cords (×wakeSeg≤4 ×6 = 7680 = reserve)
+    this.helixSeedX = new Float32Array(HELIX_CAP);
+    this.helixSeedY = new Float32Array(HELIX_CAP);
+    this.helixSeedZ = new Float32Array(HELIX_CAP);
+    this.helixAge = new Float32Array(HELIX_CAP);
+    this.helixSide = new Float32Array(HELIX_CAP);
+    this.ringCx = new Float32Array(Wind.RING_COUNT);
+    this.ringCy = new Float32Array(Wind.RING_COUNT);
+    this.ringCz = new Float32Array(Wind.RING_COUNT);
+    this.ringRadius = new Float32Array(Wind.RING_COUNT);
+    this.ringAge = new Float32Array(Wind.RING_COUNT);
+    this.ringSide = new Float32Array(Wind.RING_COUNT);
+    this.ringHeat = new Float32Array(Wind.RING_COUNT);
+    // scratch for a shed element's backward polyline (max segs+1 across both pools = HELIX_SEGS+1).
+    this.wsPtX = new Float32Array(Wind.HELIX_SEGS + 1);
+    this.wsPtY = new Float32Array(Wind.HELIX_SEGS + 1);
+    this.wsPtZ = new Float32Array(Wind.HELIX_SEGS + 1);
+    this.wakeShedPoolsInit = true;
 
     // combined vertex buffer: FAR long-line tier + NEAR sphere tier + reserved WAKE-SHED span, drawn in one
     // pass (shared format). FAR uses the SUBDIVIDED segment count (each coarse segment → FAR_SUBDIV quads).
@@ -2082,6 +2198,356 @@ export class Wind {
     return vi;
   }
 
+  // --- WAKE-SHED stepper (Phase 2): dedicated shed geometry written into the THIRD buffer span (after far+near).
+  // Drives ONE of two persistent pools depending on wakeMode: "helix" (WAKE-B wingtip cords) or "rings"
+  // (WAKE-C shed hoops). Sets up its OWN per-frame bird/wing frame (stepNear may NOT have run — the local
+  // sphere can be off while the shed geometry is on) so birdWakeAt() has the wing-right + axis it reads.
+  // Writes quads contiguously from the wake-shed span start (float offset (farVertexCount+nearVertexCount)·FPV),
+  // tracks the verts ACTUALLY written in this.wakeShedLiveCount, and NEVER exceeds WAKE_SHED_RESERVE (it stops
+  // emitting and logs once rather than overrun). When the wake is off OR wakeMode==="modulate" the caller skips
+  // this and zeroes wakeShedLiveCount. windAt / flight physics are untouched (render-only).
+  private stepWakeShed(
+    birdPos: [number, number, number],
+    axisX: number, axisY: number, axisZ: number,
+    rgx: number, rgy: number, rgz: number,
+    bs: number,
+    moving: boolean,
+    t: number,
+    dt: number
+  ): void {
+    // Set the per-frame wake frame birdWakeAt() reads (this._r* for the vortex cores; _ax/_bs/_lastBirdPos for
+    // the probe). Mirrors the top of stepNear so the shed path is self-contained when the near sphere is off.
+    this._ax = axisX; this._ay = axisY; this._az = axisZ;
+    this._rx = rgx; this._ry = rgy; this._rz = rgz;
+    this._bs = bs; this._moving = moving; this._wakeOn = moving && this.showWake;
+    this._lastBirdPos[0] = birdPos[0]; this._lastBirdPos[1] = birdPos[1]; this._lastBirdPos[2] = birdPos[2];
+
+    const base = (this.farVertexCount + this.nearVertexCount) * Wind.FPV; // float cursor at the wake-shed span start
+    if (this.wakeMode === "rings") {
+      this.wakeShedLiveCount = this.stepShedRings(birdPos, axisX, axisY, axisZ, rgx, rgy, rgz, bs, moving, t, dt, base);
+    } else { // "helix"
+      this.wakeShedLiveCount = this.stepShedHelix(birdPos, axisX, axisY, axisZ, rgx, rgy, rgz, bs, moving, t, dt, base);
+    }
+  }
+
+  // WAKE-B WINGTIP HELIX FILAMENTS: continuously SHED short tube-arcs from each wingtip (birdPos ± wingSpan·right)
+  // at wakeEmitRate arcs/tip/sec. Each shed element persists (seed advected by flowAt + birdWakeAt; retired at
+  // wakeLife). Each frame, per live element, integrate a SHORT backward polyline (wakeSeg ≤ HELIX_SEGS) through
+  // flowAt + birdWakeAt (the twin-vortex tangential term corkscrews it around its core) and emit wakeSeg quads via
+  // the CORNERS pattern. The two tips spiral in OPPOSITE senses (counter-rotating) — that falls out of the twin
+  // -vortex field; counterRotate=false flips one tip's sense back to match. helixGain multiplies the swirl term FOR
+  // SHED GEOMETRY ONLY (temporarily scales swirlGain during integration, restored after). Warm via the heat channel
+  // where |birdWakeAt| is large. Returns the verts written (capped at WAKE_SHED_RESERVE). NO new physics.
+  private stepShedHelix(
+    birdPos: [number, number, number],
+    axisX: number, axisY: number, axisZ: number,
+    rgx: number, rgy: number, rgz: number,
+    bs: number,
+    moving: boolean,
+    t: number,
+    dt: number,
+    base: number
+  ): number {
+    const HELIX_CAP = Wind.HELIX_TIPS * Wind.HELIX_LIVE;
+    // upW = axis × right (thin vertical jitter axis for the seed spread off the wingtip).
+    const ux = axisY * rgz - axisZ * rgy, uy = axisZ * rgx - axisX * rgz, uz = axisX * rgy - axisY * rgx;
+
+    // 1) RETIRE aged elements (compact the live pool in place — order doesn't matter for emission).
+    let n = this.helixActive;
+    for (let i = 0; i < n; ) {
+      this.helixAge[i]! += dt;
+      if (this.helixAge[i]! >= this.wakeLife) {
+        n--;
+        this.helixSeedX[i] = this.helixSeedX[n]!; this.helixSeedY[i] = this.helixSeedY[n]!; this.helixSeedZ[i] = this.helixSeedZ[n]!;
+        this.helixAge[i] = this.helixAge[n]!; this.helixSide[i] = this.helixSide[n]!;
+      } else i++;
+    }
+    this.helixActive = n;
+
+    // 2) SHED new arcs (both tips) at wakeEmitRate per tip per second when moving. Accumulate fractional owed.
+    if (moving) {
+      this.helixEmitAcc += this.wakeEmitRate * Wind.HELIX_TIPS * dt; // both tips
+      let owed = Math.floor(this.helixEmitAcc);
+      this.helixEmitAcc -= owed;
+      while (owed > 0 && this.helixActive < HELIX_CAP) {
+        const side = (this.helixActive & 1) === 0 ? 1 : -1; // alternate tips
+        const offR = side * this.wingSpan;
+        const jU = (Math.random() * 2 - 1) * this.wingJitter;
+        const x = birdPos[0] + rgx * offR + ux * jU;
+        const y = birdPos[1] + rgy * offR + uy * jU;
+        const z = birdPos[2] + rgz * offR + uz * jU;
+        const k = this.helixActive++;
+        this.helixSeedX[k] = x; this.helixSeedY[k] = y; this.helixSeedZ[k] = z;
+        this.helixAge[k] = 0; this.helixSide[k] = side;
+        owed--;
+      }
+    }
+
+    // 3) ADVANCE + EMIT. helixGain scales the swirl term for shed geometry only (restore after).
+    const savedSwirl = this.swirlGain;
+    this.swirlGain = savedSwirl * this.helixGain;
+    const v = this.vertHost;
+    const corners = Wind.CORNERS;
+    const seg = this.wakeSeg;
+    const ptX = this.wsPtX, ptY = this.wsPtY, ptZ = this.wsPtZ;
+    const wake = this._wsWake;
+    const maxFloats = base + Wind.WAKE_SHED_RESERVE * Wind.FPV; // hard end of the reserved span (float index)
+    let vi = base;
+    const live = this.helixActive;
+    for (let i = 0; i < live; i++) {
+      // advect this element's SEED point by flowAt + birdWakeAt (so the cord drifts off the wing and downstream).
+      let sx = this.helixSeedX[i]!, sy = this.helixSeedY[i]!, sz = this.helixSeedZ[i]!;
+      const side = this.helixSide[i]!;
+      const [afx, afz, aw] = this.flowAt(sx, sz, t);
+      const aprof = windProfile(sy);
+      let vx = afx * aprof, vy = aw, vz = afz * aprof;
+      this.sampleHelixWake(sx, sy, sz, birdPos, axisX, axisY, axisZ, bs, side, wake);
+      vx += wake[0]; vy += wake[1]; vz += wake[2];
+      sx += vx * dt; sy += vy * dt; sz += vz * dt;
+      const sfloor = this.sampleHeight(sx, sz) + this.minClear;
+      if (sy < sfloor) sy = sfloor;
+      this.helixSeedX[i] = sx; this.helixSeedY[i] = sy; this.helixSeedZ[i] = sz;
+
+      // age fade (head bright on shed, fades over wakeLife) folded into vis so a retiring cord doesn't pop out.
+      const ageFrac = this.helixAge[i]! / this.wakeLife;             // 0 fresh → 1 retire
+      const lifeFade = 1 - smoothstep(0.6, 1.0, ageFrac);            // full life → fades over the last 40%
+      const bornFade = smoothstep(0, this.fadeInTime, this.helixAge[i]!); // ease in on shed (no pop)
+      const vis = lifeFade * bornFade;
+      if (vis <= 0.001) continue; // skip emitting this element (its slot is simply not written → fewer live verts)
+
+      // SHORT backward polyline through flowAt + birdWakeAt (corkscrews around the core). Head = the seed.
+      ptX[0] = sx; ptY[0] = sy; ptZ[0] = sz;
+      let cx = sx, cy = sy, cz = sz;
+      let tfx = vx, tfy = vy, tfz = vz; // first backward step reuses the head's disturbed flow (free)
+      let maxWake = Math.sqrt(wake[0] * wake[0] + wake[1] * wake[1] + wake[2] * wake[2]); // peak |wake| → heat
+      for (let s = 1; s <= seg; s++) {
+        cx -= tfx * this.wakeSegStep;
+        cy -= tfy * this.wakeSegStep;
+        cz -= tfz * this.wakeSegStep;
+        const tb = this.sampleHeight(cx, cz) + this.minClear;
+        if (cy < tb) cy = tb;
+        ptX[s] = cx; ptY[s] = cy; ptZ[s] = cz;
+        if (s < seg) {
+          const [nwx, nwz, nw] = this.flowAt(cx, cz, t);
+          const nprof = windProfile(cy);
+          this.sampleHelixWake(cx, cy, cz, birdPos, axisX, axisY, axisZ, bs, side, wake);
+          const wm = Math.sqrt(wake[0] * wake[0] + wake[1] * wake[1] + wake[2] * wake[2]);
+          if (wm > maxWake) maxWake = wm;
+          tfx = nwx * nprof + wake[0]; tfy = nw + wake[1]; tfz = nwz * nprof + wake[2];
+        }
+      }
+      // heat: warm where the twin-vortex disturbance is strong (the genuine wake), 0..1 vs heatRef.
+      const heat = Math.min(1, maxWake / this.heatRef);
+      // speed tint from the head disturbed horizontal speed (cyan→white), same calibration as the motes.
+      const wspeed = Math.hypot(vx, vz);
+      const u = Math.min(1, Math.max(0, (wspeed - this.speedLo) / (this.speedHi - this.speedLo)));
+      const sp = u * u * (3 - 2 * u);
+
+      // would this element's quads overrun the reserved span? if so STOP (cap protection) — log once.
+      if (vi + seg * 6 * Wind.FPV > maxFloats) {
+        if (!this.wakeOverrunLogged) { console.warn("[wind] wake-shed helix hit reserve cap; halting emit this frame"); this.wakeOverrunLogged = true; }
+        break;
+      }
+      // emit a quad per segment via the CORNERS pattern. wakeTaper biases the head→tail along so the cord
+      // tapers (the VS taper + FS lenFade already darken toward the tail; wakeTaper raises the base ramp).
+      for (let s = 0; s < seg; s++) {
+        const axp = ptX[s]!, ayp = ptY[s]!, azp = ptZ[s]!;
+        const bxp = ptX[s + 1]!, byp = ptY[s + 1]!, bzp = ptZ[s + 1]!;
+        let sdx = bxp - axp, sdz = bzp - azp;
+        const sdl = Math.hypot(sdx, sdz);
+        if (sdl > 1e-5) { sdx /= sdl; sdz /= sdl; } else { sdx = 1; sdz = 0; }
+        const alongN = this.wakeTaper * (s / seg);
+        const alongF = this.wakeTaper * ((s + 1) / seg);
+        for (let c = 0; c < 6; c++) {
+          const [pick, perp] = corners[c]!;
+          const ex = pick > 0.5 ? bxp : axp;
+          const ey = pick > 0.5 ? byp : ayp;
+          const ez = pick > 0.5 ? bzp : azp;
+          const al = pick > 0.5 ? alongF : alongN;
+          v[vi++] = ex; v[vi++] = ey; v[vi++] = ez;
+          v[vi++] = pick; v[vi++] = perp;
+          v[vi++] = sp;
+          v[vi++] = sdx; v[vi++] = sdz;
+          v[vi++] = al; v[vi++] = vis;
+          v[vi++] = heat;
+        }
+      }
+    }
+    this.swirlGain = savedSwirl; // restore (helixGain is shed-only)
+    return (vi - base) / Wind.FPV; // verts actually written
+  }
+
+  // Sample the bird-wake disturbance for a HELIX shed point, honoring counterRotate. When counterRotate=true
+  // (default) birdWakeAt's twin cores already counter-rotate (the −c sign per side). When false, sample the
+  // wake at the point MIRRORED across the centerline for the −side so it picks up the +side's rotational sense
+  // → both cords spiral the SAME way. Writes [x,y,z] into `out` (no allocation).
+  private sampleHelixWake(
+    px: number, py: number, pz: number,
+    birdPos: [number, number, number],
+    axisX: number, axisY: number, axisZ: number,
+    bs: number,
+    side: number,
+    out: [number, number, number]
+  ): void {
+    if (!this._wakeOn) { out[0] = 0; out[1] = 0; out[2] = 0; return; }
+    if (this.counterRotate || side >= 0) {
+      this.birdWakeAt(px, py, pz, birdPos, axisX, axisY, axisZ, bs, out);
+      return;
+    }
+    // counterRotate OFF and this is the −side cord: mirror the sample point across the centerline so the
+    // tangential sense matches the +side, then mirror the resulting lateral component back.
+    const dx = px - birdPos[0], dy = py - birdPos[1], dz = pz - birdPos[2];
+    const lat = dx * this._rx + dy * this._ry + dz * this._rz; // signed lateral offset
+    const mx = px - 2 * lat * this._rx, my = py - 2 * lat * this._ry, mz = pz - 2 * lat * this._rz;
+    this.birdWakeAt(mx, my, mz, birdPos, axisX, axisY, axisZ, bs, out);
+    const olat = out[0] * this._rx + out[1] * this._ry + out[2] * this._rz; // mirror the lateral component back
+    out[0] -= 2 * olat * this._rx; out[1] -= 2 * olat * this._ry; out[2] -= 2 * olat * this._rz;
+  }
+
+  // WAKE-C SHED PRESSURE RINGS: on a ringRate cadence SHED a closed loop of ringSegN short chords, oriented
+  // FACE-ON to the flight axis (plane basis = wingRight and up = axis × wingRight). Each ring persists: radius
+  // += ringGrow·dt, center advected by flowAt + convectFrac·axis·bs·dt (backward), age++, retired at ringLife.
+  // twinOffset>0 = one ring per wingtip (center at birdPos ± wingSpan·right); 0 = centerline train. Each frame,
+  // per live ring, tessellate ringSegN points and emit each consecutive pair as one CORNERS quad with segDir =
+  // around-ring tangent (the VS keeps it a clean constant-px hoop). `along` 0..1 around the loop for fade;
+  // ringTilt tilts the normal by local shear; heat sampled once per ring at spawn; ringWarmBias warms the loaded
+  // (downstream) side. Returns verts written (capped at reserve). windAt / physics untouched.
+  private stepShedRings(
+    birdPos: [number, number, number],
+    axisX: number, axisY: number, axisZ: number,
+    rgx: number, rgy: number, rgz: number,
+    bs: number,
+    moving: boolean,
+    t: number,
+    dt: number,
+    base: number
+  ): number {
+    // up = axis × wingRight (the ring plane's second basis; with wingRight it spans the plane normal to axis).
+    const upx = axisY * rgz - axisZ * rgy, upy = axisZ * rgx - axisX * rgz, upz = axisX * rgy - axisY * rgx;
+
+    // 1) RETIRE aged rings (compact in place), and ADVANCE the survivors (grow + convect backward).
+    let n = this.ringActive;
+    for (let i = 0; i < n; ) {
+      this.ringAge[i]! += dt;
+      if (this.ringAge[i]! >= this.ringLife) {
+        n--;
+        this.ringCx[i] = this.ringCx[n]!; this.ringCy[i] = this.ringCy[n]!; this.ringCz[i] = this.ringCz[n]!;
+        this.ringRadius[i] = this.ringRadius[n]!; this.ringAge[i] = this.ringAge[n]!;
+        this.ringSide[i] = this.ringSide[n]!; this.ringHeat[i] = this.ringHeat[n]!;
+      } else i++;
+    }
+    this.ringActive = n;
+    for (let i = 0; i < this.ringActive; i++) {
+      this.ringRadius[i]! += this.ringGrow * dt;
+      // center advected by the terrain flow + a backward convection along the axis (the ring trails the bird).
+      const cx = this.ringCx[i]!, cy = this.ringCy[i]!, cz = this.ringCz[i]!;
+      const [cfx, cfz, cw] = this.flowAt(cx, cz, t);
+      const cprof = windProfile(cy);
+      const back = this.convectFrac * bs;
+      let ncx = cx + (cfx * cprof - axisX * back) * dt;
+      let ncy = cy + (cw - axisY * back) * dt;
+      let ncz = cz + (cfz * cprof - axisZ * back) * dt;
+      const cfloor = this.sampleHeight(ncx, ncz) + this.minClear;
+      if (ncy < cfloor) ncy = cfloor;
+      this.ringCx[i] = ncx; this.ringCy[i] = ncy; this.ringCz[i] = ncz;
+    }
+
+    // 2) SHED new rings on the ringRate cadence when moving. twinOffset>0 → one per wingtip; 0 → centerline.
+    if (moving) {
+      this.ringEmitAcc += this.ringRate * dt;
+      let owed = Math.floor(this.ringEmitAcc);
+      this.ringEmitAcc -= owed;
+      while (owed > 0) {
+        const sides = this.twinOffset > 0 ? [1, -1] : [0];
+        for (const side of sides) {
+          if (this.ringActive >= Wind.RING_COUNT) break;
+          const off = side * this.wingSpan;
+          const cx = birdPos[0] + rgx * off;
+          const cy = birdPos[1] + rgy * off;
+          const cz = birdPos[2] + rgz * off;
+          // heat sampled once at spawn from |birdWakeAt(center)| (the genuine wake loading the ring).
+          let heat = 0;
+          if (this._wakeOn) {
+            this.birdWakeAt(cx, cy, cz, birdPos, axisX, axisY, axisZ, bs, this._wsWake);
+            heat = Math.min(1, Math.sqrt(this._wsWake[0] ** 2 + this._wsWake[1] ** 2 + this._wsWake[2] ** 2) / this.heatRef);
+          }
+          const k = this.ringActive++;
+          this.ringCx[k] = cx; this.ringCy[k] = cy; this.ringCz[k] = cz;
+          this.ringRadius[k] = this.ringStartRadius; this.ringAge[k] = 0;
+          this.ringSide[k] = side; this.ringHeat[k] = heat;
+        }
+        owed--;
+      }
+    }
+
+    // 3) TESSELLATE + EMIT each live ring. Plane basis (e0,e1) = wingRight, up; tilt the up-axis by ringTilt so
+    // the hoop rakes with the local shear (a fixed tilt toward +axis here — cheap, reads as a tilted hoop).
+    const v = this.vertHost;
+    const corners = Wind.CORNERS;
+    const segN = this.ringSegN;
+    const maxFloats = base + Wind.WAKE_SHED_RESERVE * Wind.FPV;
+    let vi = base;
+    // tilted up-axis = normalize(up + ringTilt·axis) → the ring face rakes toward the flight axis.
+    let tux = upx + this.ringTilt * axisX, tuy = upy + this.ringTilt * axisY, tuz = upz + this.ringTilt * axisZ;
+    const tul = Math.hypot(tux, tuy, tuz);
+    if (tul > 1e-5) { tux /= tul; tuy /= tul; tuz /= tul; } else { tux = upx; tuy = upy; tuz = upz; }
+    for (let i = 0; i < this.ringActive; i++) {
+      // would this ring's quads overrun the reserved span? if so STOP (cap protection) — log once.
+      if (vi + segN * 6 * Wind.FPV > maxFloats) {
+        if (!this.wakeOverrunLogged) { console.warn("[wind] wake-shed rings hit reserve cap; halting emit this frame"); this.wakeOverrunLogged = true; }
+        break;
+      }
+      const cx = this.ringCx[i]!, cy = this.ringCy[i]!, cz = this.ringCz[i]!;
+      const r = this.ringRadius[i]!;
+      const ageFrac = this.ringAge[i]! / this.ringLife;     // 0 fresh → 1 retire
+      const lifeFade = 1 - smoothstep(0.5, 1.0, ageFrac);   // fade over the last half of life
+      const bornFade = smoothstep(0, this.fadeInTime, this.ringAge[i]!);
+      const ringVis = lifeFade * bornFade;
+      const baseHeat = this.ringHeat[i]!;
+      const side = this.ringSide[i]!;
+      // speed tint from the local flow speed at the ring center (cyan→white), same calibration as the motes.
+      const [rfx, rfz] = this.flowAt(cx, cz, t);
+      const rprof = windProfile(cy);
+      const wspeed = Math.hypot(rfx * rprof, rfz * rprof);
+      const u = Math.min(1, Math.max(0, (wspeed - this.speedLo) / (this.speedHi - this.speedLo)));
+      const sp = u * u * (3 - 2 * u);
+      // precompute the loop points (segN points around the circle, closed: point segN == point 0).
+      // emit a quad per consecutive pair. The around-ring tangent is the segDir (clean constant-px hoop).
+      let px0 = cx + rgx * r, py0 = cy + rgy * r, pz0 = cz + rgz * r; // angle 0 (along +wingRight)
+      for (let s = 0; s < segN; s++) {
+        const a1 = (2 * Math.PI * (s + 1)) / segN;
+        const ca = Math.cos(a1), sa = Math.sin(a1);
+        const px1 = cx + (rgx * ca + tux * sa) * r;
+        const py1 = cy + (rgy * ca + tuy * sa) * r;
+        const pz1 = cz + (rgz * ca + tuz * sa) * r;
+        let sdx = px1 - px0, sdz = pz1 - pz0;
+        const sdl = Math.hypot(sdx, sdz);
+        if (sdl > 1e-5) { sdx /= sdl; sdz /= sdl; } else { sdx = 1; sdz = 0; }
+        // along around the loop for a gentle fade; ringWarmBias warms the loaded (downstream −axis) side: the
+        // chord whose midpoint sits on the −side of the wingRight axis (toward the trailing edge) heats more.
+        const midDot = (rgx * (Math.cos(2 * Math.PI * (s + 0.5) / segN)) + tux * (Math.sin(2 * Math.PI * (s + 0.5) / segN))); // wingRight-component of the chord midpoint dir
+        const warm = Math.min(1, baseHeat + this.ringWarmBias * Math.max(0, -side * midDot));
+        const along0 = 0.15; // flat, low ramp so the whole hoop reads (not head-bright)
+        const along1 = 0.15;
+        for (let c = 0; c < 6; c++) {
+          const [pick, perp] = corners[c]!;
+          const ex = pick > 0.5 ? px1 : px0;
+          const ey = pick > 0.5 ? py1 : py0;
+          const ez = pick > 0.5 ? pz1 : pz0;
+          const al = pick > 0.5 ? along1 : along0;
+          v[vi++] = ex; v[vi++] = ey; v[vi++] = ez;
+          v[vi++] = pick; v[vi++] = perp;
+          v[vi++] = sp;
+          v[vi++] = sdx; v[vi++] = sdz;
+          v[vi++] = al; v[vi++] = ringVis;
+          v[vi++] = warm;
+        }
+        px0 = px1; py0 = py1; pz0 = pz1;
+      }
+    }
+    return (vi - base) / Wind.FPV;
+  }
+
   // SECOND pass: LOAD terrain color+depth (no clear); draw the drifting dot motes over the ridges.
   // Takes the bird POS (near-sphere center) and VEL (orients the bird-wake stir inside that sphere).
   draw(
@@ -2106,7 +2572,23 @@ export class Wind {
     if (dt > 0.05) dt = 0.05;
     this.step(camGround, camFwd, camRight, time, birdPos);
     if (this.showNear) this.stepNear(birdPos, birdVel, time, dt); // LOCAL SPHERE off → far-tier (global wind) only
-    // single upload of the combined (far + near) vertex buffer.
+    // WAKE-SHED tier (Phase 2): dedicated helix cords / shed rings into the THIRD span. Driven INDEPENDENTLY of
+    // the near sphere (showNear may be off while shed geometry is on), gated on showWake && wakeMode!=="modulate".
+    // Compute the bird/wing FRAME here (mirrors the top of stepNear) so it's available even when stepNear didn't
+    // run, then hand it to stepWakeShed. When the gate is off, wakeShedLiveCount=0 so draw() skips the shed draw.
+    if (this.showWake && this.wakeMode !== "modulate") {
+      const bvx = birdVel[0], bvy = birdVel[1], bvz = birdVel[2];
+      const bs = Math.hypot(bvx, bvy, bvz);
+      const moving = bs > 0.5;
+      const axisX = moving ? bvx / bs : 0, axisY = moving ? bvy / bs : 0, axisZ = moving ? bvz / bs : 0;
+      let rgx = -axisZ, rgz = axisX; // wing-right = normalize(axis × worldUp); fallback world X if axis ~vertical
+      const rgl = Math.hypot(rgx, rgz);
+      if (rgl > 1e-3) { rgx /= rgl; rgz /= rgl; } else { rgx = 1; rgz = 0; }
+      this.stepWakeShed(birdPos, axisX, axisY, axisZ, rgx, 0, rgz, bs, moving, time, dt);
+    } else {
+      this.wakeShedLiveCount = 0; // wake off / modulate → no shed geometry; the shed draw is skipped
+    }
+    // single upload of the combined (far + near + wake-shed) vertex buffer.
     this.device.queue.writeBuffer(this.vbuf, 0, this.vertBytes);
 
     // dotPx (screen px diameter) → NDC half-width for the ribbon perpendicular thickness. The curved
