@@ -56,6 +56,11 @@ export interface BirdTuning {
   crashBleed?: number;   // fraction of airspeed lost in a crash (0..1)
   crashTime?: number;    // stumble duration after a crash (s) — steering degraded while > 0
   minClearance?: number; // min meters above terrain
+  // VISUAL buffet (phase 3): wind-scaled judder of the DRAWN bird only — never enters this.pos, so the
+  // chase camera (which targets this.pos) stays smooth while the body shakes harder in heavier wind.
+  buffetGain?: number;     // master scale on the wind-scaled visual buffet (rock + render-only tremor)
+  buffetWindRef?: number;  // local wind speed (m/s) mapped to FULL buffet (buffetK saturates to 1 here)
+  rockCapDeg?: number;     // max visual roll from the buffet rock (DEGREES) — clamps the judder
 }
 
 type Vec3 = [number, number, number];
@@ -111,6 +116,7 @@ export class Bird3D {
   bank = 0;      // roll, banks into turns
   renderBank = 0; // bank actually drawn: steering bank + crab lean + buffet rock + stall wing-drop (visual only)
   renderPitch = 0; // pitch actually drawn: control attitude + a gentle nose-up while climbing (visual only)
+  buffetOffset: Vec3 = [0, 0, 0]; // wind-scaled VISUAL judder added ONLY to the DRAWN position in draw() — NEVER to this.pos, so the chase camera (targets this.pos) stays smooth
   stallYaw = 0;    // stall departure: signed wing-drop direction (-1..1), 0 when flying
   tumbleRoll = 0;  // crash tumble: extra roll angle (rad) from a terrain hit — winds up then settles
   tumblePitch = 0; // crash tumble: extra pitch angle (rad) from a terrain hit
@@ -191,6 +197,9 @@ export class Bird3D {
       crashBleed: t.crashBleed ?? 0.65, // a crash dumps ~65% of your airspeed
       crashTime: t.crashTime ?? 0.5,    // ~0.5 s of mushy steering after the hit
       minClearance: t.minClearance ?? 6,
+      buffetGain: t.buffetGain ?? 1,        // 1 = full wind-scaled buffet on top of the calm baseline
+      buffetWindRef: t.buffetWindRef ?? 12, // ~12 m/s of local wind drives the buffet to full strength
+      rockCapDeg: t.rockCapDeg ?? 12,       // hard cap on the visual rock roll (deg) so heavy wind can't over-spin the V
     };
 
     const meshArr = buildVMesh(); // number[]
@@ -430,6 +439,27 @@ export class Bird3D {
     this.pos[1] += cvy * clamped;
     this.pos[2] += cvz * clamped;
 
+    // --- WIND-SCALED VISUAL BUFFET (phase 3): the DRAWN bird shakes harder in heavier wind. Intensity is
+    // read from the SAME horizontal wind the bird is flying through (wx,wz, already sampled above) — no new
+    // field. buffetK saturates to 1 at buffetWindRef m/s so calm air is gentle and a gale clearly judders.
+    // This drives BOTH the render-bank rock magnitude (below) and a render-ONLY position tremor — neither
+    // touches this.pos or this.vel, so the flight FEEL and the chase camera (which targets this.pos) are
+    // unaffected. The velocity shove (shove/cvy) above is the felt flight model and is left UNCHANGED. ---
+    const wMag = Math.hypot(wx, wz);
+    const buffetK = Math.max(0, Math.min(1, wMag / this.tuning.buffetWindRef));
+    if (this.stillAir) {
+      this.buffetOffset[0] = this.buffetOffset[1] = this.buffetOffset[2] = 0;
+    } else {
+      // render-only TREMOR: lateral (along heading-right) + vertical jitter from the same g-oscillators,
+      // amplitude AMP m at full wind. Up to ~1.5 m lateral, ~0.7 m vertical at buffetGain=1, buffetK=1.
+      const AMP = 1.2;
+      const tScale = AMP * this.tuning.buffetGain * buffetK;
+      const lat = 0.5 * g1 * tScale;          // sideways body shudder
+      this.buffetOffset[0] = rightX * lat;
+      this.buffetOffset[1] = 0.6 * g2 * tScale; // vertical bob
+      this.buffetOffset[2] = rightZ * lat;
+    }
+
     // --- terrain contact: skim gently, CRASH if you hit too hard ---
     // terrain at the NEW x,z (post-move) so a fast run into a rising slope is caught this frame.
     const hCnow = this.terrain.sampleHeight(this.pos[0], this.pos[2]);
@@ -477,8 +507,14 @@ export class Bird3D {
     // breeze, like a glider crabbing. Proportional, capped, so it's a visible steady offset (not a wobble).
     const crossWind = wx * rightX + wz * rightZ;       // m/s of wind across the heading (signed)
     const crab = Math.max(-0.18, Math.min(0.18, crossWind * 0.012)); // ~±10° cap, leans with the gust DC
-    // Buffet ROCK: fast roll oscillation ±~0.12 rad (~7°) so the V visibly rolls back and forth.
-    const rock = this.stillAir ? 0 : (0.6 * g1 - 0.4 * g3) * 0.12;
+    // Buffet ROCK: fast roll oscillation that now SCALES with local wind. The 0.4 baseline keeps ~today's
+    // gentle rock in light wind (calm air isn't dead-stiff); buffetGain*buffetK adds extra judder as the
+    // wind builds. Hard-clamped to rockCapDeg so a gale can't over-roll the V. Visual only (renderBank).
+    let rock = this.stillAir
+      ? 0
+      : (0.6 * g1 - 0.4 * g3) * 0.12 * (0.4 + this.tuning.buffetGain * buffetK);
+    const rc = (this.tuning.rockCapDeg * Math.PI) / 180;
+    rock = Math.max(-rc, Math.min(rc, rock));
     const stallRoll = this.stallYaw * 0.15; // stall: a FAINT settling lean (flare mush, not a wing-drop)
     this.renderBank = this.bank + crab + rock + flapBank + stallRoll + this.tumbleRoll; // + crash tumble
     if (typeof window !== "undefined") (window as any).__birdBank = this.renderBank;
@@ -508,7 +544,11 @@ export class Bird3D {
   ): void {
     const u = this.uniformF32;
     u.set(viewProj, 0);                 // [0..16)
-    u[16] = this.pos[0]; u[17] = this.pos[1]; u[18] = this.pos[2];
+    // RENDER-ONLY tremor: the wind-scaled buffet offset is added to the DRAWN position here ONLY. this.pos
+    // itself is untouched, so the chase camera (which targets this.pos) does NOT shake with the buffet.
+    u[16] = this.pos[0] + this.buffetOffset[0];
+    u[17] = this.pos[1] + this.buffetOffset[1];
+    u[18] = this.pos[2] + this.buffetOffset[2];
     u[19] = this.time * this.tuning.flexHz * Math.PI * 2; // flexPhase (idle living flex)
     u[20] = this.heading;
     u[21] = this.renderBank; // steering bank + crab + buffet rock + flap-asymmetry → the V rolls/leans

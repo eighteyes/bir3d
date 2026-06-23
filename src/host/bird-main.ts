@@ -387,6 +387,14 @@ async function boot() {
   sliderRow(tunePanel, gt, "peakGain", 0.5, 3, 0.1);
   sliderRow(tunePanel, gt, "lineWidth", 0.5, 3, 0.1);
 
+  // --- BIRD BUFFET (phase 3): wind-scaled VISUAL judder of the drawn bird (rock + render-only tremor).
+  // Writes straight into bird.tuning; camera is untouched (the tremor never enters bird.pos). ---
+  const bt = bird.tuning as unknown as Record<string, number>;
+  panelSep(tunePanel, "bird — buffet");
+  sliderRow(tunePanel, bt, "buffetGain", 0, 3, 0.1);    // master shake scale (0 = off, 1 = default)
+  sliderRow(tunePanel, bt, "buffetWindRef", 4, 30, 1);  // wind m/s mapped to full buffet (lower = judders sooner)
+  sliderRow(tunePanel, bt, "rockCapDeg", 0, 25, 1);     // max visual roll from the rock (deg)
+
   // --- WIND controls: global-wind ACTIVITY (the altitude atmosphere) + RENDERING, then the two OFF layers ---
   const wr = wind as unknown as Record<string, number>; // live access to the Wind instance's tunable fields
   panelSep(tunePanel, "global wind — activity");
@@ -683,6 +691,7 @@ async function boot() {
     (window as any).__birdGroundTrack = bird.lastGroundTrack; // actual travel dir (rad) — drift proof
     (window as any).__birdWind = bird.lastWind; // [wx,wz] m/s — overlay/diagnostics
     (window as any).__birdVario = bird.lastVario; // climb m/s — lift proof
+    (window as any).__birdBuffet = bird.buffetOffset; // [tx,ty,tz] render-only tremor (NEVER added to bird.pos)
     frame++;
     const headingDeg = ((bird.heading * 180) / Math.PI) % 360;
     const trackDeg = (bird.lastGroundTrack * 180) / Math.PI;
@@ -744,6 +753,10 @@ async function boot() {
   // (drift + ridge lift) and the motes — one shared altitude profile. e.g. deader valleys: {loScale: 0.2}.
   (window as any).__windProfile = (p: Record<string, number>) => setWindProfile(p);
   (window as any).__windProfileAt = (y: number) => windProfile(y); // read the altitude curve (gate + tuning)
+  // BUFFET live tuning (phase 3): set buffet tuning fields the same way the T-panel sliders do, e.g.
+  // __birdTune({ buffetGain: 0 }) to kill the visual buffet, or { buffetGain: 3 } to slam it. Read-back via
+  // __birdBank (visual roll) and __birdBuffet (render-only position tremor — proves it's NOT in bird.pos).
+  (window as any).__birdTune = (p: Partial<typeof bird.tuning>) => Object.assign(bird.tuning, p);
   (window as any).__nearWake = (x: number, y: number, z: number) => wind.sampleWake(x, y, z);
   (window as any).__nearFrame = () => wind.nearFrame();
   // per-tier RENDER MODE switches (phase 1): drive the same setters the T-panel buttons call.
