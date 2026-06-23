@@ -18,6 +18,11 @@
 //         ball are recycled back inside so the sphere follows the bird. Rendered DENSE (no density cull —
 //         vis=1 for every near mote) so the local air is unmistakably legible right where the bird is.
 //     Both tiers share one pipeline/shader/vertex-format and draw in a single combined vertex buffer.
+//     RENDER MODES (phase-1 scaffold): each tier has a selectable MODE (FarMode/NearMode/WakeMode) that
+//       switches which geometry is emitted into that tier's buffer SPAN — the "A" defaults
+//       (comet/comet/modulate) reproduce today's look; divergent B/C geometries land in a later phase. The
+//       buffer carries a THIRD reserved span (worst-case wake-shed quads) so the helix/ring shed geometry
+//       has a home + the draw plumbing is verified early; draw() issues up to three offset draws into it.
 //     v9 model — wind INTERACTS WITH TERRAIN + curved longer tails (supersedes v8's flat streaks):
 //     each mote carries a persisted 3D world position (x,y,z) advected each frame by flowAt() — the
 //     TERRAIN-SHAPED flow built on top of the frozen windAt: (1) VERTICAL — w = horizontalWind ·
@@ -320,6 +325,14 @@ interface DotParams {
   foreStretch?: number;     // forward reach of the near bubble as a multiple of nearRadius (>1 = bigger bubble AHEAD of the bird so motes read in front)
 }
 
+// Per-TIER render MODE selectors (Phase 1 scaffold). Each tier shares the ONE pipeline/shader/vertex
+// format; the mode only switches which geometry is emitted into that tier's buffer span. The "A" default
+// of each tier ("comet"/"comet"/"modulate") reproduces today's look — the divergent B/C geometries land
+// in a later phase (their branches currently fall through to the A emission).
+export type FarMode = "comet" | "stipple" | "chevron";   // FAR / distance long-line tier
+export type NearMode = "comet" | "flecks" | "filaments"; // NEAR / local sphere tier
+export type WakeMode = "modulate" | "helix" | "rings";   // WAKE: "modulate" = today's velocity overlay (no own geometry); helix/rings = future shed geometry into the reserved span
+
 export class Wind {
   private cfg: Required<WindConfig>;
   private count: number;          // total motes
@@ -377,6 +390,12 @@ export class Wind {
   private _wakeOn = false;  // moving && showWake — gates the wake disturbance + wing emission within the near sphere
   private showNear = false; // LOCAL SPHERE (near-mote bubble) drawn? OFF by default — solving global wind first
   private showWake = false; // WAKE (bow/drag/twin-vortices/touched-air + wing emission) applied in the sphere? OFF by default
+  // Per-tier render MODE (Phase 1 scaffold). "A" defaults reproduce today's geometry; B/C currently
+  // fall through to A (see step()/stepNear()). wakeMode "modulate" = today's velocity overlay (no own
+  // geometry); helix/rings will emit into the reserved wake-shed span in a later phase.
+  private farMode: FarMode = "comet";
+  private nearMode: NearMode = "comet";
+  private wakeMode: WakeMode = "modulate";
   private readonly _lastBirdPos: [number, number, number] = [0, 0, 0];
   private nx: Float32Array;   // near-comet world x (per near mote)
   private ny: Float32Array;   // near-comet world y (advected height)
@@ -389,6 +408,11 @@ export class Wind {
   private nearSeeded = false; // first draw with a valid bird pos seeds the ball
   private farVertexCount: number; // far-tier vertices (the long-line population)
   private nearVertexCount: number; // near-tier vertices (the sphere)
+  // THIRD span: dedicated WAKE-SHED geometry (helix cords / shed rings) written AFTER far+near. The full
+  // worst-case span is RESERVED in the buffer now (zero-filled this phase); wakeShedLiveCount tracks how
+  // many verts were actually emitted this frame so draw() only issues the live count (0 until Phase 2).
+  private wakeShedVertexCount: number; // reserved worst-case wake-shed vertices (buffer span)
+  private wakeShedLiveCount = 0;       // wake-shed verts ACTUALLY written this frame (0 this phase → draw skipped)
 
   // PERSISTENT world-space particle state (NOT regenerated each frame — that is what makes them drift).
   // v9: each mote carries a 3D position (x, y, z); y is ADVECTED by the vertical flow w (terrain-shaped),
@@ -437,12 +461,31 @@ export class Wind {
   // far tail render-time smoothing: each coarse segment is subdivided into FAR_SUBDIV rendered segments
   // via Catmull-Rom (interpolating → passes through the original integrated points). Pure geometry; adds
   // NO flowAt/sampleHeight calls (those stay at the coarse `segments` count — the cited CPU cost).
-  private static FAR_SUBDIV = 3;
+  // Phase-1 FAR-A short-comet unify: 3→2. With segments 6→4 the far comet is shorter so it can't show
+  // hard corners at distance; FAR_SUBDIV still smooths each coarse segment via Catmull-Rom (pure geometry).
+  private static FAR_SUBDIV = 2;
   // a quad per ribbon segment: x∈{0,1} picks the segment's near(0)/far(1) endpoint, y∈{-1,1} is the perp.
   private static CORNERS: ReadonlyArray<[number, number]> = [
     [0, -1], [1, -1], [1, 1],
     [0, -1], [1, 1], [0, 1],
   ];
+
+  // --- WAKE-SHED reserved span (Phase 1: plumbing only; zero-filled, never drawn yet) ---
+  // The later wake phase emits dedicated shed geometry (helix cords OR shed rings) into a THIRD buffer span
+  // after far+near. Reserve the worst-case of the two future pools NOW so the buffer + offset plumbing is
+  // built and verified early. 6 verts per quad in both pools (CORNERS quad, shared format).
+  private static QUAD_VERTS = 6;
+  // helix pool: 2 wingtip cords × 160 live segments-per-cord × 4 ribbon segs each.
+  private static HELIX_TIPS = 2;
+  private static HELIX_LIVE = 160;
+  private static HELIX_SEGS = 4;
+  private static HELIX_VERTS = Wind.HELIX_TIPS * Wind.HELIX_LIVE * Wind.HELIX_SEGS * Wind.QUAD_VERTS; // 7680
+  // rings pool: 32 shed rings × 32 chords per ring.
+  private static RING_COUNT = 32;
+  private static RING_CHORDS = 32;
+  private static RINGS_VERTS = Wind.RING_COUNT * Wind.RING_CHORDS * Wind.QUAD_VERTS;                  // 6144
+  // reserve the larger of the two so EITHER wake mode fits without resizing the buffer.
+  private static WAKE_SHED_RESERVE = Math.max(Wind.HELIX_VERTS, Wind.RINGS_VERTS);                    // 7680
 
   constructor(
     private device: GPUDevice,
@@ -510,7 +553,10 @@ export class Wind {
     // fewer flowAt+clamp evals and 40% fewer verts. Tail flowAt is further sub-sampled below (every 2nd
     // segment) to halve the remaining gradient cost while preserving the curve. segStep is the free length
     // knob (no extra verts); the curve survives because flow is still sampled along the path (not reused).
-    this.segments = p.segments ?? 6;
+    // Phase-1 FAR-A short-comet unify: default 6→4 (shorter far comet that can't read as corners at
+    // distance). segStep stays the free length knob; the buffer-sizing formula references this.segments so
+    // the far span auto-updates. The curve still reads (Catmull-Rom over the coarse points).
+    this.segments = p.segments ?? 4;
     this.segStep = p.segStep ?? 0.8;
     // small head: many tiny motes, not star-like blobs.
     this.dotPx = p.dotPx ?? 2.6;
@@ -596,11 +642,14 @@ export class Wind {
     this.nptY = new Float32Array(this.nearSegments + 1);
     this.nptZ = new Float32Array(this.nearSegments + 1);
 
-    // combined vertex buffer: FAR long-line tier + NEAR sphere tier, drawn in one pass (shared format).
-    // FAR uses the SUBDIVIDED segment count (each coarse segment → FAR_SUBDIV rendered ribbon quads).
+    // combined vertex buffer: FAR long-line tier + NEAR sphere tier + reserved WAKE-SHED span, drawn in one
+    // pass (shared format). FAR uses the SUBDIVIDED segment count (each coarse segment → FAR_SUBDIV quads).
+    // The wake-shed span is reserved (worst-case) NOW so the offset plumbing is verified early; it stays
+    // zero-filled this phase (wakeShedLiveCount=0 → its draw is never issued — see draw()).
     this.farVertexCount = this.count * this.segments * Wind.FAR_SUBDIV * 6;
     this.nearVertexCount = this.nearCount * this.nearSegments * 6;
-    this.vertexCount = this.farVertexCount + this.nearVertexCount;
+    this.wakeShedVertexCount = Wind.WAKE_SHED_RESERVE;
+    this.vertexCount = this.farVertexCount + this.nearVertexCount + this.wakeShedVertexCount;
     this.vertBytes = new ArrayBuffer(this.vertexCount * Wind.FPV * 4);
     this.vertHost = new Float32Array(this.vertBytes);
     this.vbuf = device.createBuffer({
@@ -808,6 +857,15 @@ export class Wind {
     const sptX = this.sptX, sptY = this.sptY, sptZ = this.sptZ; // dense Catmull-Rom polyline
     let vi = 0;
     for (let i = 0; i < this.count; i++) {
+      // FAR render-MODE branch (Phase 1 scaffold). Only "comet" (today's geometry) is implemented; the
+      // divergent stipple/chevron geometries fall through to comet for now so the branch + farMode field
+      // exist and are exercised. `continue` inside still targets the for-loop (the degenerate-vis skip).
+      switch (this.farMode) {
+        case "stipple":
+        case "chevron":
+          // Phase 2: divergent far geometry — for now emit the comet ribbon (identical output).
+        case "comet":
+        default: {
       let x0 = this.px[i]!;
       let z0 = this.pz[i]!;
       let y0 = this.py[i]!;
@@ -993,6 +1051,9 @@ export class Wind {
           v[vi++] = 0; // heat=0 (far air is always cool)
         }
       }
+        break; // end FAR "comet" mode emission (stipple/chevron fall through to here in Phase 1)
+        }
+      }
     }
   }
 
@@ -1086,6 +1147,13 @@ export class Wind {
   setShowNear(v: boolean): void { this.showNear = v; }
   setShowWake(v: boolean): void { this.showWake = v; }
 
+  // Per-tier render MODE selectors (Phase 1 scaffold). Switches which geometry each tier emits into its
+  // buffer span. Defaults "comet"/"comet"/"modulate" = today's look; the B/C modes currently fall through
+  // to the A emission (the branch + field exist so the later divergent-geometry phase drops straight in).
+  setFarMode(m: FarMode): void { this.farMode = m; }
+  setNearMode(m: NearMode): void { this.nearMode = m; }
+  setWakeMode(m: WakeMode): void { this.wakeMode = m; }
+
   // v11 NEAR SPHERE: advect the dense little comets around the bird, recycle any that leave the ball back
   // inside, and emit their short CURLING tails into the SAME host vertex array (after the far tier's verts).
   // Same terrain-shaped flowAt → coherent with the shared flow + respects terrain. vis is forced to 1 (NO
@@ -1128,6 +1196,15 @@ export class Wind {
     let vi = this.farVertexCount * Wind.FPV;
 
     for (let i = 0; i < this.nearCount; i++) {
+      // NEAR render-MODE branch (Phase 1 scaffold). Only "comet" (today's geometry) is implemented; the
+      // divergent flecks/filaments geometries fall through to comet for now so the branch + nearMode field
+      // exist and are exercised.
+      switch (this.nearMode) {
+        case "flecks":
+        case "filaments":
+          // Phase 2: divergent near geometry — for now emit the comet ribbon (identical output).
+        case "comet":
+        default: {
       let x0 = this.nx[i]!, y0 = this.ny[i]!, z0 = this.nz[i]!;
 
       // recycle: if the comet has drifted outside the bird-centered ball, reseed it back inside (the
@@ -1241,6 +1318,9 @@ export class Wind {
           v[vi++] = heat;                  // TOUCHED-AIR heat (loc 6) → warm tint in fs
         }
       }
+        break; // end NEAR "comet" mode emission (flecks/filaments fall through to here in Phase 1)
+        }
+      }
     }
   }
 
@@ -1293,7 +1373,16 @@ export class Wind {
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, this.bindGroup);
     pass.setVertexBuffer(0, this.vbuf);
-    pass.draw(this.showNear ? this.vertexCount : this.farVertexCount); // skip the near tier's verts when the local sphere is off
+    // Up to THREE draws into the ONE buffer, addressed by firstVertex offset (the spans are NOT a simple
+    // prefix — near can be off while a future wake-shed draw is on, so each tier is its own draw call). Far
+    // and near rely on shader vis-culling (degenerate quads) so they always draw their FULL reserved count.
+    pass.draw(this.farVertexCount, 1, 0);                                       // FAR (always)
+    if (this.showNear) pass.draw(this.nearVertexCount, 1, this.farVertexCount); // NEAR sphere (when on)
+    // WAKE-SHED: dedicated shed geometry (helix/rings). wakeShedLiveCount is 0 this phase → this draw is
+    // never issued yet, but the buffer span is reserved and the code path exists (verified early).
+    if (this.showWake && this.wakeMode !== "modulate" && this.wakeShedLiveCount > 0) {
+      pass.draw(this.wakeShedLiveCount, 1, this.farVertexCount + this.nearVertexCount);
+    }
     pass.end();
   }
 }
