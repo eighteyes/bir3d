@@ -1,5 +1,52 @@
 # Human Review Steps
 
+## wind render modes — phase 1 scaffold (per-tier A/B/C switch)
+**Date:** 2026-06-23
+**Commits:** 7c774f4, 06de41e, 4a37c60, 955a53c (Phase 1 of the plan; B/C deliberately inert)
+**Session:** wind-render-modes (f65433b5-2d4a-4594-85b6-036787d8f3af)
+**Design:** .ai/explore/2026-06-23-wind-render-modes-design.md · **Plan:** .ai/plan/wind-render-modes/
+
+### What changed (RENDER/UI ONLY — feel/physics frozen; wind.wgsl untouched)
+- Per-tier render-MODE switch on the `Wind` class: `farMode` (comet|stipple|chevron), `nearMode` (comet|flecks|filaments), `wakeMode` (modulate|helix|rings); setters `setFarMode/setNearMode/setWakeMode`. Mode ARRAYS (`FAR_MODES`/`NEAR_MODES`/`WAKE_MODES`) are the single source of truth; the union types derive from them.
+- Phase 1 implements ONLY the "A" look (comet/comet/modulate = today's render). B/C modes are wired end-to-end but FALL THROUGH to A — no divergent geometry yet (that's Phase 2). The comet emission was extracted into `emitFarComet`/`emitNearComet` so Phase 2 geometries slot in as sibling methods.
+- Far comet shortened (`segments` 6→4, `FAR_SUBDIV` 3→2) — the ONLY deliberate visual change; the far tier reads shorter / corner-proof.
+- Vertex buffer reserves a THIRD span (wake-shed, 7680 v) for Phase 2 helix/rings; `draw()` refactored into up to 3 offset draws (far always; near if `showNear`; wake-shed if `showWake && wakeMode!=="modulate"` — never drawn this phase).
+- T-panel: a generic `cycleBtn` + three FAR/NEAR/WAKE mode buttons under a "wind — render modes" group. Console handles `__farMode/__nearMode/__wakeMode`.
+
+### Verified (automated gate, headless — full suite green, tsc exit 0)
+- 6/6 GPU specs pass: `wind-render-modes` (smoke, fps 60), `touched-air`, `slipstream`, `wind-live`, `wind-atmosphere`, `updraft-buffer` — no pageerrors, errors=0, fps 35–60.
+- Frozen-feel CONFIRMED byte-level: diff `70a4408..955a53c` touches only `wind.ts`, `bird-main.ts`, and the new spec — zero changes to bird3d/physics, autopilot, `windAt`/`windProfile`/`updraftAt`, or `wind.wgsl`.
+
+### Pre-work — launch a server FROM THIS WORKTREE (fresh strict port; stale vites can squat ports)
+```
+cd /Users/god/projects/ai-jank/vector-system/.claude/worktrees/mountaintop-forests && ./node_modules/.bin/vite --port 5274 --strictPort
+```
+
+### Verify — cycle the modes in the panel (manual)
+```
+open -a "Google Chrome" "http://localhost:5274/index-bird.html"
+```
+- [ ] Press `T` to open the tuning panel; find the "wind — render modes" group.
+- [ ] Click FAR / NEAR / WAKE to cycle each (comet▸stipple▸chevron, etc.). Should NOT crash and should NOT change the look yet — B/C fall through to A by design in Phase 1.
+- [ ] Toggle "local sphere" and "wake" on (same panel), cycle NEAR/WAKE again — still no crash.
+- [ ] Confirm the far wind comets read SHORTER than before (the one intended visual change).
+
+### Verify — cycle from the console
+```
+__farMode("chevron"); __nearMode("flecks"); __wakeMode("rings")
+```
+- [ ] No errors; demo keeps running. Reset: `__farMode("comet"); __nearMode("comet"); __wakeMode("modulate")`.
+
+### Verify — re-run the smoke spec (fresh server running first)
+```
+cd /Users/god/projects/ai-jank/vector-system/.claude/worktrees/mountaintop-forests && ./node_modules/.bin/playwright test tests/gpu/wind-render-modes.spec.ts --reporter=line
+```
+
+### Verify — re-run the frozen-feel guard
+```
+cd /Users/god/projects/ai-jank/vector-system/.claude/worktrees/mountaintop-forests && ./node_modules/.bin/playwright test tests/gpu/touched-air.spec.ts tests/gpu/wind-live.spec.ts tests/gpu/wind-atmosphere.spec.ts --reporter=line
+```
+
 ## global wind = altitude atmosphere (gameplay: calm low → strong high)
 **Date:** 2026-06-22
 **Commit:** (uncommitted — worktree `.claude/worktrees/mountaintop-forests`, branch `worktree-mountaintop-forests`, based on 58b7e44)
