@@ -25,8 +25,8 @@
 import { acquireDevice } from "./gpu/device";
 import { TerrainEKG } from "./gpu/terrain";
 import { GridTerrain } from "./gpu/terrain-grid";
-import { Bird3D, type BirdInput } from "./gpu/bird3d";
-import { Wind, windAt, setFluidField } from "./gpu/wind";
+import { Bird3D, updraftAt, type BirdInput } from "./gpu/bird3d";
+import { Wind, windAt, setFluidField, setWindProfile, windProfile, windProfileParams } from "./gpu/wind";
 import { FluidWind } from "./gpu/fluid-wind";
 import { GroundMarker } from "./gpu/marker";
 import { Target } from "./gpu/target";
@@ -41,7 +41,7 @@ import { FrameLoop } from "./frameloop";
 // AUTOPILOT MODE (this pass): manual controls OFF — the AutoPilot flies, proving autonomous
 // soaring (find lift, ride it, never touch the ground) before flapping/controls return.
 let autopilot = false; // default MANUAL — YOU fly and feel the wind; press P to hand it to the autopilot
-let showWind = false; // wind motes hidden for now (window.__showWind toggles); fluid sim still runs
+let showWind = true; // neon wind motes drawn over the ridges (window.__showWind toggles); fed by the SAME fluid field that pushes the bird
 // terrain renderer: "ekg" = original camera-relative scan-lines (lines run away); "grid" = world-static
 // wireframe (parallax toward you); "topo" = world-static topographic contour lines. window.__terrainMode(m).
 let terrainMode: "ekg" | "grid" | "topo" = "ekg";
@@ -176,10 +176,10 @@ async function boot() {
     {},
     SAMPLES,
   );
-  // STILL-AIR BASIS: the bird flies dead-calm — no wind drift / ridge lift / thermal / buffet — so the
-  // core glide-and-steer-to-target reads cleanly. Rendering is untouched: the wind motes keep drifting
-  // as ambient atmosphere; the bird simply ignores them. Wind returns later as flair.
-  bird.stillAir = true;
+  // WIND LIVE: the bird flies the moving fluid field — horizontal drift you must correct, ridge lift +
+  // thermals to ride, buffet/gust shake. windGain (bird3d tuning, default 1.6) scales the shove; the
+  // visible motes (showWind) draw the SAME windAt field so you SEE the air that's pushing you.
+  bird.stillAir = false;
 
   // VISIBLE WIND: neon streamline comets over the terrain, integrated from the SAME shared windAt
   // field that pushes the bird (src/host/gpu/wind.ts). Camera-relative like the EKG rows.
@@ -192,7 +192,9 @@ async function boot() {
     HDR_FORMAT,
     (x, z) => terrain.sampleHeight(x, z),
     {},
-    { nearCount: 400 },
+    // FEWER, BETTER motes (user): cut counts ~2× and make each bigger so they read as distinct wind streaks
+    // instead of a faint noisy cloud. dotPx is live-tunable (__wind.dotPx); counts need a reload.
+    { nearCount: 200, numMotes: 700, dotPx: 3.6 },
     SAMPLES,
   );
 
@@ -350,6 +352,8 @@ async function boot() {
     ["climbPower", 0.3, 2.5, 0.05],
     ["dragK", 0.1, 1.5, 0.05],
     ["liftGain", 0, 6, 0.1],
+    ["ridgeLookahead", 0, 150, 5],
+    ["ridgeEps", 6, 40, 2],
     ["windGain", 0, 15, 0.5],
     ["windDrift", 0, 2, 0.1],
     ["minSpeed", 8, 20, 0.5],
@@ -381,6 +385,27 @@ async function boot() {
   sliderRow(tunePanel, gt, "floorFade", 0, 1, 0.02);
   sliderRow(tunePanel, gt, "peakGain", 0.5, 3, 0.1);
   sliderRow(tunePanel, gt, "lineWidth", 0.5, 3, 0.1);
+
+  // --- WIND controls: global-wind ACTIVITY (the altitude atmosphere) + RENDERING, then the two OFF layers ---
+  const wr = wind as unknown as Record<string, number>; // live access to the Wind instance's tunable fields
+  panelSep(tunePanel, "global wind — activity");
+  sliderRow(tunePanel, windProfileParams, "loScale", 0, 2, 0.05);   // valley wind fraction
+  sliderRow(tunePanel, windProfileParams, "hiScale", 0, 3, 0.05);   // aloft wind strength (also ridge-lift strength)
+  sliderRow(tunePanel, windProfileParams, "altLo", 0, 300, 10);     // altitude where calm ends (<altHi)
+  sliderRow(tunePanel, windProfileParams, "altHi", 320, 800, 10);   // altitude of full strength
+  panelSep(tunePanel, "global wind — render");
+  sliderRow(tunePanel, wr, "dotPx", 1, 8, 0.2);                     // mote size
+  sliderRow(tunePanel, wr, "clearance", 5, 150, 5);                 // band height above terrain
+  sliderRow(tunePanel, wr, "vSpread", 10, 150, 5);                  // band thickness / tail
+  sliderRow(tunePanel, wr, "homeBias", 1, 5, 0.2);                  // hug-terrain bias (higher = more hug)
+  panelSep(tunePanel, "local sphere + wake (off — solving global)");
+  toggleBtn(tunePanel, "local sphere", false, (v) => wind.setShowNear(v));
+  toggleBtn(tunePanel, "wake", false, (v) => wind.setShowWake(v));
+  sliderRow(tunePanel, wr, "ambientNearFloor", 0, 1, 0.05);         // sphere stick (1 = full global wind)
+  sliderRow(tunePanel, wr, "foreStretch", 1, 3, 0.1);              // sphere forward reach
+  sliderRow(tunePanel, wr, "swirlGain", 0, 2, 0.1);                // wake vortex strength
+  sliderRow(tunePanel, wr, "wingSpan", 0, 30, 1);                  // wake vortex tip spacing
+  sliderRow(tunePanel, wr, "heatRef", 4, 50, 2);                   // touched-air selectivity (higher = less warm)
 
   document.body.appendChild(tunePanel);
   window.addEventListener("keydown", (e) => {
@@ -592,7 +617,7 @@ async function boot() {
     }
     // wind pass: loads color+depth (no clear); drifting neon DOT motes over the ridges (depth-tested,
     // no depth-write) — advected by the bird's sim time so the drawn field matches the field that pushes.
-    // HIDDEN for now (window.__showWind = true to restore). The fluid sim still runs (drives the bird).
+    // ON by default (window.__showWind(false) hides them); same fluid field drives the bird physics.
     if (showWind) {
       wind.draw(
         enc,
@@ -670,7 +695,7 @@ async function boot() {
     tRel = ((((tRel + 180) % 360) + 360) % 360) - 180;
     const tArrow = tRel > 5 ? "►" : tRel < -5 ? "◄" : "▲";
     overlay.textContent =
-      `vector-system — bird3d (still-air glider · fly to target)${autopilot ? `   AUTO: ${auto.mode} (click/P=manual)` : "   MANUAL (P=autopilot)"}${bird.lastFlapping ? "   ▲ FLAP" : ""}${bird.lastCrashing ? "   ✖ CRASH" : ""}\n` +
+      `vector-system — bird3d (wind glider · fly to target)${autopilot ? `   AUTO: ${auto.mode} (click/P=manual)` : "   MANUAL (P=autopilot)"}${bird.lastFlapping ? "   ▲ FLAP" : ""}${bird.lastCrashing ? "   ✖ CRASH" : ""}\n` +
       `TARGET: ${tDist.toFixed(0)} m   steer ${tArrow} ${Math.abs(tRel).toFixed(0)}°   reached: ${reached}\n` +
       `alt over terrain: ${bird.lastClearance.toFixed(0)} m   air: ${bird.lastSpeed.toFixed(0)} m/s\n` +
       `vario: ${varioStr} m/s ${vario > 0.5 ? "▲" : vario < -0.5 ? "▼" : "—"}   updraft: +${bird.lastUpdraft.toFixed(1)} m/s\n` +
@@ -693,6 +718,27 @@ async function boot() {
   // change across calls comes ONLY from the fluid readback replacing the field each frame — that IS the
   // proof the wind is the evolving fluid (the old analytic curl-noise at a fixed point was quasi-static).
   (window as any).__windAt = (x: number, z: number) => windAt(x, z, 0);
+
+  // LIFT PROBE: the exact ridge+thermal updraft the bird RIDES (and the autopilot senses) at a world point.
+  // tuneOverride lets a test sample the field with different ridgeLookahead/ridgeEps (e.g. lookahead=0) to
+  // measure how much WIDER the L+B lift band is than the local-only band. t fixed at 0 for repeatability.
+  (window as any).__updraftAt = (
+    x: number,
+    z: number,
+    tuneOverride?: Record<string, number>,
+  ) => updraftAt(x, z, 0, terrain, { ...bird.tuning, ...(tuneOverride ?? {}) });
+
+  // SLIPSTREAM live tuning + probes (debug): e.g. __wind.swirlGain = 1.2, __wind.wingSpan = 14,
+  // __wind.ambientNearFloor = 0.1, __wind.wingEmitFrac = 0.6. __nearWake(x,y,z) returns the wake velocity at a
+  // world point (used by the live gate to prove the two wingtip vortices counter-rotate); __nearFrame() gives
+  // the current bird pos + motion axis + wing-right vector.
+  (window as any).__wind = wind;
+  // GLOBAL WIND atmosphere live tuning: __windProfile({loScale, hiScale, altLo, altHi}). Affects BOTH the bird
+  // (drift + ridge lift) and the motes — one shared altitude profile. e.g. deader valleys: {loScale: 0.2}.
+  (window as any).__windProfile = (p: Record<string, number>) => setWindProfile(p);
+  (window as any).__windProfileAt = (y: number) => windProfile(y); // read the altitude curve (gate + tuning)
+  (window as any).__nearWake = (x: number, y: number, z: number) => wind.sampleWake(x, y, z);
+  (window as any).__nearFrame = () => wind.nearFrame();
 
   // perf A/B handle: window.__trees.enabled = false disables the forest pass; window.__trees.treeCount
   // reports how many trees the current window baked.
@@ -736,6 +782,27 @@ function buildTunePanel(
     "font:12px/1.6 monospace;color:#9fe8ff;z-index:10;min-width:240px;";
   for (const [key, min, max, step] of rows) sliderRow(panel, tuning, key, min, max, step);
   return panel;
+}
+
+// a labelled separator heading inside the tuning panel.
+function panelSep(panel: HTMLElement, text: string): void {
+  const sep = document.createElement("div");
+  sep.style.cssText = "border-top:1px solid #3a3360;margin:8px 0 6px;padding-top:6px;color:#c9a8ff;";
+  sep.textContent = text;
+  panel.appendChild(sep);
+}
+
+// a toggle button bound to a boolean setter; reused for the wind layer toggles.
+function toggleBtn(panel: HTMLElement, label: string, initial: boolean, onSet: (v: boolean) => void): void {
+  let on = initial;
+  const btn = document.createElement("button");
+  btn.style.cssText =
+    "width:100%;margin:0 0 6px;padding:4px;background:#241d40;color:#9fe8ff;" +
+    "border:1px solid #4a4070;border-radius:4px;font:12px monospace;cursor:pointer;";
+  const render = () => { btn.textContent = `${label}: ${on ? "ON" : "OFF"}`; };
+  render();
+  btn.onclick = () => { on = !on; onSet(on); render(); };
+  panel.appendChild(btn);
 }
 
 // one slider row bound to obj[key]; reused for bird.tuning and the terrain render controls.

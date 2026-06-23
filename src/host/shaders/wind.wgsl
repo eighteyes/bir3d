@@ -31,6 +31,7 @@ struct VSOut {
   @location(2) speedFrac : f32,      // 0..1 wind speed
   @location(3) viewDist : f32,
   @location(4) vis : f32,            // 0..1 density-fade visibility (0 = culled in calm air)
+  @location(5) heat : f32,           // 0..1 touched-air heat → warm (yellow→red) tint
 };
 
 @vertex
@@ -40,7 +41,8 @@ fn vs(
   @location(2) speedFrac : f32,
   @location(3) segDir : vec2<f32>,   // this segment's world-XZ direction (unit-ish)
   @location(4) along : f32,          // head=0 → tail=1 fade fraction at this endpoint
-  @location(5) vis : f32             // CPU density cull (0 = culled)
+  @location(5) vis : f32,            // CPU density cull (0 = culled)
+  @location(6) heat : f32            // 0..1 touched-air heat (near tier; far tier = 0)
 ) -> VSOut {
   var out : VSOut;
   let clip = U.viewProj * vec4<f32>(endpoint, 1.0);
@@ -71,11 +73,14 @@ fn vs(
   out.speedFrac = speedFrac;
   out.viewDist = length(endpoint - U.eyeAspect.xyz);
   out.vis = vis;
+  out.heat = heat;
   return out;
 }
 
 const CYAN : vec3<f32> = vec3<f32>(0.30, 0.85, 1.0);
 const WHITE : vec3<f32> = vec3<f32>(0.85, 0.97, 1.0);
+const YELLOW : vec3<f32> = vec3<f32>(1.0, 0.8, 0.2);  // touched air, gentle wake
+const RED : vec3<f32> = vec3<f32>(1.0, 0.25, 0.08);   // touched air, hard wake
 
 @fragment
 fn fs(in : VSOut) -> @location(0) vec4<f32> {
@@ -90,13 +95,19 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
   // soften the speed term 1.2→1.0 so slow/calm air READS brightly against the dark (it was dimming below
   // the bloom threshold and reading as absent). Faster wind still brightens to a whiter core, just gentler.
   // density-fade visibility also modulates brightness so motes entering/leaving fade smoothly.
-  let intensity = glow * (1.6 + in.speedFrac * 1.0) * in.vis;
-  let tint = mix(CYAN, WHITE, clamp(in.speedFrac, 0.0, 1.0));
+  let intensity = glow * (1.6 + in.speedFrac * 1.0) * in.vis * (1.0 + 0.5 * in.heat); // touched air a touch brighter so red reads
+  // TOUCHED AIR: blend the cool speed tint toward a warm yellow→red by heat (the wind the bird physically touched).
+  // DEADZONE smoothstep(0.3, 0.6): low heat (the gently-stirred ambient ball) stays PURE cyan — without it, the
+  // faint wake everywhere gives every mote a little heat → a partial cyan↔yellow (complementary) blend that
+  // desaturates to GREY. Only air the wake genuinely touched (heat ≳ 0.3) warms; redness still ramps with heat.
+  let coolTint = mix(CYAN, WHITE, clamp(in.speedFrac, 0.0, 1.0));
+  let warmTint = mix(YELLOW, RED, clamp(in.heat, 0.0, 1.0));
+  let tint = mix(coolTint, warmTint, smoothstep(0.3, 0.6, in.heat));
 
   // distance fog → far motes dissolve into the haze.
   let fog = exp(-U.fog.w * in.viewDist);
 
   var color = tint * intensity * clamp(fog, 0.0, 1.0);
   color = min(color, vec3<f32>(1.2, 1.3, 1.5));
-  return vec4<f32>(color * 0.5, 1.0); // 50% opacity — wind rendered at half brightness (additive blend)
+  return vec4<f32>(color * 0.65, 1.0); // brightness (was 0.5): fewer motes → each reads brighter/cleaner (additive blend)
 }

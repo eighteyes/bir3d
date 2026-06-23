@@ -1,5 +1,176 @@
 # Human Review Steps
 
+## global wind = altitude atmosphere (gameplay: calm low → strong high)
+**Date:** 2026-06-22
+**Commit:** (uncommitted — worktree `.claude/worktrees/mountaintop-forests`, branch `worktree-mountaintop-forests`, based on 58b7e44)
+**Session:** global-wind-atmosphere (f65433b5-2d4a-4594-85b6-036787d8f3af)
+**Design:** .ai/explore/2026-06-22-global-wind-altitude-atmosphere-design.md · **Plan:** .ai/plan/global-wind-atmosphere/
+
+### What changed (GAMEPLAY — unfreezes the bird's windAt consumption)
+- New `windProfile(absoluteY)` (wind.ts): one magnitude curve, calm low → strong high (smoothstep `altLo..altHi`). Multiplied into horizontal wind at EVERY consumer — **uniform, no special rules**.
+- **Drift** (bird3d.integrate) scales by `windProfile(birdY)` — calm valleys, strong open air.
+- **Ridge lift** (`updraftAt`) uses `windAloftScale()` — the STRONG free-stream wind ALOFT, altitude-INDEPENDENT. A 150m ridge has strong wind over it just like a 500m peak, so **ridge soaring works at any ridge height and the bird is never stranded low**. (An earlier draft scaled lift by the bird's absolute altitude — adversarial review caught that it nerfed soaring 25–60% on low/mid ridges and could strand a bird in a valley; corrected to aloft per the original "strong aloft wind" intent.)
+- Terrain shelter (calm valleys) emerges from the DRIFT profile; no lee rule.
+- **Motes** advect by `windAt × windProfile(moteY)` — peak-huggers rip, valley-huggers idle (gradient reads through speed). Far tier reverted to **terrain-hugging** (clearance 60→30) with `homeBias` clustering low + a thin tail aloft so altitude isn't a dead void.
+- Thermals untouched (separate vertical system). Live tuning: `__windProfile({loScale,hiScale,altLo,altHi})`, `__windProfileAt(y)`.
+
+### Verified (automated gate, headless — `tests/gpu/wind-atmosphere.spec.ts`)
+- Curve monotonic: `0:0.40 → 600:1.40`. Ridge lift consumes it: unsaturated spot low=2.33 vs high=7.90 (Δ=5.57).
+- SOARING PRESERVED: autopilot rides 8.0 m/s updraft, no crash, `fps=60`, no errors. Slipstream + touched-air gates still pass (no regression).
+
+### Pre-work — launch a server FROM THIS WORKTREE
+```
+cd /Users/god/projects/ai-jank/vector-system/.claude/worktrees/mountaintop-forests && ./node_modules/.bin/vite --port 5273 --strictPort
+```
+
+### Verify — FEEL the atmosphere (manual flight)
+```
+open -a "Google Chrome" "http://localhost:5273/index-bird.html"
+```
+- [ ] Dive into a valley: drift goes calm (sheltered), the air settles.
+- [ ] Climb into open air / over a high ridge: drift shoves harder, `wind` HUD rises — and ridge soaring still lifts you (climb the windward face, vario stays ▲).
+- [ ] Press `P` (autopilot) and walk away: it still finds lift and does NOT spiral in.
+
+### Verify — tune the curve live (console)
+```
+__windProfile({ loScale: 0.2, hiScale: 1.8 })
+```
+- [ ] Deader valleys / wilder heights. `__windProfileAt(50)` vs `__windProfileAt(450)` shows the curve. Reset: `__windProfile({loScale:0.4, hiScale:1.4, altLo:100, altHi:500})`.
+
+### Verify — re-run the automated gate
+```
+cd /Users/god/projects/ai-jank/vector-system/.claude/worktrees/mountaintop-forests && ./node_modules/.bin/playwright test tests/gpu/wind-atmosphere.spec.ts --config .ai/tmp/wind-verify.config.ts --reporter=line
+```
+
+## wing slipstream (twin wingtip vortices + body that sticks)
+**Date:** 2026-06-22
+**Commit:** (uncommitted — worktree `.claude/worktrees/mountaintop-forests`, branch `worktree-mountaintop-forests`, based on 58b7e44)
+**Session:** felt-wind / slipstream (f65433b5-2d4a-4594-85b6-036787d8f3af)
+
+### What changed (RENDER-ONLY — near-mote sphere; flight physics + far tier + vertex format untouched)
+- **V — twin counter-rotating wingtip vortices** replace the single central swirl in `birdWakeAt` (wind.ts). Two cores at `birdPos ± wingSpan·right` (`right = axis × worldUp`), Rankine falloff peaking at `vortexCore`, circulation sign flips per side → the pair counter-rotates and trails BEHIND the wings.
+- **B — body attach.** Near the bird the ambient terrain-wind is attenuated (`ambientNearFloor` at the bird, ramping to full at the ball edge) so the near sphere rides the bird's own wake and STICKS instead of blowing downwind. Applied to head advection + the curling tail.
+- **C — wingtip emission.** `seedNearMote` now births a `wingEmitFrac` fraction of motes at the wingtips (slightly ahead, with jitter) so the two streams are visibly born at the tips; the rest fill the body uniformly.
+- Live tuning hooks (console): `__wind.swirlGain`, `__wind.wingSpan`, `__wind.vortexCore`, `__wind.wingEmitFrac`, `__wind.ambientNearFloor`. Probes `__nearWake(x,y,z)` / `__nearFrame()`.
+
+### Verified (automated gate, headless ANGLE/Metal — `tests/gpu/slipstream.spec.ts`)
+- COUNTER-ROTATION: circulation behind the two wingtips reads `right=-3.65`, `left=+12.67` — opposite sign, real magnitude ⇒ the vortices genuinely counter-rotate.
+- `fps=60`, no crash, no pageerrors. Screenshot: `test-results/slipstream.png`.
+
+### Pre-work — launch a server FROM THIS WORKTREE (a stale `:5173` from another worktree serves OLD code)
+```
+cd /Users/god/projects/ai-jank/vector-system/.claude/worktrees/mountaintop-forests && ./node_modules/.bin/vite --port 5273 --strictPort
+```
+
+### Verify — SEE the slipstream (manual flight, WebGPU browser)
+```
+open -a "Google Chrome" "http://localhost:5273/index-bird.html"
+```
+- [ ] In a fast glide, two mote streams visibly trail off the wingtips (not one central spiral).
+- [ ] The near sphere reads as ATTACHED to the bird — motes flow past/with it rather than blowing away downwind.
+- [ ] The streams curl (counter-rotating corkscrews), strongest just behind the wings, fading by the ball edge.
+
+### Verify — tune the feel live (browser console)
+```
+__wind.wingSpan = 16
+```
+- [ ] Wider tip separation → the two streams move apart. Try `__wind.swirlGain = 1.2` (more curl), `__wind.wingEmitFrac = 0.7` (denser streams), `__wind.ambientNearFloor = 0.05` (sticks harder).
+
+### Verify — re-run the automated gate (needs the worktree server on :5273 from pre-work)
+```
+cd /Users/god/projects/ai-jank/vector-system/.claude/worktrees/mountaintop-forests && ./node_modules/.bin/playwright test tests/gpu/slipstream.spec.ts --config .ai/tmp/wind-verify.config.ts --reporter=line
+```
+
+## updraft buffer off hills (ridge lift kicks in earlier — L+B)
+**Date:** 2026-06-22
+**Commit:** (uncommitted — worktree `.claude/worktrees/mountaintop-forests`, branch `worktree-mountaintop-forests`, based on 58b7e44)
+**Session:** felt-wind / updraft-buffer (f65433b5-2d4a-4594-85b6-036787d8f3af)
+
+### What changed (FLIGHT PHYSICS — previously frozen, unfrozen on request)
+- The bird used to need to skim a slope before ridge lift kicked in. Two mechanisms give a buffer so lift appears earlier on the approach:
+  - **L (lookahead)** — ridge lift also samples the terrain gradient `ridgeLookahead` m DOWNWIND (toward the windward face the wind compresses into) and takes the MAX with the local value. Lift can only appear EARLIER, never less than the bird's own position already gives.
+  - **B (broaden)** — the ridge gradient is a central difference over a wider half-step `ridgeEps` (was a hardcoded 6 m) → a softer, wider lift band reaching off the face.
+- De-duplicated the ridge-lift math: `Bird3D.integrate` now CALLS the exported `updraftAt` (single source of truth) instead of a hand-synced copy — so the autopilot senses EXACTLY the air the bird rides. The horizontal-drift deflection gradient is untouched (still eps=6, still matched to the motes).
+- New live `T`-panel sliders: `ridgeLookahead` (0–150 m, default 50) and `ridgeEps` (6–40 m, default 14). Dial to taste.
+- Debug probe `window.__updraftAt(x, z, tuneOverride?)` returns the exact ridden updraft; pass `{ridgeLookahead:0}` to compare against the no-buffer field.
+
+### Verified (automated gate, headless ANGLE/Metal — `tests/gpu/updraft-buffer.spec.ts`)
+- Lift band L+B vs no-buffer baseline: **6397 vs 4631** lift cells (of 10201) — ~38% wider.
+- **1823 buffer cells**: spots where the old geometry gave ~no lift but L+B gives real lift (≥0.8 m/s).
+- `maxLift = 8.00` both configs — the anti-launch cap (8 m/s) still holds; physics not destabilized.
+- Flight under autopilot: rides updraft 8.0 m/s, `fps=60`, no crash, no pageerrors.
+
+### Pre-work — launch a server FROM THIS WORKTREE (a stale `:5173` from another worktree serves OLD code)
+```
+cd /Users/god/projects/ai-jank/vector-system/.claude/worktrees/mountaintop-forests && ./node_modules/.bin/vite --port 5273 --strictPort
+```
+
+### Verify — FEEL the bigger buffer (manual flight, WebGPU browser)
+```
+open -a "Google Chrome" "http://localhost:5273/index-bird.html"
+```
+- [ ] Fly toward a windward (into-the-wind) hill at a shallow approach: `vario` goes positive (▲) / `updraft` climbs while you are still well OFF the slope — not only once you are skimming it.
+- [ ] Press `T`, drag `ridgeLookahead` to 0: lift should now feel "late" again (you must get close). Drag it back up (50–120): lift returns earlier. That swing IS the buffer.
+- [ ] Drag `ridgeEps` higher: the lift band feels broader/softer; lower (6): tighter and peakier.
+- [ ] Press `P` (autopilot) and walk away: it still holds course and does NOT spiral into the ground (the autopilot senses the same buffered lift).
+
+### Verify — measure the buffer (browser console)
+```
+__updraftAt(__birdPos[0], __birdPos[2])
+```
+- [ ] Compare against the no-buffer field at the same point: `__updraftAt(__birdPos[0], __birdPos[2], {ridgeLookahead:0, ridgeEps:6})` — the first (L+B) should be ≥ the second wherever a windward face is within lookahead.
+
+### Verify — re-run the automated gate (needs the worktree server on :5273 from pre-work)
+```
+cd /Users/god/projects/ai-jank/vector-system/.claude/worktrees/mountaintop-forests && ./node_modules/.bin/playwright test tests/gpu/updraft-buffer.spec.ts --config .ai/tmp/wind-verify.config.ts --reporter=line
+```
+
+## wind re-enabled (bird feels it + motes drawn)
+**Date:** 2026-06-21
+**Commit:** (uncommitted — worktree `.claude/worktrees/mountaintop-forests`, branch `worktree-mountaintop-forests`, based on 58b7e44)
+**Session:** wind-reenable (f65433b5-2d4a-4594-85b6-036787d8f3af)
+
+### What changed
+- Both wind consumers turned back ON in `bird-main.ts` (the fluid sim itself never stopped — only its two consumers were parked):
+  - PHYSICS: `bird.stillAir = false` (was `true`). The bird now flies the moving fluid field — horizontal drift you must correct, ridge lift + thermals to ride, buffet/gust shake. `windGain` (bird3d tuning, default 1.6) scales the shove.
+  - MOTES: `showWind = true` (was `false`). The neon streamline-comet motes draw over the ridges again, fed by the SAME `windAt` field that pushes the bird. Toggle live with `window.__showWind(false|true)`.
+  - Comments corrected to match (no longer claim "still-air basis" / "hidden for now"); HUD title relabelled `still-air glider` → `wind glider`.
+- GATE (`tests/gpu/wind-live.spec.ts`, NEW): boots the live app, hands control to autopilot, samples telemetry ~3 s, and asserts wind is FELT (non-zero, flyable band), EVOLVES (moving fluid), DRIFTS (heading vs ground-track gap), stays CONTROLLABLE (no crash), runs (fps>15), and errors-free. Writes `test-results/wind-live.png` (gitignored) as the visual mote proof.
+
+### Verified (automated gate, headless ANGLE/Metal)
+- `meanMag=11.8 m/s  maxMag=14.3` — dead-center in the documented flyable band (regulator targets mean ~10 / max ~16).
+- `evolveΔ=1.35` (field is the moving fluid, not frozen) · `maxDrift=23.4°` (bird genuinely crabs) · `fps=60` · `crashed=false` · no pageerrors.
+
+### Pre-work — launch a server FROM THIS WORKTREE (a stale `:5173` from another worktree serves OLD code)
+```
+cd /Users/god/projects/ai-jank/vector-system/.claude/worktrees/mountaintop-forests && ./node_modules/.bin/vite --port 5273 --strictPort
+```
+
+### Verify — SEE the wind (open in a WebGPU browser: Chrome/Edge)
+```
+open -a "Google Chrome" "http://localhost:5273/index-bird.html"
+```
+- [ ] Cyan neon mote-comets stream over the ridges (not a still scene).
+- [ ] Bottom-right compass shows a GAP between the cyan (heading) and yellow (ground-track) arrows — that gap is the drift.
+- [ ] HUD `wind:` line reads non-zero m/s (≈10–15); HUD title reads `wind glider`.
+
+### Verify — FEEL the wind (manual flight)
+- [ ] Mouse-steer across a ridge: the bird visibly crabs sideways (you correct heading) and `DRIFT` on the HUD swings non-zero.
+- [ ] Cross a windward face: `vario` goes positive (▲) as ridge lift carries you — climb without flapping.
+- [ ] Press `P` (autopilot) and walk away: it holds course and does NOT spiral into the ground.
+
+### Verify — the motes toggle (browser console)
+```
+window.__showWind(false)
+```
+- [ ] Motes vanish, bird KEEPS drifting (physics independent of the render toggle). Re-run with `true` to restore.
+
+### Verify — re-run the automated gate (needs the worktree server on :5273 from pre-work)
+```
+cd /Users/god/projects/ai-jank/vector-system/.claude/worktrees/mountaintop-forests && ./node_modules/.bin/playwright test tests/gpu/wind-live.spec.ts --config .ai/tmp/wind-verify.config.ts --reporter=line
+```
+NOTE: the `.ai/tmp/wind-verify.config.ts` override is needed ONLY because stale vite servers from other worktrees occupy `:5173` and the committed `playwright.config.ts` has `reuseExistingServer:true` (it would test their OLD code). In a clean environment with nothing on `:5173`, the standard `./node_modules/.bin/playwright test tests/gpu/wind-live.spec.ts` starts its own correct server.
+
 ## mountaintop neon forests (algorithmic trees)
 **Date:** 2026-06-18
 **Commit:** (uncommitted — worktree `.claude/worktrees/mountaintop-forests`, branch `worktree-mountaintop-forests`, based on 99bfc9a)

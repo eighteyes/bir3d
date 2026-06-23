@@ -21,7 +21,7 @@
 //   - forwardVec()/heading expose the chase convention (+Z forward) for the camera.
 
 import type { TerrainEKG } from "./terrain";
-import { windAt, thermalAt, flowHorizontal } from "./wind";
+import { windAt, thermalAt, flowHorizontal, windProfile, windAloftScale } from "./wind";
 
 export interface BirdInput {
   yawRate: number;     // rad/s, from mouse-x offset (rate: hold to keep turning)
@@ -41,6 +41,8 @@ export interface BirdTuning {
   windGain?: number;     // analytic wind push scale
   windDrift?: number;    // fraction of horizontal wind the bird drifts with
   liftGain?: number;     // ridge updraft scale (vertical air-motion m/s per unit wind·slope)
+  ridgeLookahead?: number; // m DOWNWIND (toward the windward face the wind compresses into) the ridge-lift gradient is also sampled (MAX'd with local) → lift kicks in BEFORE the bird skims the slope (the "bigger buffer off hills")
+  ridgeEps?: number;       // m central-diff half-step for the ridge-lift gradient — BROADEN to widen/soften the lift band reaching off the face
   deflect?: number;      // terrain into-slope deflection of horizontal drift — MUST match Wind.deflect to ride the motes
   flexHz?: number;       // subtle idle wing-flex frequency (living glide, NOT a flap beat)
   flexAmp?: number;      // subtle idle wing-flex amplitude (rad)
@@ -67,14 +69,32 @@ export function updraftAt(
   terrain: TerrainEKG,
   T: Required<BirdTuning>
 ): number {
+  // ATMOSPHERE: ridge lift uses the STRONG free-stream wind ALOFT (windAloftScale), NOT the bird's calm
+  // low-altitude value — so ridge soaring works at ANY ridge height (low/mid ridges included) and the bird is
+  // never stranded in a valley. Drift IS altitude-scaled (in integrate); only LIFT pins to the aloft strength.
+  const prof = windAloftScale();
   const [bwx, bwz] = windAt(x, z, t);
-  const wx = bwx * T.windGain;
-  const wz = bwz * T.windGain;
-  const eps = 6;
-  const hC = terrain.sampleHeight(x, z);
-  const gx = (terrain.sampleHeight(x + eps, z) - hC) / eps;
-  const gz = (terrain.sampleHeight(x, z + eps) - hC) / eps;
-  const ridge = Math.max(0, wx * gx + wz * gz) * T.liftGain;
+  const wx = bwx * T.windGain * prof;
+  const wz = bwz * T.windGain * prof;
+  // RIDGE LIFT = wind · uphill-gradient, clamped to the windward (rising-into-wind) faces. Two upgrades give
+  // the "bigger buffer off hills" so the bird isn't forced to skim the slope before lift kicks in:
+  //   B (broaden): the gradient is a CENTRAL difference over a wide half-step (ridgeEps, was a hardcoded 6) →
+  //                a softer, wider lift band that reaches further off the steepest face.
+  //   L (lookahead): also sample the gradient ridgeLookahead metres DOWNWIND (toward the windward faces the
+  //                  wind runs into) and take the MAX with the local value — so lift appears EARLIER on the
+  //                  approach but can never be LESS than what the bird's own position already provides.
+  const e = T.ridgeEps;
+  const ws = Math.hypot(bwx, bwz);
+  const inv = ws > 1e-4 ? 1 / ws : 0;           // unit wind dir = downwind (toward the windward slope); 0 in dead calm (ridge≈0 anyway)
+  const lx = x + bwx * inv * T.ridgeLookahead;
+  const lz = z + bwz * inv * T.ridgeLookahead;
+  const gx0 = (terrain.sampleHeight(x + e, z) - terrain.sampleHeight(x - e, z)) / (2 * e);
+  const gz0 = (terrain.sampleHeight(x, z + e) - terrain.sampleHeight(x, z - e)) / (2 * e);
+  const gxL = (terrain.sampleHeight(lx + e, lz) - terrain.sampleHeight(lx - e, lz)) / (2 * e);
+  const gzL = (terrain.sampleHeight(lx, lz + e) - terrain.sampleHeight(lx, lz - e)) / (2 * e);
+  const ridgeLocal = Math.max(0, wx * gx0 + wz * gz0);
+  const ridgeAhead = Math.max(0, wx * gxL + wz * gzL);
+  const ridge = Math.max(ridgeLocal, ridgeAhead) * T.liftGain;
   const thermal = thermalAt(x, z, t) * 1.8; // stronger sparse cores (see integrate)
   return Math.min(8.0, ridge + thermal);    // cap mirrors integrate's anti-launch clamp (v14: 5.5→8.0)
 }
@@ -153,6 +173,8 @@ export class Bird3D {
       windGain: t.windGain ?? 1.6,  // multiplier on the shared windAt field (CRANKED)
       windDrift: t.windDrift ?? 1.0, // fraction of horizontal wind the glider drifts with
       liftGain: t.liftGain ?? 3.5,   // v14: stronger ridge lift (2.5→3.5) — soaring the windward ridges sustains you
+      ridgeLookahead: t.ridgeLookahead ?? 50, // L: sample ridge lift 50m DOWNWIND toward the windward face (max with local) → feel a hill before skimming it (the buffer)
+      ridgeEps: t.ridgeEps ?? 14,             // B: broadened gradient half-step (was hardcoded 6) → wider, softer lift band off the face
       deflect: t.deflect ?? 0.25,    // v17b REVERTED to 0.25 (the no-complaint baseline): syncing to the motes (0.45)
                                      // + the taller RELIEF (steeper gradients saturate flowHorizontal's into-slope shed)
                                      // made the bird's drift SPATIALLY LUMPY — dead between ridges, hard swing crossing
@@ -340,27 +362,27 @@ export class Bird3D {
     const [bwx, bwz] = this.stillAir
       ? ([0, 0] as [number, number])
       : windAt(this.pos[0], this.pos[2], this.time);
-    const rwx = bwx * T.windGain; // RAW gained horizontal — drives RIDGE LIFT (into-slope component intact)
-    const rwz = bwz * T.windGain;
+    // ATMOSPHERE: scale the bird's gained wind by the absolute-altitude profile (calm low → strong high) BEFORE
+    // it drives drift — high/open air shoves harder, valleys settle. updraftAt applies the SAME profile to ridge
+    // lift (keyed on the bird's altitude), so drift + lift stay uniform with one rule.
+    const drProf = windProfile(this.pos[1]);
+    const rwx = bwx * T.windGain * drProf; // gained horizontal drift, altitude-scaled
+    const rwz = bwz * T.windGain * drProf;
+    // DEFLECTION gradient: central-diff at eps=6, kept matched to Wind.flowAt so the bird drifts with the
+    // VISIBLE motes (NOT the ridge-lift gradient — that lives in updraftAt with its own broaden+lookahead).
     const eps = 6;
-    const hC = this.terrain.sampleHeight(this.pos[0], this.pos[2]);
     const hX = this.terrain.sampleHeight(this.pos[0] + eps, this.pos[2]);
     const hZ = this.terrain.sampleHeight(this.pos[0], this.pos[2] + eps);
-    const gx = (hX - hC) / eps; // uphill gradient (forward diff) — ridge lift, unchanged
-    const gz = (hZ - hC) / eps;
-    // DRIFT uses the terrain-DEFLECTED wind (the SAME shared fn the motes ride) so the bird drifts with the
-    // VISIBLE flow, not the raw field. Central-diff gradient (e=eps) matches Wind.flowAt exactly — reuse
-    // hX/hZ and add the two −e samples (2 extra sampleHeight/frame, negligible). Ridge lift below keeps the
-    // RAW wind so windward soaring is unchanged (deflection sheds exactly the into-slope lift component).
     const hXm = this.terrain.sampleHeight(this.pos[0] - eps, this.pos[2]);
     const hZm = this.terrain.sampleHeight(this.pos[0], this.pos[2] - eps);
+    // DRIFT uses the terrain-DEFLECTED wind (the SAME shared fn the motes ride) so the bird drifts with the
+    // VISIBLE flow, not the raw field. RAW wind (rwx,rwz) still drives ridge lift inside updraftAt below.
     const [wx, wz] = flowHorizontal(rwx, rwz, (hX - hXm) / (2 * eps), (hZ - hZm) / (2 * eps), T.deflect);
     this.lastWind = [wx, wz]; // telemetry (overlay + compass) shows the DRIFT the bird feels — matches the motes
-    // (kept in sync via the exported updraftAt — same ridge+thermal+cap math; gx/gz reused above)
-    const into = rwx * gx + rwz * gz; // RAW wind · uphill → ridge lift (undeflected, soaring intact)
-    const ridge = Math.max(0, into) * T.liftGain;
-    const thermal = this.stillAir ? 0 : thermalAt(this.pos[0], this.pos[2], this.time) * 1.8; // v8: stronger thermal cores (sparse but rewarding to find); NOT scaled by the horizontal-wind crank
-    const updraft = Math.min(8.0, ridge + thermal); // CAP (v14: 5.5→8.0): strong ridge/thermal lift sustains a climb without launching the bird (was spiking +25 on steep windward faces)
+    // RIDGE + THERMAL lift via the SHARED updraftAt — single source of truth (was duplicated here), so the
+    // autopilot SENSES exactly the air the bird RIDES, now including the L+B buffer. stillAir = dead-calm
+    // airframe basis → no lift. The anti-launch cap (min 8.0) lives inside updraftAt.
+    const updraft = this.stillAir ? 0 : updraftAt(this.pos[0], this.pos[2], this.time, this.terrain, T);
     this.lastUpdraft = updraft;
 
     // --- sink: minimal at trim, mushes CUBICALLY when slow — at minSpeed full-nose-up the
