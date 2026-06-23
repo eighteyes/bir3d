@@ -847,6 +847,39 @@ export class Wind {
     if (dt < 0) dt = 0;
     if (dt > 0.05) dt = 0.05; // clamp stalls
 
+    let vi = 0;
+    for (let i = 0; i < this.count; i++) {
+      // FAR render-MODE branch (Phase 1 scaffold). Only "comet" (today's geometry) is implemented; the
+      // divergent stipple/chevron geometries fall through to comet for now so the branch + farMode field
+      // exist and are exercised.
+      switch (this.farMode) {
+        case "stipple":
+        case "chevron":
+          // Phase 2: divergent far geometry — for now emit the comet ribbon (identical output).
+        case "comet":
+        default:
+          vi = this.emitFarComet(i, camGround, camFwd, camRight, t, birdPos, dt, vi);
+          break; // end FAR "comet" mode emission (stipple/chevron fall through to here in Phase 1)
+      }
+    }
+  }
+
+  // FAR "comet" geometry emission for one mote (index i). Advects this.px/py/pz, then integrates a curved,
+  // Catmull-Rom-smoothed tail and writes its quads into this.vertHost starting at vertex-float cursor `vi`,
+  // RETURNING the advanced cursor. Extracted verbatim from step()'s mode switch (review follow-up): the body
+  // is unchanged so the default farMode="comet" output is byte-identical. A degenerate (collapsed) ribbon is
+  // emitted when vis≤0.001 so the draw count stays fixed; that early-out RETURNS the advanced cursor (was a
+  // loop `continue`). The divergent stipple/chevron geometries will get their own emit methods in Phase 2.
+  private emitFarComet(
+    i: number,
+    camGround: [number, number],
+    camFwd: [number, number],
+    camRight: [number, number],
+    t: number,
+    birdPos: [number, number, number],
+    dt: number,
+    vi: number
+  ): number {
     const lo = this.speedLo;
     const hi = this.speedHi;
     const v = this.vertHost;
@@ -855,17 +888,6 @@ export class Wind {
     const denseSeg = seg * Wind.FAR_SUBDIV;          // rendered (subdivided) segment count per tail
     const ptX = this.ptX, ptY = this.ptY, ptZ = this.ptZ;
     const sptX = this.sptX, sptY = this.sptY, sptZ = this.sptZ; // dense Catmull-Rom polyline
-    let vi = 0;
-    for (let i = 0; i < this.count; i++) {
-      // FAR render-MODE branch (Phase 1 scaffold). Only "comet" (today's geometry) is implemented; the
-      // divergent stipple/chevron geometries fall through to comet for now so the branch + farMode field
-      // exist and are exercised. `continue` inside still targets the for-loop (the degenerate-vis skip).
-      switch (this.farMode) {
-        case "stipple":
-        case "chevron":
-          // Phase 2: divergent far geometry — for now emit the comet ribbon (identical output).
-        case "comet":
-        default: {
       let x0 = this.px[i]!;
       let z0 = this.pz[i]!;
       let y0 = this.py[i]!;
@@ -974,7 +996,7 @@ export class Wind {
             v[vi++] = 0;              // heat=0 (far air is always cool)
           }
         }
-        continue;
+        return vi; // degenerate ribbon only (was a loop `continue`); cursor advanced past the collapsed quads
       }
 
       // CURVED TAIL: integrate BACKWARD along flowAt from the head, building a polyline of seg+1 points.
@@ -1051,10 +1073,7 @@ export class Wind {
           v[vi++] = 0; // heat=0 (far air is always cool)
         }
       }
-        break; // end FAR "comet" mode emission (stipple/chevron fall through to here in Phase 1)
-        }
-      }
-    }
+      return vi;
   }
 
   // Bird-wake disturbance velocity (visuals only) at world point (px,py,pz): a bow-wave OUTWARD ahead of the
@@ -1187,11 +1206,6 @@ export class Wind {
       this.nearSeeded = true;
     }
 
-    const lo = this.speedLo, hi = this.speedHi;
-    const v = this.vertHost;
-    const corners = Wind.CORNERS;
-    const seg = this.nearSegments;
-    const ptX = this.nptX, ptY = this.nptY, ptZ = this.nptZ;
     // write after the far tier's verts.
     let vi = this.farVertexCount * Wind.FPV;
 
@@ -1204,7 +1218,35 @@ export class Wind {
         case "filaments":
           // Phase 2: divergent near geometry — for now emit the comet ribbon (identical output).
         case "comet":
-        default: {
+        default:
+          vi = this.emitNearComet(i, birdPos, t, dt, axisX, axisY, axisZ, bs, moving, vi);
+          break; // end NEAR "comet" mode emission (flecks/filaments fall through to here in Phase 1)
+      }
+    }
+  }
+
+  // NEAR "comet" geometry emission for one mote (index i). Advects this.nx/ny/nz by the terrain-shaped flow
+  // PLUS the bird wake, integrates a curling tail, and writes its quads into this.vertHost starting at the
+  // vertex-float cursor `vi`, RETURNING the advanced cursor. Extracted verbatim from stepNear()'s mode switch
+  // (review follow-up): the body is unchanged so the default nearMode="comet" output is byte-identical. The
+  // per-frame wake frame (axis/speed/moving + this._wake*/_wakeOn) is computed by the caller; passed in here.
+  private emitNearComet(
+    i: number,
+    birdPos: [number, number, number],
+    t: number,
+    dt: number,
+    axisX: number,
+    axisY: number,
+    axisZ: number,
+    bs: number,
+    moving: boolean,
+    vi: number
+  ): number {
+    const lo = this.speedLo, hi = this.speedHi;
+    const v = this.vertHost;
+    const corners = Wind.CORNERS;
+    const seg = this.nearSegments;
+    const ptX = this.nptX, ptY = this.nptY, ptZ = this.nptZ;
       let x0 = this.nx[i]!, y0 = this.ny[i]!, z0 = this.nz[i]!;
 
       // recycle: if the comet has drifted outside the bird-centered ball, reseed it back inside (the
@@ -1318,10 +1360,7 @@ export class Wind {
           v[vi++] = heat;                  // TOUCHED-AIR heat (loc 6) → warm tint in fs
         }
       }
-        break; // end NEAR "comet" mode emission (flecks/filaments fall through to here in Phase 1)
-        }
-      }
-    }
+      return vi;
   }
 
   // SECOND pass: LOAD terrain color+depth (no clear); draw the drifting dot motes over the ridges.
