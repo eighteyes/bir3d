@@ -195,7 +195,7 @@ async function boot() {
     {},
     // FEWER, BETTER motes (user): cut counts ~2× and make each bigger so they read as distinct wind streaks
     // instead of a faint noisy cloud. dotPx is live-tunable (__wind.dotPx); counts need a reload.
-    { nearCount: 200, numMotes: 700, dotPx: 3.6 },
+    { nearCount: 200, numMotes: 4000, dotPx: 3.6 },
     SAMPLES,
   );
 
@@ -415,8 +415,8 @@ async function boot() {
   cycleBtn(tunePanel, "WAKE", WAKE_MODES, "modulate", (m) => wind.setWakeMode(m));
   // --- per-mode tuning DIALS (phase 2 finish): the render-mode geometry fields, grouped by tier+mode ---
   panelSep(tunePanel, "far — stipple");
-  sliderRow(tunePanel, wr, "dashCountK", 2, 4, 1);
-  sliderRow(tunePanel, wr, "dashLenM", 3, 20, 1);
+  sliderRow(tunePanel, wr, "dashCountK", 2, 8, 1);
+  sliderRow(tunePanel, wr, "dashLenM", 3, 160, 1);
   sliderRow(tunePanel, wr, "gapRatio", 0.5, 3, 0.1);
   sliderRow(tunePanel, wr, "leadBoost", 1, 2, 0.1);
   panelSep(tunePanel, "far — chevron");
@@ -445,6 +445,7 @@ async function boot() {
   toggleBtn(tunePanel, "local sphere", false, (v) => wind.setShowNear(v));
   toggleBtn(tunePanel, "wake", false, (v) => wind.setShowWake(v));
   sliderRow(tunePanel, wr, "ambientNearFloor", 0, 1, 0.05);         // sphere stick (1 = full global wind)
+  sliderRow(tunePanel, wr, "nearJitter", 0, 0.6, 0.02);            // per-mote direction randomness (rad; 0 = uniform)
   sliderRow(tunePanel, wr, "foreStretch", 1, 3, 0.1);              // sphere forward reach
   sliderRow(tunePanel, wr, "swirlGain", 0, 2, 0.1);                // wake vortex strength
   sliderRow(tunePanel, wr, "wingSpan", 0, 30, 1);                  // wake vortex tip spacing

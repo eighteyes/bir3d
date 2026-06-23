@@ -197,7 +197,7 @@ export class Bird3D {
       crashBleed: t.crashBleed ?? 0.65, // a crash dumps ~65% of your airspeed
       crashTime: t.crashTime ?? 0.5,    // ~0.5 s of mushy steering after the hit
       minClearance: t.minClearance ?? 6,
-      buffetGain: t.buffetGain ?? 1,        // 1 = full wind-scaled buffet on top of the calm baseline
+      buffetGain: t.buffetGain ?? 0.3,      // 0.3 = gentle in-frame sway (tuned by feel); bird moves in frame, camera stays put
       buffetWindRef: t.buffetWindRef ?? 12, // ~12 m/s of local wind drives the buffet to full strength
       rockCapDeg: t.rockCapDeg ?? 12,       // hard cap on the visual rock roll (deg) so heavy wind can't over-spin the V
     };

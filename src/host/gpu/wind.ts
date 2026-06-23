@@ -302,6 +302,7 @@ interface DotParams {
   nearRadius?: number;   // radius (m) of the sphere around the bird
   nearSegments?: number; // tail segment count for the LITTLE comets (short → distinct from far lines)
   nearSegStep?: number;  // seconds of flow integrated per near-comet tail segment (short tail)
+  nearJitter?: number;   // per-mote random rotation (rad) of the near-comet flow direction so motes aren't uniform (0 = off)
   // --- v12 FADE envelope (no-pop on recycle): fade IN on (re)seed, fade OUT before recycle ---
   fadeInTime?: number;   // seconds over which a freshly seeded mote ramps vis 0→1 (smoothstep)
   fadeFarEdge?: number;  // meters before a FAR span boundary where the fade-OUT begins (→0 at the edge)
@@ -403,6 +404,7 @@ export class Wind {
   private nearRadius: number;
   private nearSegments: number;
   private nearSegStep: number;
+  private nearJitter: number;
   // v12 FADE envelope tuning.
   private fadeInTime: number;
   private fadeFarEdge: number;
@@ -484,6 +486,7 @@ export class Wind {
   private nz: Float32Array;   // near-comet world z
   private nearAge: Float32Array; // v12 FADE: per-near-comet AGE (s since last seed/recycle) → fade-IN ramp
   private nearHeat: Float32Array; // TOUCHED-AIR: per-near-comet heat (0..1) — decays over heatTau; warm tint + longer tail
+  private nearJit: Float32Array;  // per-near-mote random sign/amount [-1,1] for the direction jitter (set at seed)
   private nptX: Float32Array; // scratch polyline for the near comet (nearSegments+1)
   private nptY: Float32Array;
   private nptZ: Float32Array;
@@ -697,6 +700,7 @@ export class Wind {
     this.nearRadius = p.nearRadius ?? 65;
     this.nearSegments = p.nearSegments ?? 4; // a 4th segment → smoother CURLING tail arcs
     this.nearSegStep = p.nearSegStep ?? 0.12;
+    this.nearJitter = p.nearJitter ?? 0.12; // a tiny bit of per-mote direction variety so the sphere isn't lockstep
 
     // v12 FADE: motes RECYCLE (far = span-boundary reseed; near = ball-edge reseed) and the position
     // SNAPS to a new seed → a hard POP in at the new spot and POP out when it leaves. Fold a fade envelope
@@ -801,6 +805,7 @@ export class Wind {
     this.nz = new Float32Array(this.nearCount);
     this.nearAge = new Float32Array(this.nearCount);
     this.nearHeat = new Float32Array(this.nearCount); // TOUCHED-AIR: per-mote heat (0..1), warm tint + longer tail
+    this.nearJit = new Float32Array(this.nearCount);  // per-mote direction-jitter amount [-1,1], assigned at seed
     // NEAR-B: persisted per-mote long-axis (XZ unit dir) for the optional orientLerp slerp toward velocity.
     this.fleckDirX = new Float32Array(this.nearCount);
     this.fleckDirZ = new Float32Array(this.nearCount);
@@ -949,7 +954,7 @@ export class Wind {
   private seedNearMote(i: number, birdPos: [number, number, number]): void {
     const R = this.nearRadius;
     let x: number, y0: number, z: number;
-    if (this._wakeOn && Math.random() < this.wingEmitFrac) {
+    if (this._wakeOn && (this.wakeMode === "modulate" || this.nearMode === "filaments") && Math.random() < this.wingEmitFrac) {
       // WINGTIP EMISSION: born near a wingtip (birdPos ± wingSpan·right), slightly AHEAD along the motion axis
       // so it immediately streams BACK through that tip's vortex → the visible "off the wing" cord.
       const side = Math.random() < 0.5 ? 1 : -1;
@@ -989,6 +994,7 @@ export class Wind {
     this.nz[i] = z;
     this.nearAge[i] = 0; // v12 FADE: fresh seed → age 0 so the fade-IN envelope ramps this comet up.
     this.nearHeat[i] = 0; // TOUCHED-AIR: a freshly (re)seeded mote is untouched air → cool until the wake hits it.
+    this.nearJit[i] = Math.random() * 2 - 1; // fresh per-mote direction-jitter sign/amount so the cloud isn't uniform
   }
 
   // TERRAIN-SHAPED flow at world (x,z): the frozen horizontal windAt, plus a VERTICAL component and a
@@ -1409,7 +1415,7 @@ export class Wind {
     // 1/(K + (K-1)·gapRatio) of the arc... but we want the LEAD dash at the head (frac 0). So center_k =
     // k·pitch where pitch = 1/max(1,K-1) when K>1 spaces them evenly head→~near-tail, and gapRatio biases
     // the inter-dash spacing implicitly via where we stop (≤ ~0.85 so the last dash isn't at the very tail).
-    const K = Math.max(1, Math.round(this.dashCountK));
+    const K = Math.max(1, Math.min((this.FAR_VERTS_PER_MOTE / 6) | 0, Math.round(this.dashCountK))); // ≤ slot (no overrun)
     // dash length in world meters, scaled by altitude (proxied by speedFrac) via lenByAltitude:
     // full length when lenByAltitude=0; at =1 the length scales 0.4→1 with sp (low altitude/calm → shorter).
     const altScale = 1 - this.lenByAltitude * (1 - (0.4 + 0.6 * sp));
@@ -1799,7 +1805,12 @@ export class Wind {
       // added to windAt (flight physics frozen) — it lives only in this near-mote advection + the curling tail.
       const [fwx0, fwz0, w] = this.flowAt(x0, z0, t);
       const prof = windProfile(y0); // ATMOSPHERE: near motes ride the SAME altitude-scaled global wind as the bird
-      const wx = fwx0 * prof, wz = fwz0 * prof;
+      // per-mote DIRECTION JITTER: rotate the AMBIENT flow by a small persistent random angle so the near motes
+      // don't all stream in lockstep (nearJitter rad; 0 = off). The bird WAKE added below stays physical/true.
+      const ja = this.nearJit[i]! * this.nearJitter;
+      const jc = Math.cos(ja), jjs = Math.sin(ja);
+      const wx0 = fwx0 * prof, wz0 = fwz0 * prof;
+      const wx = wx0 * jc - wz0 * jjs, wz = wx0 * jjs + wz0 * jc;
       let ibx = 0, iby = 0, ibz = 0;
       if (this._wakeOn) {
         this.birdWakeAt(x0, y0, z0, birdPos, axisX, axisY, axisZ, bs, this._wake);
@@ -1865,11 +1876,13 @@ export class Wind {
         // re-sample the disturbed flow at the NEW point for the NEXT step → the tail curls along the wake.
         if (s < seg) {
           const [nwx, nwz, nw] = this.flowAt(cx, cz, t);
+          // rotate the re-sampled ambient flow by the SAME per-mote jitter so the whole tail points consistently.
+          const rnx = nwx * prof * jc - nwz * prof * jjs, rnz = nwx * prof * jjs + nwz * prof * jc;
           if (this._wakeOn) {
             this.birdWakeAt(cx, cy, cz, birdPos, axisX, axisY, axisZ, bs, this._wake);
-            tfx = nwx * prof * ambientW + this._wake[0]; tfy = nw * ambientW + this._wake[1]; tfz = nwz * prof * ambientW + this._wake[2];
+            tfx = rnx * ambientW + this._wake[0]; tfy = nw * ambientW + this._wake[1]; tfz = rnz * ambientW + this._wake[2];
           } else {
-            tfx = nwx * prof; tfy = nw; tfz = nwz * prof;
+            tfx = rnx; tfy = nw; tfz = rnz;
           }
         }
       }
