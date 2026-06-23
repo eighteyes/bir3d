@@ -334,6 +334,14 @@ interface DotParams {
   limbLenM?: number;        // world-meters length of each chevron limb from apex to tip
   apexBoost?: number;       // brightness multiplier at the apex (the bright point of the arrow)
   rakeBySpeed?: number;     // 0..1 — how strongly speedFrac sharpens the spread + grows the limbs (faster = sharper dart)
+  // --- NEAR-B SHEAR FLECKS (single oriented dash whose length/brightness reads local velocity shear) — render-only, near tier ---
+  fleckLen?: number;        // base world-meters length of the dash (full 2-point span = ±0.5·len along the local velocity dir)
+  shearGain?: number;       // how strongly local shear magnitude stretches the fleck: len = fleckLen·(1 + shearGain·shearMag)
+  shearRadius?: number;     // world-meters half-span of the finite-diff used to measure shear across the flow (head ± shearRadius·dir)
+  fleckTaper?: number;      // low `along` ramp ceiling so the dash reads as a FLAT tracer (not a head-bright mini-comet)
+  orientLerp?: number;      // 0..1 slerp of the long axis toward the current velocity each frame (0 = snap to current dir)
+  // --- NEAR-C CURL FILAMENTS (thin thread that corkscrews around the wingtip vortex cores) — render-only, near tier ---
+  filSegStep?: number;      // seconds of flow integrated per filament tail segment (LONGER than nearSegStep → looser, readable spiral)
 }
 
 // Per-TIER render MODE selectors (Phase 1 scaffold). Each tier shares the ONE pipeline/shader/vertex
@@ -407,6 +415,17 @@ export class Wind {
   private limbLenM: number;
   private apexBoost: number;
   private rakeBySpeed: number;
+  // NEAR-B SHEAR FLECKS dials (see DotParams).
+  private fleckLen: number;
+  private shearGain: number;
+  private shearRadius: number;
+  private fleckTaper: number;
+  private orientLerp: number;
+  // NEAR-C CURL FILAMENTS dials (see DotParams).
+  private filSegStep: number;
+  // NEAR-B per-mote long-axis (XZ unit dir) persisted so orientLerp can slerp it toward velocity each frame.
+  private fleckDirX: Float32Array;
+  private fleckDirZ: Float32Array;
   // reusable scratch for the per-point bird-wake disturbance (avoids allocation in the hot near-tail loop).
   private readonly _wake: [number, number, number] = [0, 0, 0];
   // per-frame near-wake FRAME (motion axis + wing-right unit + speed + bird pos + moving flag) — set at the top
@@ -659,6 +678,17 @@ export class Wind {
     this.apexBoost = p.apexBoost ?? 1.5;
     this.rakeBySpeed = p.rakeBySpeed ?? 0.5;
 
+    // NEAR-B SHEAR FLECKS: a single short oriented dash per mote, length+brightness driven by local velocity
+    // shear (finite-diff across ±shearRadius). NO backward integration. Defaults per spec.
+    this.fleckLen = p.fleckLen ?? 3;
+    this.shearGain = p.shearGain ?? 1.5;
+    this.shearRadius = p.shearRadius ?? 3;
+    this.fleckTaper = p.fleckTaper ?? 0.2;
+    this.orientLerp = p.orientLerp ?? 0;
+    // NEAR-C CURL FILAMENTS: backward integration (same as the comet) but a LONGER per-segment reach so the
+    // wingtip-vortex corkscrew reads as a loose spiral. Default per spec.
+    this.filSegStep = p.filSegStep ?? 0.25;
+
     this.px = new Float32Array(this.count);
     this.py = new Float32Array(this.count);
     this.pz = new Float32Array(this.count);
@@ -678,6 +708,9 @@ export class Wind {
     this.nz = new Float32Array(this.nearCount);
     this.nearAge = new Float32Array(this.nearCount);
     this.nearHeat = new Float32Array(this.nearCount); // TOUCHED-AIR: per-mote heat (0..1), warm tint + longer tail
+    // NEAR-B: persisted per-mote long-axis (XZ unit dir) for the optional orientLerp slerp toward velocity.
+    this.fleckDirX = new Float32Array(this.nearCount);
+    this.fleckDirZ = new Float32Array(this.nearCount);
     this.nptX = new Float32Array(this.nearSegments + 1);
     this.nptY = new Float32Array(this.nearSegments + 1);
     this.nptZ = new Float32Array(this.nearSegments + 1);
@@ -1594,17 +1627,21 @@ export class Wind {
     let vi = this.farVertexCount * Wind.FPV;
 
     for (let i = 0; i < this.nearCount; i++) {
-      // NEAR render-MODE branch (Phase 1 scaffold). Only "comet" (today's geometry) is implemented; the
-      // divergent flecks/filaments geometries fall through to comet for now so the branch + nearMode field
-      // exist and are exercised.
+      // NEAR render-MODE branch (Phase 2). Each mode fills the SAME fixed per-mote stride
+      // (NEAR_VERTS_PER_MOTE = nearSegments·6 verts): flecks emit ONE 2-segment dash (12 verts) then PAD the
+      // remainder with degenerate (vis=0) verts; filaments + comet integrate the full nearSegments-segment
+      // ribbon (no pad). All three return vi advanced by exactly NEAR_VERTS_PER_MOTE·FPV.
       switch (this.nearMode) {
         case "flecks":
+          vi = this.emitNearFlecks(i, birdPos, t, dt, axisX, axisY, axisZ, bs, moving, vi);
+          break; // NEAR-B: oriented shear dash
         case "filaments":
-          // Phase 2: divergent near geometry — for now emit the comet ribbon (identical output).
+          vi = this.emitNearFilaments(i, birdPos, t, dt, axisX, axisY, axisZ, bs, moving, vi);
+          break; // NEAR-C: curl filament corkscrewing the wingtip vortices
         case "comet":
         default:
           vi = this.emitNearComet(i, birdPos, t, dt, axisX, axisY, axisZ, bs, moving, vi);
-          break; // end NEAR "comet" mode emission (flecks/filaments fall through to here in Phase 1)
+          break; // NEAR-A: short curling comet (today's geometry)
       }
     }
   }
@@ -1745,6 +1782,304 @@ export class Wind {
         }
       }
       return vi;
+  }
+
+  // FIXED per-mote near-tier vertex stride. stepNear() always fills the near span exactly, and that span is
+  // sized nearCount * nearSegments * 6 — so EVERY near mote owns exactly this many vertices regardless of which
+  // nearMode emitted it. emitNearComet/emitNearFilaments fill it entirely (nearSegments segments × 6);
+  // emitNearFlecks emits FEWER real quads and PADS the remainder with degenerate (vis=0) verts, advancing the
+  // cursor by exactly this many so the next mote lands at the correct offset. (Mirrors FAR_VERTS_PER_MOTE.)
+  private get NEAR_VERTS_PER_MOTE(): number {
+    return this.nearSegments * 6;
+  }
+
+  // Emit ONE degenerate (collapsed, vis=0) near vertex at cursor `vi` and return the advanced cursor. All 11
+  // floats are 0 — the VS collapses vis<0.001 to a point and the FS discards vis<=0.001, so the reserved
+  // padding draws nothing. Used by the divergent near geometry (flecks) to fill its fixed slot after the real
+  // quads, keeping the per-mote stride constant (see NEAR_VERTS_PER_MOTE). Near equivalent of emitDegenerateFarVert.
+  private emitDegenerateNearVert(vi: number): number {
+    const v = this.vertHost;
+    v[vi++] = 0; v[vi++] = 0; v[vi++] = 0; // pos
+    v[vi++] = 0; v[vi++] = 0;              // corner
+    v[vi++] = 0;                           // speedFrac
+    v[vi++] = 0; v[vi++] = 0;              // segDir
+    v[vi++] = 0; v[vi++] = 0;              // along, vis (vis=0 → discarded)
+    v[vi++] = 0;                           // heat
+    return vi;
+  }
+
+  // NEAR-B SHEAR FLECKS geometry emission for one mote (index i). Shares emitNearComet's advection/recycle/heat/
+  // fade bookkeeping (so the sphere follows the bird and reads the same touched-air), but the GEOMETRY is a single
+  // SHORT 2-segment oriented dash centered on the head along the LOCAL disturbed-velocity dir — NO backward path
+  // integration. Length + brightness read local velocity SHEAR (finite-diff of flowAt+birdWakeAt across
+  // ±shearRadius). Emits 1 quad (6 verts) and PADS the rest of the fixed slot with degenerate verts; returns the
+  // cursor advanced by exactly NEAR_VERTS_PER_MOTE·FPV.
+  private emitNearFlecks(
+    i: number,
+    birdPos: [number, number, number],
+    t: number,
+    dt: number,
+    axisX: number,
+    axisY: number,
+    axisZ: number,
+    bs: number,
+    moving: boolean,
+    vi: number
+  ): number {
+    const slotEnd = vi + this.NEAR_VERTS_PER_MOTE * Wind.FPV; // exact end of this mote's fixed stride
+    const lo = this.speedLo, hi = this.speedHi;
+    const v = this.vertHost;
+    const corners = Wind.CORNERS;
+    let x0 = this.nx[i]!, y0 = this.ny[i]!, z0 = this.nz[i]!;
+
+    // recycle (identical to the comet): outside the forward-stretched bubble → reseed back inside.
+    const dxb = x0 - birdPos[0], dyb = y0 - birdPos[1], dzb = z0 - birdPos[2];
+    if (this.bubbleFrac(dxb, dyb, dzb) > 1) {
+      this.seedNearMote(i, birdPos);
+      x0 = this.nx[i]!; y0 = this.ny[i]!; z0 = this.nz[i]!;
+    }
+
+    // LOCAL disturbed flow at the head (windAt-derived terrain flow + bird wake), the SAME sample the comet
+    // takes for advection. This is the dash's orientation source AND the center of the shear finite-diff.
+    const [fwx0, fwz0, w] = this.flowAt(x0, z0, t);
+    const prof = windProfile(y0);
+    const wx = fwx0 * prof, wz = fwz0 * prof;
+    let ibx = 0, iby = 0, ibz = 0;
+    if (this._wakeOn) {
+      this.birdWakeAt(x0, y0, z0, birdPos, axisX, axisY, axisZ, bs, this._wake);
+      ibx = this._wake[0]; iby = this._wake[1]; ibz = this._wake[2];
+    }
+    const adx = x0 - birdPos[0], ady = y0 - birdPos[1], adz = z0 - birdPos[2];
+    const rrFrac = Math.min(1, Math.sqrt(adx * adx + ady * ady + adz * adz) / this.nearRadius);
+    const ambientW = moving ? this.ambientNearFloor + (1 - this.ambientNearFloor) * rrFrac : 1;
+    // FULL disturbed velocity at the head (global immersion + bird wake) — the dash orients along its XZ dir.
+    const fwx = wx * ambientW + ibx, fwy = w * ambientW + iby, fwz = wz * ambientW + ibz;
+
+    // TOUCHED-AIR heat (identical to the comet): decay + max with the current wake gain; warm tint + length.
+    const wakeMag = Math.sqrt(ibx * ibx + iby * iby + ibz * ibz);
+    const gain = Math.min(1, wakeMag / this.heatRef);
+    const heat = Math.max(this.nearHeat[i]! * Math.exp(-dt / this.heatTau), gain);
+    this.nearHeat[i] = heat;
+
+    // advect the mote head (so flecks DRIFT through the field like the comet, just without a trailing tail).
+    const x = x0 + fwx * dt;
+    const z = z0 + fwz * dt;
+    const terr = this.sampleHeight(x, z);
+    let y = y0 + fwy * dt;
+    const loY = terr + this.minClear;
+    if (y < loY) y = loY;
+    this.nx[i] = x; this.ny[i] = y; this.nz[i] = z;
+
+    // fade envelope (no-pop) — identical to the comet so flecks ease in/out at the ball edge.
+    this.nearAge[i]! += dt;
+    const fadeIn = smoothstep(0, this.fadeInTime, this.nearAge[i]!);
+    const ndx = x - birdPos[0], ndy = y - birdPos[1], ndz = z - birdPos[2];
+    const distFrac = this.bubbleFrac(ndx, ndy, ndz);
+    const fadeOut = 1 - smoothstep(this.fadeNearEdge, 1, distFrac);
+    const nearVis = fadeIn * fadeOut;
+
+    // UNIT dash dir = the disturbed-velocity dir in world XZ at the head. Fallback to the motion axis / +X.
+    let ux = fwx, uz = fwz;
+    let ul = Math.hypot(ux, uz);
+    if (ul > 1e-5) { ux /= ul; uz /= ul; } else if (moving) { ux = axisX; uz = axisZ; ul = Math.hypot(ux, uz); if (ul > 1e-5) { ux /= ul; uz /= ul; } else { ux = 1; uz = 0; } } else { ux = 1; uz = 0; }
+
+    // SHEAR magnitude: finite-difference the disturbed velocity across the flow at head ± shearRadius·dir.
+    // shearMag = |v(head + d) − v(head − d)| / (2·shearRadius), with d = shearRadius·dashDir (XZ). Two extra
+    // flowAt+birdWakeAt samples (the only extra field cost — flecks have no per-segment tail, so net cheaper).
+    const sr = this.shearRadius;
+    const hpx = x0 + ux * sr, hpz = z0 + uz * sr;   // head + d
+    const hmx = x0 - ux * sr, hmz = z0 - uz * sr;   // head − d
+    const [pfx0, pfz0] = this.flowAt(hpx, hpz, t);
+    const pprof = windProfile(y0);
+    let pvx = pfx0 * pprof, pvz = pfz0 * pprof;
+    const [mfx0, mfz0] = this.flowAt(hmx, hmz, t);
+    let mvx = mfx0 * pprof, mvz = mfz0 * pprof;
+    if (this._wakeOn) {
+      this.birdWakeAt(hpx, y0, hpz, birdPos, axisX, axisY, axisZ, bs, this._wake);
+      pvx = pvx * ambientW + this._wake[0]; pvz = pvz * ambientW + this._wake[2];
+      this.birdWakeAt(hmx, y0, hmz, birdPos, axisX, axisY, axisZ, bs, this._wake);
+      mvx = mvx * ambientW + this._wake[0]; mvz = mvz * ambientW + this._wake[2];
+    }
+    const shearMag = Math.hypot(pvx - mvx, pvz - mvz) / (2 * sr);
+
+    // ORIENT: optionally lerp the persisted long-axis toward the current velocity dir (orientLerp=0 → snap).
+    if (this.fleckDirX[i] === 0 && this.fleckDirZ[i] === 0) { this.fleckDirX[i] = ux; this.fleckDirZ[i] = uz; }
+    let dirX: number, dirZ: number;
+    if (this.orientLerp > 0 && moving) {
+      const k = Math.min(1, this.orientLerp);
+      dirX = this.fleckDirX[i]! * (1 - k) + ux * k;
+      dirZ = this.fleckDirZ[i]! * (1 - k) + uz * k;
+      const dl = Math.hypot(dirX, dirZ);
+      if (dl > 1e-5) { dirX /= dl; dirZ /= dl; } else { dirX = ux; dirZ = uz; }
+    } else { dirX = ux; dirZ = uz; }
+    this.fleckDirX[i] = dirX; this.fleckDirZ[i] = dirZ;
+
+    // LENGTH: base fleckLen stretched by shear → uniform air = short, shear layers = long. SHORT 2-segment dash
+    // = head ± 0.5·len along the long axis (flat, in the mote's near-horizontal plane).
+    const len = this.fleckLen * (1 + this.shearGain * shearMag);
+    const half = 0.5 * len;
+    const p0x = x - dirX * half, p0z = z - dirZ * half; const p0y = y; // one end
+    const p1x = x + dirX * half, p1z = z + dirZ * half; const p1y = y; // other end
+
+    // BRIGHTNESS via speedFrac (it already drives intensity): drive it from SHEAR so high-shear flecks brighten.
+    // sheared brightness reads the moving shear surfaces; the calm speed read is kept as a floor so still air
+    // isn't black. shearMag is normalized through the same speedLo/Hi band the comet uses (m/s-scale).
+    const wspeed = Math.hypot(fwx, fwz);
+    const us = Math.min(1, Math.max(0, (wspeed - lo) / (hi - lo)));
+    const spBase = us * us * (3 - 2 * us);
+    const shu = Math.min(1, Math.max(0, (shearMag - lo) / (hi - lo)));
+    const spShear = shu * shu * (3 - 2 * shu);
+    const sp = Math.max(spBase * 0.4, spShear); // shear leads; a low speed floor keeps uniform air faintly lit
+
+    // FLAT low-taper `along`: clamp the ramp to ≤ fleckTaper so the dash reads as a FLAT tracer (not head-bright).
+    // The shader fades intensity by (1-along)^p, so a LOW along on BOTH ends keeps the whole dash near-uniform.
+    const along0 = 0;
+    const along1 = Math.min(this.fleckTaper, 0.5); // never a full head→tail comet ramp; capped for a flat read
+    // segDir for screen-space perp (XZ), normalized (= the dash dir).
+    const sdx = dirX, sdz = dirZ;
+    // emit ONE quad (the dash). pick: 0 = head-side end (p0), 1 = far end (p1).
+    for (let c = 0; c < 6; c++) {
+      const [pick, perp] = corners[c]!;
+      const ex = pick > 0.5 ? p1x : p0x;
+      const ey = pick > 0.5 ? p1y : p0y;
+      const ez = pick > 0.5 ? p1z : p0z;
+      const al = pick > 0.5 ? along1 : along0;
+      v[vi++] = ex; v[vi++] = ey; v[vi++] = ez;
+      v[vi++] = pick; v[vi++] = perp;
+      v[vi++] = sp;
+      v[vi++] = sdx; v[vi++] = sdz;
+      v[vi++] = al; v[vi++] = nearVis;
+      v[vi++] = heat; // TOUCHED-AIR heat (loc 6) → warm tint, kept from the existing near-heat path
+    }
+    // PAD the remainder of the fixed slot with degenerate (vis=0) verts so the per-mote stride stays constant.
+    while (vi < slotEnd) vi = this.emitDegenerateNearVert(vi);
+    return vi;
+  }
+
+  // NEAR-C CURL FILAMENTS geometry emission for one mote (index i). The SAME backward integration as
+  // emitNearComet (through flowAt + birdWakeAt, whose twin-Rankine tangential term curls the tail around the
+  // wingtip cores) BUT with a LONGER per-segment reach (filSegStep vs nearSegStep) so the corkscrew is longer/
+  // looser and the curl reads. Integrates over nearSegments segments → fills the slot EXACTLY (no pad, same as
+  // the comet). Constant thin width, gentle head→tail fade (reuses the comet's along/vis/heat handling). Seeding
+  // toward the two wingtip cores is already honored by seedNearMote via wingEmitFrac when the wake is on.
+  private emitNearFilaments(
+    i: number,
+    birdPos: [number, number, number],
+    t: number,
+    dt: number,
+    axisX: number,
+    axisY: number,
+    axisZ: number,
+    bs: number,
+    moving: boolean,
+    vi: number
+  ): number {
+    const lo = this.speedLo, hi = this.speedHi;
+    const v = this.vertHost;
+    const corners = Wind.CORNERS;
+    const seg = this.nearSegments;
+    const ptX = this.nptX, ptY = this.nptY, ptZ = this.nptZ;
+    let x0 = this.nx[i]!, y0 = this.ny[i]!, z0 = this.nz[i]!;
+
+    // recycle (identical to the comet): outside the forward-stretched bubble → reseed back inside (seedNearMote
+    // honors wingEmitFrac when the wake is on, so filaments are born preferentially at the two wingtip cores).
+    const dxb = x0 - birdPos[0], dyb = y0 - birdPos[1], dzb = z0 - birdPos[2];
+    if (this.bubbleFrac(dxb, dyb, dzb) > 1) {
+      this.seedNearMote(i, birdPos);
+      x0 = this.nx[i]!; y0 = this.ny[i]!; z0 = this.nz[i]!;
+    }
+
+    // advect by the terrain-shaped flow PLUS the bird wake (the twin Rankine vortices) — identical to the comet.
+    const [fwx0, fwz0, w] = this.flowAt(x0, z0, t);
+    const prof = windProfile(y0);
+    const wx = fwx0 * prof, wz = fwz0 * prof;
+    let ibx = 0, iby = 0, ibz = 0;
+    if (this._wakeOn) {
+      this.birdWakeAt(x0, y0, z0, birdPos, axisX, axisY, axisZ, bs, this._wake);
+      ibx = this._wake[0]; iby = this._wake[1]; ibz = this._wake[2];
+    }
+    const wakeMag = Math.sqrt(ibx * ibx + iby * iby + ibz * ibz);
+    const gain = Math.min(1, wakeMag / this.heatRef);
+    const heat = Math.max(this.nearHeat[i]! * Math.exp(-dt / this.heatTau), gain);
+    this.nearHeat[i] = heat;
+    const adx = x0 - birdPos[0], ady = y0 - birdPos[1], adz = z0 - birdPos[2];
+    const rrFrac = Math.min(1, Math.sqrt(adx * adx + ady * ady + adz * adz) / this.nearRadius);
+    const ambientW = moving ? this.ambientNearFloor + (1 - this.ambientNearFloor) * rrFrac : 1;
+    const fwx = wx * ambientW + ibx, fwy = w * ambientW + iby, fwz = wz * ambientW + ibz;
+    const x = x0 + fwx * dt;
+    const z = z0 + fwz * dt;
+    const terr = this.sampleHeight(x, z);
+    let y = y0 + fwy * dt;
+    const loY = terr + this.minClear;
+    if (y < loY) y = loY;
+    this.nx[i] = x; this.ny[i] = y; this.nz[i] = z;
+
+    // fade envelope (no-pop) — identical to the comet.
+    this.nearAge[i]! += dt;
+    const fadeIn = smoothstep(0, this.fadeInTime, this.nearAge[i]!);
+    const ndx = x - birdPos[0], ndy = y - birdPos[1], ndz = z - birdPos[2];
+    const distFrac = this.bubbleFrac(ndx, ndy, ndz);
+    const fadeOut = 1 - smoothstep(this.fadeNearEdge, 1, distFrac);
+    const nearVis = fadeIn * fadeOut;
+
+    // speed tint (same calibration as the comet) — uses the DISTURBED horizontal speed.
+    const wspeed = Math.hypot(fwx, fwz);
+    const u = Math.min(1, Math.max(0, (wspeed - lo) / (hi - lo)));
+    let sp = u * u * (3 - 2 * u);
+    const climbFrac = Math.min(1, Math.max(0, w / 7.0));
+    sp = Math.max(sp, climbFrac);
+
+    // CORKSCREW tail: integrate BACKWARD along the LOCAL disturbed flow (wind + bird wake), re-sampling at each
+    // point so the thread WRAPS the wingtip vortex cores. Same loop as the comet BUT with the LONGER filSegStep
+    // (looser, readable spiral) and the heat-driven length extension. Per-point terrain clamp kept.
+    const stepLen = this.filSegStep * (1 + this.heatLenGain * heat);
+    ptX[0] = x; ptY[0] = y; ptZ[0] = z;
+    let cx = x, cy = y, cz = z;
+    let tfx = fwx, tfy = fwy, tfz = fwz; // first backward step reuses the head's disturbed flow (free)
+    for (let s = 1; s <= seg; s++) {
+      cx -= tfx * stepLen;
+      cy -= tfy * stepLen;
+      cz -= tfz * stepLen;
+      const tb = this.sampleHeight(cx, cz) + this.minClear; // keep the tail above the ridge
+      if (cy < tb) cy = tb;
+      ptX[s] = cx; ptY[s] = cy; ptZ[s] = cz;
+      // re-sample the disturbed flow at the NEW point for the NEXT step → the filament corkscrews the core.
+      if (s < seg) {
+        const [nwx, nwz, nw] = this.flowAt(cx, cz, t);
+        if (this._wakeOn) {
+          this.birdWakeAt(cx, cy, cz, birdPos, axisX, axisY, axisZ, bs, this._wake);
+          tfx = nwx * prof * ambientW + this._wake[0]; tfy = nw * ambientW + this._wake[1]; tfz = nwz * prof * ambientW + this._wake[2];
+        } else {
+          tfx = nwx * prof; tfy = nw; tfz = nwz * prof;
+        }
+      }
+    }
+
+    // emit a quad per segment (constant thin width via the shared ribbon); vis = fade envelope, along = head→
+    // tail fade. Fills the slot EXACTLY (seg segments × 6 = NEAR_VERTS_PER_MOTE) — no pad.
+    for (let s = 0; s < seg; s++) {
+      const ax = ptX[s]!, ay = ptY[s]!, az = ptZ[s]!;
+      const bx = ptX[s + 1]!, by = ptY[s + 1]!, bz = ptZ[s + 1]!;
+      let sdx = bx - ax, sdz = bz - az;
+      const sdl = Math.hypot(sdx, sdz);
+      if (sdl > 1e-5) { sdx /= sdl; sdz /= sdl; } else { sdx = 1; sdz = 0; }
+      const alongN = s / seg;
+      const alongF = (s + 1) / seg;
+      for (let c = 0; c < 6; c++) {
+        const [pick, perp] = corners[c]!;
+        const ex = pick > 0.5 ? bx : ax;
+        const ey = pick > 0.5 ? by : ay;
+        const ez = pick > 0.5 ? bz : az;
+        const al = pick > 0.5 ? alongF : alongN;
+        v[vi++] = ex; v[vi++] = ey; v[vi++] = ez;
+        v[vi++] = pick; v[vi++] = perp;
+        v[vi++] = sp;
+        v[vi++] = sdx; v[vi++] = sdz;
+        v[vi++] = al; v[vi++] = nearVis;
+        v[vi++] = heat; // TOUCHED-AIR heat (loc 6) → warm tint
+      }
+    }
+    return vi;
   }
 
   // SECOND pass: LOAD terrain color+depth (no clear); draw the drifting dot motes over the ridges.
