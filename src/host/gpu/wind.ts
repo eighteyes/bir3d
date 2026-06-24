@@ -962,8 +962,11 @@ export class Wind {
       const ax = this._ax, ay = this._ay, az = this._az;
       const rx = this._rx, ry = this._ry, rz = this._rz;
       const ux = ay * rz - az * ry, uy = az * rx - ax * rz, uz = ax * ry - ay * rx; // upW = axis × right (thin vertical jitter axis)
-      const lead = R * (0.1 + 0.45 * Math.random());            // ahead of the bird so there is room to trail back
-      const offR = side * this.wingSpan + (Math.random() * 2 - 1) * this.wingJitter;
+      // EMIT FROM THE WINGS DIRECTLY (user): spawn AT the wing — the bird's own longitudinal position (lead≈0,
+      // slight ± scatter), spread ALONG the outer wing span (not just a point at the tip) — so the motes
+      // originate off the WINGS and stream BACK through the vortex, instead of spawning ahead and reading as behind.
+      const lead = R * (Math.random() * 0.1 - 0.05);            // ~at the wing (small ± along-axis scatter)
+      const offR = side * this.wingSpan * (0.55 + 0.45 * Math.random()) + (Math.random() * 2 - 1) * this.wingJitter;
       const offU = (Math.random() * 2 - 1) * this.wingJitter;
       x = birdPos[0] + ax * lead + rx * offR + ux * offU;
       y0 = birdPos[1] + ay * lead + ry * offR + uy * offU;
