@@ -195,7 +195,7 @@ async function boot() {
     {},
     // FEWER, BETTER motes (user): cut counts ~2× and make each bigger so they read as distinct wind streaks
     // instead of a faint noisy cloud. dotPx is live-tunable (__wind.dotPx); counts need a reload.
-    { nearCount: 200, numMotes: 4000, dotPx: 3.6 },
+    { nearCount: 360, numMotes: 4000, dotPx: 3.6 }, // 200 body (the sphere) + 160 wing budget (extra slipstream only when wake on)
     SAMPLES,
   );
 

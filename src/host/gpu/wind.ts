@@ -299,6 +299,7 @@ interface DotParams {
   speedHi?: number;   // |windAt| (m/s) mapped to speedFrac 1 (fast) — calibrated to the field max
   // --- v11 NEAR WIND SPHERE (dense little comets centered on the bird) ---
   nearCount?: number;    // number of little comets packed in the bird-centered ball (DENSE)
+  nearBodyCount?: number; // of nearCount, how many are the BALL body (always shown); the rest are the modulate wing slipstream (only when wake on)
   nearRadius?: number;   // radius (m) of the sphere around the bird
   nearSegments?: number; // tail segment count for the LITTLE comets (short → distinct from far lines)
   nearSegStep?: number;  // seconds of flow integrated per near-comet tail segment (short tail)
@@ -401,6 +402,7 @@ export class Wind {
 
   // --- v11 NEAR WIND SPHERE state (bird-centered dense little comets) ---
   private nearCount: number;
+  private nearBodyCount: number;
   private nearRadius: number;
   private nearSegments: number;
   private nearSegStep: number;
@@ -697,6 +699,7 @@ export class Wind {
     // tip terrain clamp to stay cheap (no per-segment flowAt/sampleHeight).
     this.nearCount = p.nearCount ?? 1600; // NOTE: bird-main overrides this to 800 (the live near-sphere count);
                                           // this default is the fallback only. Tune the sphere size there, not here.
+    this.nearBodyCount = Math.min(p.nearBodyCount ?? 200, this.nearCount); // BALL body budget; wake adds wing motes ON TOP (never steals)
     this.nearRadius = p.nearRadius ?? 65;
     this.nearSegments = p.nearSegments ?? 4; // a 4th segment → smoother CURLING tail arcs
     this.nearSegStep = p.nearSegStep ?? 0.12;
@@ -955,7 +958,14 @@ export class Wind {
   private seedNearMote(i: number, birdPos: [number, number, number]): void {
     const R = this.nearRadius;
     let x: number, y0: number, z: number;
-    if (this._wakeOn && (this.wakeMode === "modulate" || this.nearMode === "filaments") && Math.random() < this.wingEmitFrac) {
+    // WING SEEDING: in modulate, the dedicated wing-budget slots (i >= nearBodyCount) ARE the wingtip streams, so
+    // the body slots [0, nearBodyCount) always stay in the ball — wake never thins the sphere, it ADDS streams.
+    // Filaments keeps its random wingEmitFrac core-seeding (it wants most motes at the tips).
+    const wingSeed = this._wakeOn && (
+      (this.wakeMode === "modulate" && this.nearMode === "comet" && i >= this.nearBodyCount) ||
+      (this.nearMode === "filaments" && Math.random() < this.wingEmitFrac)
+    );
+    if (wingSeed) {
       // WINGTIP EMISSION: born near a wingtip (birdPos ± wingSpan·right), slightly AHEAD along the motion axis
       // so it immediately streams BACK through that tip's vortex → the visible "off the wing" cord.
       const side = Math.random() < 0.5 ? 1 : -1;
@@ -1795,6 +1805,15 @@ export class Wind {
     const seg = this.nearSegments;
     const ptX = this.nptX, ptY = this.nptY, ptZ = this.nptZ;
       let x0 = this.nx[i]!, y0 = this.ny[i]!, z0 = this.nz[i]!;
+
+      // DEDICATED WING BUDGET: motes [nearBodyCount, nearCount) are the modulate wing slipstream — active ONLY
+      // when wake is on (modulate). Parked (wake off / non-modulate) → emit degenerate so the body's
+      // nearBodyCount density is CONSTANT with or without wake (wake ADDS the wing motes, never steals them).
+      if (i >= this.nearBodyCount && !(this._wakeOn && this.wakeMode === "modulate")) {
+        const slotEnd = vi + this.NEAR_VERTS_PER_MOTE * Wind.FPV;
+        while (vi < slotEnd) vi = this.emitDegenerateNearVert(vi);
+        return vi;
+      }
 
       // recycle: if the comet has drifted outside the bird-centered ball, reseed it back inside (the
       // sphere follows the bird as it moves). 3D distance test against the radius.
