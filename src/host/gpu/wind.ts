@@ -300,6 +300,8 @@ interface DotParams {
   // --- v11 NEAR WIND SPHERE (dense little comets centered on the bird) ---
   nearCount?: number;    // number of little comets packed in the bird-centered ball (DENSE)
   nearBodyCount?: number; // of nearCount, how many are the BALL body (always shown); the rest are the modulate wing slipstream (only when wake on)
+  nearWakeCount?: number; // live count of WAKE (wingtip slipstream) motes shown when wake is on — drawn from the buffer ON TOP of the body
+  wakeMoteLen?: number;   // tail-length multiplier for the wake (wing) motes vs the body comets (1 = same)
   nearRadius?: number;   // radius (m) of the sphere around the bird
   nearSegments?: number; // tail segment count for the LITTLE comets (short → distinct from far lines)
   nearSegStep?: number;  // seconds of flow integrated per near-comet tail segment (short tail)
@@ -403,6 +405,8 @@ export class Wind {
   // --- v11 NEAR WIND SPHERE state (bird-centered dense little comets) ---
   private nearCount: number;
   private nearBodyCount: number;
+  private nearWakeCount: number;
+  private wakeMoteLen: number;
   private nearRadius: number;
   private nearSegments: number;
   private nearSegStep: number;
@@ -700,6 +704,8 @@ export class Wind {
     this.nearCount = p.nearCount ?? 1600; // NOTE: bird-main overrides this to 800 (the live near-sphere count);
                                           // this default is the fallback only. Tune the sphere size there, not here.
     this.nearBodyCount = Math.min(p.nearBodyCount ?? 200, this.nearCount); // BALL body budget; wake adds wing motes ON TOP (never steals)
+    this.nearWakeCount = p.nearWakeCount ?? 160; // WAKE (wingtip slipstream) motes added ON TOP when wake is on (live; body+wake ≤ nearCount)
+    this.wakeMoteLen = p.wakeMoteLen ?? 1.0;     // wake-mote tail length vs the body comets (1 = same)
     this.nearRadius = p.nearRadius ?? 65;
     this.nearSegments = p.nearSegments ?? 4; // a 4th segment → smoother CURLING tail arcs
     this.nearSegStep = p.nearSegStep ?? 0.12;
@@ -1763,6 +1769,17 @@ export class Wind {
     let vi = this.farVertexCount * Wind.FPV;
 
     for (let i = 0; i < this.nearCount; i++) {
+      // LIVE BUDGET: body slots [0,nearBodyCount) always render; wing slots [nearBodyCount, +nearWakeCount) render
+      // only while wake is on (modulate) or in filaments; anything beyond is a PARKED spare → degenerate. This makes
+      // nearBodyCount / nearWakeCount LIVE-adjustable up to the buffer (nearCount) with no resize.
+      const isBodySlot = i < this.nearBodyCount;
+      const isWingSlot = i >= this.nearBodyCount && i < this.nearBodyCount + this.nearWakeCount;
+      const wingActive = this._wakeOn && (this.wakeMode === "modulate" || this.nearMode === "filaments");
+      if (!(isBodySlot || (isWingSlot && wingActive))) {
+        let e = vi + this.NEAR_VERTS_PER_MOTE * Wind.FPV;
+        while (vi < e) vi = this.emitDegenerateNearVert(vi);
+        continue;
+      }
       // NEAR render-MODE branch (Phase 2). Each mode fills the SAME fixed per-mote stride
       // (NEAR_VERTS_PER_MOTE = nearSegments·6 verts): flecks emit ONE 2-segment dash (12 verts) then PAD the
       // remainder with degenerate (vis=0) verts; filaments + comet integrate the full nearSegments-segment
@@ -1805,15 +1822,6 @@ export class Wind {
     const seg = this.nearSegments;
     const ptX = this.nptX, ptY = this.nptY, ptZ = this.nptZ;
       let x0 = this.nx[i]!, y0 = this.ny[i]!, z0 = this.nz[i]!;
-
-      // DEDICATED WING BUDGET: motes [nearBodyCount, nearCount) are the modulate wing slipstream — active ONLY
-      // when wake is on (modulate). Parked (wake off / non-modulate) → emit degenerate so the body's
-      // nearBodyCount density is CONSTANT with or without wake (wake ADDS the wing motes, never steals them).
-      if (i >= this.nearBodyCount && !(this._wakeOn && this.wakeMode === "modulate")) {
-        const slotEnd = vi + this.NEAR_VERTS_PER_MOTE * Wind.FPV;
-        while (vi < slotEnd) vi = this.emitDegenerateNearVert(vi);
-        return vi;
-      }
 
       // recycle: if the comet has drifted outside the bird-centered ball, reseed it back inside (the
       // sphere follows the bird as it moves). 3D distance test against the radius.
@@ -1885,7 +1893,8 @@ export class Wind {
       // each point so the tail CURVES with the swirl/slipstream instead of being a straight streak. Costs a
       // flowAt + birdWakeAt per segment — affordable now that the near sphere is small. Per-point terrain
       // clamp since a curling tail can swing toward a ridge.
-      const stepLen = this.nearSegStep * (1 + this.heatLenGain * heat); // TOUCHED air trails up to (1+heatLenGain)× longer
+      const isWing = i >= this.nearBodyCount; // wing-stream (slipstream) mote → its own length via wakeMoteLen
+      const stepLen = this.nearSegStep * (isWing ? this.wakeMoteLen : 1) * (1 + this.heatLenGain * heat); // wake length via wakeMoteLen
       ptX[0] = x; ptY[0] = y; ptZ[0] = z;
       let cx = x, cy = y, cz = z;
       let tfx = fwx, tfy = fwy, tfz = fwz; // first backward step reuses the head's disturbed flow (free)
