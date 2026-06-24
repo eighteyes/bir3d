@@ -397,6 +397,7 @@ async function boot() {
   sliderRow(activity, windProfileParams, "altLo", 0, 300, 10, "Altitude (m) where calm ends and wind strength begins rising.");
   sliderRow(activity, windProfileParams, "altHi", 320, 800, 10, "Altitude (m) of full wind strength.");
   sliderRow(activity, windTuning, "fluidMax", 0, 100, 0.5, "Peak |fluid wind| (m/s) the fluid component is clamped to. Steady drift (~6 m/s) adds on top → felt field peaks ~6 above this. Default 10 → max ~16.");
+  sliderRow(activity, fluidWind as unknown as Record<string, number>, "targetBand", 0, 30, 0.5, "Mean fluid-wind magnitude (m/s) the regulator drives toward — the REAL wind-strength knob (fluidMax only clamps peaks). LIVE; the regulator re-converges over ~a second.");
   const wrender = acc.section("global wind — render");
   sliderRow(wrender, wr, "dotPx", 1, 8, 0.2, "On-screen comet-head diameter (px).");
   sliderRow(wrender, wr, "clearance", 5, 150, 5, "Nominal metres above terrain the motes relax toward (height is advected).");
@@ -414,6 +415,7 @@ async function boot() {
   toggleBtn(sphere, "local sphere", false, (v) => wind.setShowNear(v), "Show/hide the local sphere (body) mote layer.");
   toggleBtn(sphere, "wake", false, (v) => wind.setShowWake(v), "Show/hide the wake (wing) mote layer.");
   sliderRow(sphere, wr, "ambientNearFloor", 0, 1, 0.05, "Ambient (global) terrain-wind weight at the bird (0..1); 1 = full immersion.");
+  sliderRow(sphere, wr, "bodyWakeFrac", 0, 1, 0.05, "How much the bird-WAKE pulls on the sphere (body) motes. Lower = sphere holds together instead of bleeding into the wake. 1 = old, 0 = ignores wake.");
   sliderRow(sphere, wr, "nearJitter", 0, 0.6, 0.02, "Per-mote random direction rotation (rad) so the sphere isn't uniform.");
   sliderRow(sphere, wr, "foreStretch", 1, 5, 0.1, "Forward reach of the near bubble as a multiple of nearRadius (>1 = bigger ahead).");
   sliderRow(sphere, wr, "nearBodyCount", 0, 600, 20, "Local sphere (body) mote count cap — scales with global wind speed up to this.");
@@ -428,11 +430,16 @@ async function boot() {
   sliderRow(sphere, wr, "heatRef", 4, 50, 2, "Wake speed (m/s) mapped to full heat (red + max tail length).");
 
   document.body.appendChild(tunePanel);
+  // S = toggle the local SPHERE (body motes); W = toggle the WAKE (wing motes). Live; may desync the panel
+  // "local sphere"/"wake" button labels (separate state), but the layer itself flips correctly.
+  let sphereShown = false, wakeShown = false;
   window.addEventListener("keydown", (e) => {
     if (e.code === "KeyT") {
       tunePanel.style.display =
         tunePanel.style.display === "none" ? "block" : "none";
     }
+    if (e.code === "KeyS") { sphereShown = !sphereShown; wind.setShowNear(sphereShown); }
+    if (e.code === "KeyW") { wakeShown = !wakeShown; wind.setShowWake(wakeShown); }
     if (e.code === "KeyP") autopilot = !autopilot; // toggle hands-off autopilot <-> manual
     if (e.code === "Space") {
       flapHeld = true;

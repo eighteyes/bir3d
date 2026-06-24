@@ -1899,7 +1899,10 @@ export class Wind {
       // the global wind to visibly HIT the wake. Body motes keep the ambientNearFloor stick curve.
       const isWing = i >= this.nearBodyCount;
       const ambientW = isWing ? 1 : (moving ? this.ambientNearFloor + (1 - this.ambientNearFloor) * rrFrac : 1);
-      const fwx = wx * ambientW + ibx, fwy = w * ambientW + iby, fwz = wz * ambientW + ibz; // global wind (immersion) + bird wake (connection)
+      // BODY motes feel only bodyWakeFrac of the bird-wake pull so the sphere stays coherent instead of
+      // bleeding into the wake; WING motes feel it fully (they ARE the wake).
+      const wakeW = isWing ? 1 : this.bodyWakeFrac;
+      const fwx = wx * ambientW + ibx * wakeW, fwy = w * ambientW + iby * wakeW, fwz = wz * ambientW + ibz * wakeW; // global wind (immersion) + bird wake (connection, body-attenuated)
       const x = x0 + fwx * dt;
       const z = z0 + fwz * dt;
       const terr = this.sampleHeight(x, z);
@@ -1950,7 +1953,7 @@ export class Wind {
           const rnx = nwx * prof * jc - nwz * prof * jjs, rnz = nwx * prof * jjs + nwz * prof * jc;
           if (this._wakeOn) {
             this.birdWakeAt(cx, cy, cz, birdPos, axisX, axisY, axisZ, bs, this._wake);
-            tfx = rnx * ambientW + this._wake[0]; tfy = nw * ambientW + this._wake[1]; tfz = rnz * ambientW + this._wake[2];
+            tfx = rnx * ambientW + this._wake[0] * wakeW; tfy = nw * ambientW + this._wake[1] * wakeW; tfz = rnz * ambientW + this._wake[2] * wakeW;
           } else {
             tfx = rnx; tfy = nw; tfz = rnz;
           }
