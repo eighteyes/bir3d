@@ -26,7 +26,7 @@ cp index-bird.html index.html  # glider is the front door
 touch .nojekyll
 
 git init -q
-git checkout -q -b gh-pages
+git checkout -q -B gh-pages   # -B: create or reset, so re-runs over a leftover dist/.git are idempotent
 git add -A
 git -c user.email="deploy@bir3d" -c user.name="bir3d-deploy" \
   commit -qm "deploy site"
