@@ -17,6 +17,7 @@
 
 import { acquireDevice } from "./gpu/device";
 import { GpuFluid } from "./gpu/fluid";
+import { loadShader } from "./gpu/shaders";
 import { PassTimer } from "./gpu/passtimer";
 import { FrameLoop } from "./frameloop";
 
@@ -90,12 +91,12 @@ async function boot() {
     alphaMode: "opaque",
   });
 
-  // Load shaders (compute kernels + the render viz) from the dev server.
-  const get = (f: string) => fetch(`/src/host/shaders/fluid/${f}.wgsl`).then((r) => r.text());
-  const [advect, divergence, jacobi, subtractGrad, setBnd, forces, visualize] = await Promise.all([
+  // Shaders (compute kernels + the render viz) are bundled at build time, not fetched at runtime.
+  const get = (f: string) => loadShader(`/src/host/shaders/fluid/${f}.wgsl`);
+  const [advect, divergence, jacobi, subtractGrad, setBnd, forces, visualize] = [
     get("advect"), get("divergence"), get("jacobi"), get("subtract_grad"),
     get("set_bnd"), get("forces"), get("visualize"),
-  ]);
+  ];
   const fluid = new GpuFluid(device, GRID, GRID, { forces, divergence, jacobi, subtractGrad, advect, setBnd });
 
   // Render pipeline: fullscreen triangle (visualize.wgsl vs/fs), no vertex buffer.

@@ -38,27 +38,7 @@ import { AutoPilot } from "./autopilot";
 import { Bloom } from "./gpu/bloom";
 import { perspective, multiply } from "./gpu/mat4";
 import { FrameLoop } from "./frameloop";
-
-// Shaders are bundled as raw strings at BUILD time (Vite ?raw glob) rather than
-// fetched at runtime: the dev server serves /src/host/shaders/*.wgsl live, but
-// `vite build` does not emit those source files, so a runtime fetch 404s on a
-// static host (GitHub Pages) and WebGPU then compiles the 404 HTML → uncaptured
-// error. Globbing inlines every shader into the JS bundle, identical in dev/prod.
-const SHADER_SOURCES = import.meta.glob("./shaders/**/*.wgsl", {
-  query: "?raw",
-  import: "default",
-  eager: true,
-}) as Record<string, string>;
-// Call sites reference shaders by their absolute /src/host path; map that onto
-// the file-relative keys the glob produces (./shaders/...).
-function loadShader(absPath: string): string {
-  const key = absPath.replace("/src/host", ".");
-  const src = SHADER_SOURCES[key];
-  if (src === undefined) {
-    throw new Error(`shader not bundled: ${absPath} (looked for key ${key})`);
-  }
-  return src;
-}
+import { loadShader } from "./gpu/shaders";
 
 // AUTOPILOT MODE (this pass): manual controls OFF — the AutoPilot flies, proving autonomous
 // soaring (find lift, ride it, never touch the ground) before flapping/controls return.

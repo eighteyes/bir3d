@@ -324,6 +324,7 @@ interface DotParams {
   bowGain?: number;    // radial OUTWARD push AHEAD of the bird — motes part at the nose (bow wave)
   wakeGain?: number;   // along-motion DRAG behind the bird — slipstream the wake follows the bird
   swirlGain?: number;  // TANGENTIAL swirl in the wake — now drives the TWIN wingtip vortices (per-core circulation)
+  bodyWakeFrac?: number; // 0..1 — fraction of the bird-WAKE pull the BODY (sphere) motes feel; lower keeps the sphere coherent instead of bleeding into the wake (wing motes always feel it fully)
   // --- SLIPSTREAM (twin wingtip vortices + wing emission + body attach) — render-only, near sphere ---
   wingSpan?: number;        // half-span (m): lateral offset of each wingtip vortex core from the bird centerline
   vortexCore?: number;      // Rankine core radius rc (m): the trailing vortex swirl peaks at this distance from the core line
@@ -440,6 +441,7 @@ export class Wind {
   private wingEmitFrac: number;
   private wingJitter: number;
   private ambientNearFloor: number;
+  private bodyWakeFrac: number;
   // TOUCHED AIR (see DotParams).
   private heatTau: number;
   private heatRef: number;
@@ -748,6 +750,7 @@ export class Wind {
     this.bowGain = p.bowGain ?? 0.45; // softened (was 0.9): the strong outward push carved a "split" void directly ahead of the bird
     this.wakeGain = p.wakeGain ?? 0.75;
     this.swirlGain = p.swirlGain ?? 0.5;
+    this.bodyWakeFrac = p.bodyWakeFrac ?? 0.2; // BODY motes feel only this fraction of the bird-wake pull (anti-bleed); 1 = full (old), 0 = sphere ignores the wake
     // SLIPSTREAM: two wingtip vortices at ±wingSpan, Rankine core vortexCore; half the motes are born at the
     // tips (wingEmitFrac) to make the streams legible; ambientNearFloor attenuates terrain-wind at the bird so
     // the near sphere rides the bird's own wake (sticks) instead of blowing downwind.

@@ -20,6 +20,7 @@
 //   - Expose window.__fluidWindow {originX,originZ,recenterFrame} so a probe can detect/await a recenter.
 
 import { GpuFluid } from "./fluid";
+import { loadShader } from "./shaders";
 
 interface FluidShaders {
   forces: string;
@@ -227,18 +228,15 @@ export class FluidWind {
     this.heights = new Float32Array(this.fluid.cells);
     this.heightsScratch = new Float32Array(this.fluid.cells);
 
-    // Fetch the extra kernels (shift + per-cell force field) and init their pipelines. The base shaders
-    // were already supplied; bird-main (frozen) can't pass these, so fetch them here (fire-and-forget).
-    // shift()/setForceField() no-op until ready; once ready the terrain field is uploaded on the next step.
-    Promise.all([
-      fetch("/src/host/shaders/fluid/shift.wgsl").then((r) => r.text()),
-      fetch("/src/host/shaders/fluid/force_field.wgsl").then((r) => r.text()),
-    ]).then(([shiftSrc, forceFieldSrc]) => {
-      this.fluid.initExtraPipelines(shiftSrc, forceFieldSrc);
-      this.extraReady = true;
-      // upload whatever terrain field was already computed (the first step() runs before this resolves).
-      if (this.initialized) this.fluid.setForceField(this.fxField, this.fyField);
-    });
+    // Init the extra kernels (shift + per-cell force field). Shaders are bundled at build time
+    // (loadShader), so they're available synchronously — no runtime fetch that would 404 on a
+    // static host and break these compute pipelines.
+    this.fluid.initExtraPipelines(
+      loadShader("/src/host/shaders/fluid/shift.wgsl"),
+      loadShader("/src/host/shaders/fluid/force_field.wgsl"),
+    );
+    this.extraReady = true;
+    if (this.initialized) this.fluid.setForceField(this.fxField, this.fyField);
   }
 
   get cellMeters(): number { return this.cellM; }

@@ -2,6 +2,7 @@
 // Proves the whole foundation runs in a live frame loop and the instrument reports numbers.
 import { acquireDevice } from "./gpu/device";
 import { makeComputePipeline } from "./gpu/dispatch";
+import { loadShader } from "./gpu/shaders";
 import { GpuProfiler } from "./gpu/profiler";
 import { FrameLoop } from "./frameloop";
 
@@ -16,7 +17,7 @@ async function boot() {
     console.error("[WebGPU lost]", info.reason, info.message);
   });
 
-  const code = await (await fetch("/src/host/shaders/addone.wgsl")).text();
+  const code = loadShader("/src/host/shaders/addone.wgsl");
   const pipeline = makeComputePipeline(device, code);
   const prof = new GpuProfiler(device, hasTimestampQuery);
 
