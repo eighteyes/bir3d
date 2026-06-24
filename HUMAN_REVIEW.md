@@ -2,14 +2,16 @@
 
 ## GitHub Pages deploy + production shader-load fix
 **Date:** 2026-06-24
-**Commits:** 53f1d10 (Pages config + deploy script), 4301ad6 (shader ?raw glob fix)
+**Commits:** 53f1d10 (Pages config + deploy script), 4301ad6 (bird-main ?raw glob), b3a45f2 (shared loader — submodule shaders)
 **Session:** serve-and-deploy (886a0a78-f8b6-4ccc-ac5f-f4ec43ece1fb)
 **Live:** https://eighteyes.github.io/bir3d/ · **Repo:** https://github.com/eighteyes/bir3d
 
 ### What changed
 - Vite: `base` via `VITE_BASE` env, multi-page build inputs (main/bird/fluid).
 - `scripts/deploy-pages.sh`: build under Pages base, promote index-bird.html to root index.html, preserve vector demo at /vector.html, force-push dist/ to gh-pages branch (idempotent `-B`).
-- bird-main.ts: shaders loaded via `import.meta.glob('./shaders/**/*.wgsl', {query:'?raw', eager})` instead of runtime `fetch('/src/host/shaders/*.wgsl')`. Runtime fetch only resolves under the dev server; in a production build the source files aren't emitted -> 404 -> WebGPU compiled the HTML error page -> uncaptured error.
+- Shaders loaded via shared `gpu/shaders.ts` `loadShader()` (`import.meta.glob('../shaders/**/*.wgsl', {query:'?raw', eager})`) instead of runtime `fetch('/src/host/shaders/*.wgsl')`. Runtime fetch only resolves under the dev server; in a production build the source files aren't emitted -> 404 -> WebGPU compiled the HTML error page -> invalid shader/pipeline -> uncaptured validation errors. Routed bird-main.ts, fluid-wind.ts (shift/force_field compute kernels), main.ts (addone), fluid-main.ts through it.
+- Verified with a headless-Chrome WebGPU probe (.ai/tmp/gpu-probe.mjs) against the LIVE site: hasGPU+booted true, terrain-selfcheck PASS, no compute-pipeline errors. Only a cosmetic favicon.ico 404 remains.
+- KNOWN: `npm run build` (tsc) still fails on a PRE-EXISTING WIP error in wind.ts (bodyWakeFrac no initializer) — unrelated to this work; deploy script skips tsc.
 
 ### Review steps
 - [ ] Open the live site in Chrome/Edge with a GPU; confirm the glider renders (not a blank/black canvas):
