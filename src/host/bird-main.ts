@@ -446,7 +446,7 @@ async function boot() {
   toggleBtn(tunePanel, "wake", false, (v) => wind.setShowWake(v));
   sliderRow(tunePanel, wr, "ambientNearFloor", 0, 1, 0.05);         // sphere stick (1 = full global wind)
   sliderRow(tunePanel, wr, "nearJitter", 0, 0.6, 0.02);            // per-mote direction randomness (rad; 0 = uniform)
-  sliderRow(tunePanel, wr, "foreStretch", 1, 3, 0.1);              // sphere forward reach
+  sliderRow(tunePanel, wr, "foreStretch", 1, 5, 0.1);              // sphere forward reach (overlap with the global-wind fade)
   sliderRow(tunePanel, wr, "swirlGain", 0, 2, 0.1);                // wake vortex strength
   sliderRow(tunePanel, wr, "wingSpan", 0, 30, 1);                  // wake vortex tip spacing
   sliderRow(tunePanel, wr, "heatRef", 4, 50, 2);                   // touched-air selectivity (higher = less warm)

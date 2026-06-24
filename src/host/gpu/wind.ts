@@ -735,7 +735,8 @@ export class Wind {
     this.heatRef = p.heatRef ?? 24; // wake speed (m/s) for FULL heat. HIGH so only the genuine wake stream warms
                                     // (low values heat the WHOLE ball at speed → everything red). Tune live.
     this.heatLenGain = p.heatLenGain ?? 1.0;
-    this.foreStretch = p.foreStretch ?? 1.3; // mild forward reach (was 1.6): with FEWER motes, don't spread them thin
+    this.foreStretch = p.foreStretch ?? 2.6; // 2× forward reach: the near bubble stretches well ahead so it OVERLAPS the
+                                              // forward zone where the global-wind handoff fades out (no seam in front of the bird)
 
     // FAR-B STIPPLE: K disconnected dashes tracing the over-ridge flow arc (the comet's integrated polyline),
     // lead dash bright, trailing dashes dimmer. Defaults per spec.
