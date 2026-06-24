@@ -985,10 +985,10 @@ export class Wind {
       const ax = this._ax, ay = this._ay, az = this._az;
       const rx = this._rx, ry = this._ry, rz = this._rz;
       const ux = ay * rz - az * ry, uy = az * rx - ax * rz, uz = ax * ry - ay * rx; // upW = axis × right (thin vertical jitter axis)
-      // EMIT IN FRONT of the bird, off the wing: seed AHEAD along the motion axis (positive lead) so the motes stream
-      // BACK past the wingtip as the bird flies INTO them → reads like air coming off the wing. Uniform forward spread
-      // keeps it a CONTINUOUS source (varied lead → staggered exits), not synchronized puffs.
-      const lead = R * (0.2 + 0.9 * Math.random());
+      // EMIT off the wing, MODESTLY ahead: seed ahead along the motion axis so the motes stream BACK past the wingtip
+      // as the bird flies INTO them → reads like air coming off the wing. Pulled HALFWAY back toward the wing from the
+      // fully-forward version (user). Uniform spread keeps it a CONTINUOUS source (varied lead → staggered exits).
+      const lead = R * (0.1 + 0.45 * Math.random());
       const offR = side * this.wingSpan * (0.55 + 0.45 * Math.random()) + (Math.random() * 2 - 1) * this.wingJitter;
       const offU = (Math.random() * 2 - 1) * this.wingJitter;
       x = birdPos[0] + ax * lead + rx * offR + ux * offU;
