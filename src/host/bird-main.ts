@@ -39,6 +39,27 @@ import { Bloom } from "./gpu/bloom";
 import { perspective, multiply } from "./gpu/mat4";
 import { FrameLoop } from "./frameloop";
 
+// Shaders are bundled as raw strings at BUILD time (Vite ?raw glob) rather than
+// fetched at runtime: the dev server serves /src/host/shaders/*.wgsl live, but
+// `vite build` does not emit those source files, so a runtime fetch 404s on a
+// static host (GitHub Pages) and WebGPU then compiles the 404 HTML → uncaptured
+// error. Globbing inlines every shader into the JS bundle, identical in dev/prod.
+const SHADER_SOURCES = import.meta.glob("./shaders/**/*.wgsl", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+}) as Record<string, string>;
+// Call sites reference shaders by their absolute /src/host path; map that onto
+// the file-relative keys the glob produces (./shaders/...).
+function loadShader(absPath: string): string {
+  const key = absPath.replace("/src/host", ".");
+  const src = SHADER_SOURCES[key];
+  if (src === undefined) {
+    throw new Error(`shader not bundled: ${absPath} (looked for key ${key})`);
+  }
+  return src;
+}
+
 // AUTOPILOT MODE (this pass): manual controls OFF — the AutoPilot flies, proving autonomous
 // soaring (find lift, ride it, never touch the ground) before flapping/controls return.
 let autopilot = false; // default MANUAL — YOU fly and feel the wind; press P to hand it to the autopilot
@@ -126,9 +147,7 @@ async function boot() {
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
   });
 
-  const terrainShader = await fetch("/src/host/shaders/terrain_ekg.wgsl").then(
-    (r) => r.text(),
-  );
+  const terrainShader = loadShader("/src/host/shaders/terrain_ekg.wgsl");
   const terrain = new TerrainEKG(device, terrainShader, HDR_FORMAT, {
     rows: 512, // stacked EKG depth rows — covers the 2× maxDist at the same 4× spacing
     cols: 1536, // samples per row — 2× density: the wide halfWidth means near rows show only a
@@ -152,7 +171,7 @@ async function boot() {
 
   // WORLD-STATIC wireframe terrain (alternative renderer; default ON via gridMode). Lines pinned to world
   // space → fly forward and they flow toward you with real parallax. Same fBm → trees/bird sit on it too.
-  const gridShader = await fetch("/src/host/shaders/terrain_grid.wgsl").then((r) => r.text());
+  const gridShader = loadShader("/src/host/shaders/terrain_grid.wgsl");
   const gridTerrain = new GridTerrain(device, gridShader, HDR_FORMAT, {
     spacing: 26,
     radius: 1650,
@@ -162,9 +181,7 @@ async function boot() {
     sampleCount: SAMPLES,
   });
 
-  const birdShader = await fetch("/src/host/shaders/bird3d.wgsl").then((r) =>
-    r.text(),
-  );
+  const birdShader = loadShader("/src/host/shaders/bird3d.wgsl");
   const startH = terrain.sampleHeight(0, 0);
   // HIGHER START: begin START_CLEARANCE above terrain so the still-air glider has the altitude budget to
   // reach the first target, and the flight is aerial from the first frame (EKG stack below the eyeline).
@@ -184,9 +201,7 @@ async function boot() {
 
   // VISIBLE WIND: neon streamline comets over the terrain, integrated from the SAME shared windAt
   // field that pushes the bird (src/host/gpu/wind.ts). Camera-relative like the EKG rows.
-  const windShader = await fetch("/src/host/shaders/wind.wgsl").then((r) =>
-    r.text(),
-  );
+  const windShader = loadShader("/src/host/shaders/wind.wgsl");
   const wind = new Wind(
     device,
     windShader,
@@ -212,12 +227,7 @@ async function boot() {
     setBnd: "/src/host/shaders/fluid/set_bnd.wgsl",
   };
   const fluidShaders = Object.fromEntries(
-    await Promise.all(
-      Object.entries(fluidShaderPaths).map(async ([k, p]) => [
-        k,
-        await fetch(p).then((r) => r.text()),
-      ]),
-    ),
+    Object.entries(fluidShaderPaths).map(([k, p]) => [k, loadShader(p)]),
   ) as {
     forces: string;
     divergence: string;
@@ -236,16 +246,12 @@ async function boot() {
 
   // ALTITUDE PLUMB-LINE: dashed neon drop-line bird→ground (one dash per ~9 m = readable altimeter)
   // + pulsing ground diamond. THE direct how-close-is-the-ground cue for swoops.
-  const markerShader = await fetch("/src/host/shaders/marker.wgsl").then((r) =>
-    r.text(),
-  );
+  const markerShader = loadShader("/src/host/shaders/marker.wgsl");
   const marker = new GroundMarker(device, markerShader, HDR_FORMAT, SAMPLES);
 
   // FLIGHT TARGET: an amber beam of light out in the distance — fly to it and it respawns ahead. The
   // playable basis ("see a target, fly toward it"). Drawn always-on-top so it stays visible behind ridges.
-  const targetShader = await fetch("/src/host/shaders/target.wgsl").then((r) =>
-    r.text(),
-  );
+  const targetShader = loadShader("/src/host/shaders/target.wgsl");
   const target = new Target(
     device,
     targetShader,
@@ -256,12 +262,8 @@ async function boot() {
 
   // TREES: mountaintop neon forests of recursive glow-branch trees, streamed in a grid window around
   // the camera (placed only where terrain clears the peak threshold). Depth-tested so ridges occlude them.
-  const treeShader = await fetch("/src/host/shaders/trees.wgsl").then((r) =>
-    r.text(),
-  );
-  const treeGroundShader = await fetch(
-    "/src/host/shaders/trees_ground.wgsl",
-  ).then((r) => r.text());
+  const treeShader = loadShader("/src/host/shaders/trees.wgsl");
+  const treeGroundShader = loadShader("/src/host/shaders/trees_ground.wgsl");
   const trees = new Trees(
     device,
     treeShader,
@@ -277,15 +279,9 @@ async function boot() {
   // tone-map in the composite keeps blown pixels HUE-COLORED instead of smearing to white. Half-res
   // blur (downsample 2) gives a wide soft glow AND holds the 60fps budget.
   const bloomShaders = {
-    threshold: await fetch("/src/host/shaders/bloom_threshold.wgsl").then((r) =>
-      r.text(),
-    ),
-    blur: await fetch("/src/host/shaders/bloom_blur.wgsl").then((r) =>
-      r.text(),
-    ),
-    composite: await fetch("/src/host/shaders/bloom_composite.wgsl").then((r) =>
-      r.text(),
-    ),
+    threshold: loadShader("/src/host/shaders/bloom_threshold.wgsl"),
+    blur: loadShader("/src/host/shaders/bloom_blur.wgsl"),
+    composite: loadShader("/src/host/shaders/bloom_composite.wgsl"),
   };
   const bloom = new Bloom(device, format, bloomShaders, {
     threshold: 0.85, // only neon cores above this luminance bloom (dark ground / dim far lines do not)
@@ -403,6 +399,7 @@ async function boot() {
   sliderRow(treesSec, trees.tuning, "radius", 300, 1200, 20, "How far out trees stream + fade (m). Rebuilds on change.");
   sliderRow(treesSec, trees.tuning, "glow", 0.2, 3, 0.1, "HDR brightness baked into tree colours (bloom glow). Rebuilds.");
   sliderRow(treesSec, trees.tuning, "fogDensity", 0.0002, 0.0014, 0.00005, "Distance haze over the trees — LIVE (no rebuild).");
+  sliderRow(treesSec, trees.tuning, "depthBias", 0, 10, 0.5, "Pull trees toward the camera (m) so they draw ON TOP of their ridge — kills the ridgeline ripple. 0 = off. LIVE.");
 
   // bird buffet: wind-scaled VISUAL judder of the drawn bird (rock + render-only tremor). Writes
   // straight into bird.tuning; camera is untouched (the tremor never enters bird.pos).
@@ -419,7 +416,7 @@ async function boot() {
   sliderRow(activity, windProfileParams, "hiScale", 0, 3, 0.05, "Wind strength fraction aloft (also drives ridge-lift strength).");
   sliderRow(activity, windProfileParams, "altLo", 0, 300, 10, "Altitude (m) where calm ends and wind strength begins rising.");
   sliderRow(activity, windProfileParams, "altHi", 320, 800, 10, "Altitude (m) of full wind strength.");
-  sliderRow(activity, windTuning, "fluidMax", 0, 20, 0.5, "Peak |fluid wind| (m/s) the fluid component is clamped to. Steady drift (~6 m/s) adds on top → felt field peaks ~6 above this. Default 10 → max ~16.");
+  sliderRow(activity, windTuning, "fluidMax", 0, 100, 0.5, "Peak |fluid wind| (m/s) the fluid component is clamped to. Steady drift (~6 m/s) adds on top → felt field peaks ~6 above this. Default 10 → max ~16.");
   const wrender = acc.section("global wind — render");
   sliderRow(wrender, wr, "dotPx", 1, 8, 0.2, "On-screen comet-head diameter (px).");
   sliderRow(wrender, wr, "clearance", 5, 150, 5, "Nominal metres above terrain the motes relax toward (height is advected).");

@@ -18,7 +18,7 @@ const UNIFORM_BYTES = 96; // mat4(64) + eye+fogDensity(16) + fadeStart+fadeEnd+p
 
 // --- placement window ---
 const CELL = 14; // m — grid spacing of candidate tree slots
-const RADIUS = 680; // m — how far out trees stream around the camera
+const RADIUS = 1000; // m — how far out trees stream around the camera (default tuning.radius)
 const MAX_TREES = 14000; // ALLOCATION ceiling (vertex buffer + CPU rebuild cost). The live tuning.maxTrees
 // (default 9000) caps how many trees actually generate, up to this ceiling.
 const PEAK_RELIEF = 600; // m — terrain RELIEF constant (max height); mirror of terrain.ts
@@ -115,6 +115,7 @@ export class Trees {
     radius: RADIUS,         // stream + fade radius (m) around the camera
     glow: 1,                // HDR colour multiplier baked into every tree vertex (bloom brightness)
     fogDensity: 0.5 / 1100, // distance haze (matches the terrain's); higher = shorter view
+    depthBias: 3,           // metres pulled toward the eye so trees draw ON TOP of their ridge (anti-ripple); LIVE
   };
 
   private vbuf: GPUBuffer;
@@ -434,7 +435,7 @@ export class Trees {
     u[19] = fogDensity;
     u[20] = this.tuning.radius * 0.78; // fadeStart (tracks the live stream radius)
     u[21] = this.tuning.radius * 0.98; // fadeEnd — trees fade fully out before the window rim → no pop
-    u[22] = 0;
+    u[22] = this.tuning.depthBias; // draw-on-top pull (metres) — consumed by the vertex shader
     u[23] = time;
     this.device.queue.writeBuffer(this.ubuf, 0, this.uniformHost);
 
