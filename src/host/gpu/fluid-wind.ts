@@ -213,7 +213,7 @@ export class FluidWind {
     this.worldSpanM = cfg.worldSpanM ?? 2600;
     this.cellM = this.worldSpanM / grid;
     this.forceMag = cfg.forceMag ?? 28;       // weak PREVAILING advection (not the band — band is scale)
-    this.targetBand = cfg.targetBand ?? 3.0;  // mean |wind| target; peaks clamped to FLUID_MAX in windAt
+    this.targetBand = cfg.targetBand ?? 3.0;  // mean |wind| target; peaks clamped to windTuning.fluidMax in windAt
     this.scaleMin = cfg.scaleMin ?? 0.02;
     this.scaleMax = cfg.scaleMax ?? 50;
     this.recenterFrac = cfg.recenterFrac ?? 0.18; // bird may drift 18% of half-span before recenter

@@ -79,7 +79,10 @@ let fluidField: FluidField | null = null;
 // band, no +61° blow-around (drift+16° crab preserved), AND matching the shipped analytic field's speed
 // distribution so the motes' speed-cull survival (→ the per-mote 10-segment sampleHeight tail loop, the
 // dominant CPU cost) does not spike above the analytic baseline.
-const FLUID_MAX = 10;
+// LIVE-TUNABLE: a stable module object the host tuning panel's slider mutates and windAt reads each
+// call — mirrors the fluidField module-global so the bird physics + motes + probe all ride one clamp
+// with no per-instance config threading. `.fluidMax` is the clamp value (m/s; default 10).
+export const windTuning = { fluidMax: 10 };
 
 // Per-frame setter (bird-main.ts). uArr/vArr are the latest readback of fluid.velocityX/Y (bordered
 // (gridW+2)*(gridH+2)). The window is BIRD-LOCAL: originX/Z is the world position of interior cell
@@ -191,7 +194,8 @@ export function windAt(
       // the motes' speed-cull survival → more run the 10-segment sampleHeight tail loop → a CPU spike.
       // Clamping the peaks to the analytic max fixes BOTH (feel stays in-band, cull survival matches).
       const mag = Math.hypot(ux, vx);
-      if (mag > FLUID_MAX) { const s = FLUID_MAX / mag; ux *= s; vx *= s; }
+      const fluidMax = windTuning.fluidMax;
+      if (mag > fluidMax) { const s = fluidMax / mag; ux *= s; vx *= s; }
       _w[0] = ux + dx;
       _w[1] = vx + dz;
       return _w;

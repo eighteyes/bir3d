@@ -1846,3 +1846,33 @@ open http://localhost:5180/index-bird.html
 - Dive to build speed, then pull up → a long light ZOOM-climb (swoosh), not a heavy stall-out. Speed
   bleeds gracefully as you trade it for altitude.
 - T panel: drop `climbPower` toward ~0.7 for an even floatier zoom; raise toward divePower for heavier.
+
+---
+
+## tuning panel revamp — collapsible accordion sections + hover tooltips + live fluidMax slider
+**Date:** 2026-06-24
+**Commit:** (uncommitted — worktree `.claude/worktrees/mountaintop-forests`)
+**Session:** mountaintop-forests ("can fluid_max get a slider?" → "revamp our slider section? i'd like some collapsable sections and tooltips")
+
+### Changes
+- **gpu/wind.ts**: `const FLUID_MAX = 10` → `export const windTuning = { fluidMax: 10 }` (mutable module
+  object; `windAt` reads `windTuning.fluidMax` in the fluid clamp). One global knob — bird physics, motes,
+  and the `__windAt` probe all ride it. No per-instance config threading.
+- **gpu/fluid-wind.ts**: comment reference `FLUID_MAX` → `windTuning.fluidMax`.
+- **bird-main.ts**: panel converted from a flat stack to a `makeAccordion` controller — 7 collapsible
+  sections (flight / terrain render / bird — buffet / global wind — activity / global wind — render /
+  wind — render modes / local sphere + wake), ONE open at a time, `flight` open by default (▸/▾ headers).
+  `sliderRow`/`toggleBtn`/`cycleBtn` gained an optional tooltip arg → native `title` on hover (copy sourced
+  from each field's source-of-truth comment). New `fluidMax` slider (0–20) added to "global wind — activity".
+  `buildTunePanel()` is now an empty shell (+ max-height/overflow scroll). `panelSep` removed.
+
+### Verify (dev server on :5180)
+```
+open http://localhost:5180/index-bird.html
+```
+1. Press `T` → panel opens with ONLY "flight" expanded (▾); other sections collapsed (▸).
+2. Click another header (e.g. "global wind — activity") → it opens and "flight" auto-collapses (accordion).
+3. Click the open section's header again → it collapses (zero open sections is allowed).
+4. Hover any slider row (e.g. `glideSpeed`) → a tooltip describing the parameter appears.
+5. In "global wind — activity", drag `fluidMax` down to ~2 → wind calms; raise toward 20 → peak gusts return (live).
+6. Regression: a pre-existing control in each section still writes through (drag `dotPx`, toggle "local sphere", cycle "FAR").

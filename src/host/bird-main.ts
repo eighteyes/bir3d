@@ -26,7 +26,7 @@ import { acquireDevice } from "./gpu/device";
 import { TerrainEKG } from "./gpu/terrain";
 import { GridTerrain } from "./gpu/terrain-grid";
 import { Bird3D, updraftAt, type BirdInput } from "./gpu/bird3d";
-import { Wind, windAt, setFluidField, setWindProfile, windProfile, windProfileParams, FAR_MODES, NEAR_MODES, WAKE_MODES } from "./gpu/wind";
+import { Wind, windAt, setFluidField, setWindProfile, windProfile, windProfileParams, windTuning, FAR_MODES, NEAR_MODES, WAKE_MODES } from "./gpu/wind";
 import type { FarMode, NearMode, WakeMode } from "./gpu/wind";
 import { FluidWind } from "./gpu/fluid-wind";
 import { GroundMarker } from "./gpu/marker";
@@ -345,92 +345,98 @@ async function boot() {
   canvas.addEventListener("mouseleave", neutralizeSteer);
   window.addEventListener("blur", neutralizeSteer);
 
-  // --- tuning panel: sliders write straight into bird.tuning; 'T' toggles visibility ---
-  const tunePanel = buildTunePanel(bird.tuning, [
-    ["glideSpeed", 14, 40, 0.5],
-    ["sinkRate", 0.3, 4, 0.1],
-    ["divePower", 0.2, 3, 0.05],
-    ["climbPower", 0.3, 2.5, 0.05],
-    ["dragK", 0.1, 1.5, 0.05],
-    ["liftGain", 0, 6, 0.1],
-    ["ridgeLookahead", 0, 150, 5],
-    ["ridgeEps", 6, 40, 2],
-    ["windGain", 0, 15, 0.5],
-    ["windDrift", 0, 2, 0.1],
-    ["minSpeed", 8, 20, 0.5],
-    ["maxSpeed", 30, 160, 1],
-    ["beatLift", 0, 30, 1],
-    ["beatThrust", 0, 25, 1],
-    ["beatHz", 1, 6, 0.5],
-    ["crashSpeed", 5, 40, 1],
-  ]);
-  // --- terrain render controls in the same panel: a mode button + live topo sliders ---
-  const sep = document.createElement("div");
-  sep.style.cssText = "border-top:1px solid #3a3360;margin:8px 0 6px;padding-top:6px;color:#c9a8ff;";
-  sep.textContent = "terrain render";
-  tunePanel.appendChild(sep);
+  // --- tuning panel: collapsible accordion (one section open at a time; 'flight' open by default);
+  // 'T' toggles visibility. Hover any row/button for a tooltip describing the parameter. ---
+  const tunePanel = buildTunePanel();
+  const acc = makeAccordion(tunePanel);
+
+  // FLIGHT: sliders write straight into bird.tuning.
+  const flight = acc.section("flight");
+  const flightRows: [string, number, number, number, string][] = [
+    ["glideSpeed", 14, 40, 0.5, "Trim airspeed (m/s) that drag relaxes speed toward."],
+    ["sinkRate", 0.3, 4, 0.1, "Base sink at trim speed (m/s); scales (trim/speed)² when slow."],
+    ["divePower", 0.2, 3, 0.05, "Scale on gravity-along-path when diving (nose down)."],
+    ["climbPower", 0.3, 2.5, 0.05, "Scale on gravity-along-path when climbing (nose up)."],
+    ["dragK", 0.1, 1.5, 0.05, "Per-second relaxation of airspeed toward trim."],
+    ["liftGain", 0, 6, 0.1, "Ridge updraft scale (vertical air-motion m/s per unit wind·slope)."],
+    ["ridgeLookahead", 0, 150, 5, "Metres downwind the ridge-lift gradient is sampled (bigger = lift off hills sooner)."],
+    ["ridgeEps", 6, 40, 2, "Central-diff half-step (m) for the ridge-lift gradient (broaden to widen the lift band)."],
+    ["windGain", 0, 15, 0.5, "Analytic wind push scale — how hard wind pushes the bird (cross-track drift)."],
+    ["windDrift", 0, 2, 0.1, "Fraction of horizontal wind the bird drifts with."],
+    ["minSpeed", 8, 20, 0.5, "Stall floor (m/s)."],
+    ["maxSpeed", 30, 160, 1, "Dive ceiling (m/s)."],
+    ["beatLift", 0, 30, 1, "Peak vertical lift from a symmetric wingbeat (m/s into target vertical vel)."],
+    ["beatThrust", 0, 25, 1, "Peak forward thrust during a beat (m/s²) — sustains airspeed in a climb."],
+    ["beatHz", 1, 6, 0.5, "Wingbeats per second while flap is held (sustained-climb cadence)."],
+    ["crashSpeed", 5, 40, 1, "Closing speed into terrain (m/s) above which a touch counts as a crash."],
+  ];
+  for (const [k, min, max, step, tip] of flightRows) sliderRow(flight, bird.tuning, k, min, max, step, tip);
+
+  // terrain render: a mode button + live topo sliders.
+  const terrainSec = acc.section("terrain render");
   const modeBtn = document.createElement("button");
   const modes: ("ekg" | "grid" | "topo")[] = ["ekg", "grid", "topo"];
   modeBtn.textContent = `mode: ${terrainMode}  ▸`;
   modeBtn.style.cssText =
     "width:100%;margin:0 0 6px;padding:4px;background:#241d40;color:#9fe8ff;" +
     "border:1px solid #4a4070;border-radius:4px;font:12px monospace;cursor:pointer;";
+  modeBtn.title = "Cycle the terrain render style: EKG rows / grid / topo contours.";
   modeBtn.onclick = () => {
     terrainMode = modes[(modes.indexOf(terrainMode) + 1) % modes.length]!;
     modeBtn.textContent = `mode: ${terrainMode}  ▸`;
   };
-  tunePanel.appendChild(modeBtn);
-  // topo line params (live; visible effect in topo mode)
+  terrainSec.appendChild(modeBtn);
   const gt = gridTerrain as unknown as Record<string, number>;
-  sliderRow(tunePanel, gt, "interval", 8, 80, 1);
-  sliderRow(tunePanel, gt, "floorFade", 0, 1, 0.02);
-  sliderRow(tunePanel, gt, "peakGain", 0.5, 3, 0.1);
-  sliderRow(tunePanel, gt, "lineWidth", 0.5, 3, 0.1);
+  sliderRow(terrainSec, gt, "interval", 8, 80, 1, "Horizontal spacing (m) of the stacked depth rows in the dense near band.");
+  sliderRow(terrainSec, gt, "floorFade", 0, 1, 0.02, "Opacity fade for far rows (0..1).");
+  sliderRow(terrainSec, gt, "peakGain", 0.5, 3, 0.1, "Elevation colour scale for peaks (higher = brighter warm tint).");
+  sliderRow(terrainSec, gt, "lineWidth", 0.5, 3, 0.1, "Neon line stroke width (px).");
 
-  // --- BIRD BUFFET (phase 3): wind-scaled VISUAL judder of the drawn bird (rock + render-only tremor).
-  // Writes straight into bird.tuning; camera is untouched (the tremor never enters bird.pos). ---
+  // bird buffet: wind-scaled VISUAL judder of the drawn bird (rock + render-only tremor). Writes
+  // straight into bird.tuning; camera is untouched (the tremor never enters bird.pos).
   const bt = bird.tuning as unknown as Record<string, number>;
-  panelSep(tunePanel, "bird — buffet");
-  sliderRow(tunePanel, bt, "buffetGain", 0, 3, 0.1);    // master shake scale (0 = off, 1 = default)
-  sliderRow(tunePanel, bt, "buffetWindRef", 4, 30, 1);  // wind m/s mapped to full buffet (lower = judders sooner)
-  sliderRow(tunePanel, bt, "rockCapDeg", 0, 25, 1);     // max visual roll from the rock (deg)
+  const buffet = acc.section("bird — buffet");
+  sliderRow(buffet, bt, "buffetGain", 0, 3, 0.1, "Master scale on the wind-scaled visual buffet (rock + render-only tremor; 0 = off).");
+  sliderRow(buffet, bt, "buffetWindRef", 4, 30, 1, "Local wind speed (m/s) mapped to full buffet saturation (lower = judders sooner).");
+  sliderRow(buffet, bt, "rockCapDeg", 0, 25, 1, "Max visual roll from the buffet rock (degrees) — clamps the judder.");
 
-  // --- WIND controls: global-wind ACTIVITY (the altitude atmosphere) + RENDERING, then the two OFF layers ---
+  // WIND: global-wind ACTIVITY (the altitude atmosphere) + the fluid clamp + RENDERING, then OFF layers.
   const wr = wind as unknown as Record<string, number>; // live access to the Wind instance's tunable fields
-  panelSep(tunePanel, "global wind — activity");
-  sliderRow(tunePanel, windProfileParams, "loScale", 0, 2, 0.05);   // valley wind fraction
-  sliderRow(tunePanel, windProfileParams, "hiScale", 0, 3, 0.05);   // aloft wind strength (also ridge-lift strength)
-  sliderRow(tunePanel, windProfileParams, "altLo", 0, 300, 10);     // altitude where calm ends (<altHi)
-  sliderRow(tunePanel, windProfileParams, "altHi", 320, 800, 10);   // altitude of full strength
-  panelSep(tunePanel, "global wind — render");
-  sliderRow(tunePanel, wr, "dotPx", 1, 8, 0.2);                     // mote size
-  sliderRow(tunePanel, wr, "clearance", 5, 150, 5);                 // band height above terrain
-  sliderRow(tunePanel, wr, "vSpread", 10, 150, 5);                  // band thickness / tail
-  sliderRow(tunePanel, wr, "homeBias", 1, 5, 0.2);                  // hug-terrain bias (higher = more hug)
+  const activity = acc.section("global wind — activity");
+  sliderRow(activity, windProfileParams, "loScale", 0, 2, 0.05, "Wind strength fraction in the valleys (low altitude).");
+  sliderRow(activity, windProfileParams, "hiScale", 0, 3, 0.05, "Wind strength fraction aloft (also drives ridge-lift strength).");
+  sliderRow(activity, windProfileParams, "altLo", 0, 300, 10, "Altitude (m) where calm ends and wind strength begins rising.");
+  sliderRow(activity, windProfileParams, "altHi", 320, 800, 10, "Altitude (m) of full wind strength.");
+  sliderRow(activity, windTuning, "fluidMax", 0, 20, 0.5, "Peak |fluid wind| (m/s) the fluid component is clamped to. Steady drift (~6 m/s) adds on top → felt field peaks ~6 above this. Default 10 → max ~16.");
+  const wrender = acc.section("global wind — render");
+  sliderRow(wrender, wr, "dotPx", 1, 8, 0.2, "On-screen comet-head diameter (px).");
+  sliderRow(wrender, wr, "clearance", 5, 150, 5, "Nominal metres above terrain the motes relax toward (height is advected).");
+  sliderRow(wrender, wr, "vSpread", 10, 150, 5, "Half-height (m) of the vertical band for mote home clearance spread.");
+  sliderRow(wrender, wr, "homeBias", 1, 5, 0.2, "Power (≥1) biasing far-mote heights toward terrain; >1 clusters motes low.");
   // per-tier wind RENDER MODES (phase 1): switching is wired end-to-end but B/C currently fall through to
   // the comet/modulate look in the engine — no visible change yet; divergent geometry is a later phase.
-  panelSep(tunePanel, "wind — render modes");
-  cycleBtn(tunePanel, "FAR", FAR_MODES, "comet", (m) => wind.setFarMode(m));
-  cycleBtn(tunePanel, "NEAR", NEAR_MODES, "comet", (m) => wind.setNearMode(m));
-  cycleBtn(tunePanel, "WAKE", WAKE_MODES, "modulate", (m) => wind.setWakeMode(m));
+  const wmodes = acc.section("wind — render modes");
+  cycleBtn(wmodes, "FAR", FAR_MODES, "comet", (m) => wind.setFarMode(m), "Render style for the FAR (global) wind tier.");
+  cycleBtn(wmodes, "NEAR", NEAR_MODES, "comet", (m) => wind.setNearMode(m), "Render style for the NEAR (local sphere) tier.");
+  cycleBtn(wmodes, "WAKE", WAKE_MODES, "modulate", (m) => wind.setWakeMode(m), "Render style for the WAKE (wing) tier.");
   // per-mode tuning DIALS removed from the panel for now (decluttered while running comet/comet/modulate).
   // The fields are still live on __wind.* — e.g. __wind.dashLenM, __wind.spreadAngleDeg, __wind.ringRate.
-  panelSep(tunePanel, "local sphere + wake (off — solving global)");
-  toggleBtn(tunePanel, "local sphere", false, (v) => wind.setShowNear(v));
-  toggleBtn(tunePanel, "wake", false, (v) => wind.setShowWake(v));
-  sliderRow(tunePanel, wr, "ambientNearFloor", 0, 1, 0.05);         // sphere stick (1 = full global wind)
-  sliderRow(tunePanel, wr, "nearJitter", 0, 0.6, 0.02);            // per-mote direction randomness (rad; 0 = uniform)
-  sliderRow(tunePanel, wr, "foreStretch", 1, 5, 0.1);              // sphere forward reach (overlap with the global-wind fade)
-  sliderRow(tunePanel, wr, "nearBodyCount", 0, 600, 20);          // SPHERE (body) mote count CAP — scales with global wind speed up to this
-  sliderRow(tunePanel, wr, "bodyWindRef", 4, 30, 1);             // global wind speed (m/s) at which the body count hits the cap
-  sliderRow(tunePanel, wr, "nearWakeCount", 0, 1000, 20);        // WAKE mote count CAP — active count scales with bird speed up to this
-  sliderRow(tunePanel, wr, "wakeSpeedRef", 10, 70, 5);           // bird speed (m/s) at which the wake count hits the cap
-  sliderRow(tunePanel, wr, "wakeMoteLen", 0.2, 4, 0.1);           // WAKE mote tail length vs the body comets (1 = same)
-  sliderRow(tunePanel, wr, "nearOpacity", 0.1, 1, 0.05);         // LOCAL sphere (body) opacity
-  sliderRow(tunePanel, wr, "wakeOpacity", 0.1, 1, 0.05);         // WAKE (wing) opacity
-  sliderRow(tunePanel, wr, "swirlGain", 0, 2, 0.1);                // wake vortex strength
-  sliderRow(tunePanel, wr, "wingSpan", 0, 30, 1);                  // wake vortex tip spacing
-  sliderRow(tunePanel, wr, "heatRef", 4, 50, 2);                   // touched-air selectivity (higher = less warm)
+  const sphere = acc.section("local sphere + wake (off — solving global)");
+  toggleBtn(sphere, "local sphere", false, (v) => wind.setShowNear(v), "Show/hide the local sphere (body) mote layer.");
+  toggleBtn(sphere, "wake", false, (v) => wind.setShowWake(v), "Show/hide the wake (wing) mote layer.");
+  sliderRow(sphere, wr, "ambientNearFloor", 0, 1, 0.05, "Ambient (global) terrain-wind weight at the bird (0..1); 1 = full immersion.");
+  sliderRow(sphere, wr, "nearJitter", 0, 0.6, 0.02, "Per-mote random direction rotation (rad) so the sphere isn't uniform.");
+  sliderRow(sphere, wr, "foreStretch", 1, 5, 0.1, "Forward reach of the near bubble as a multiple of nearRadius (>1 = bigger ahead).");
+  sliderRow(sphere, wr, "nearBodyCount", 0, 600, 20, "Local sphere (body) mote count cap — scales with global wind speed up to this.");
+  sliderRow(sphere, wr, "bodyWindRef", 4, 30, 1, "Global wind speed (m/s) at which the body count reaches its cap.");
+  sliderRow(sphere, wr, "nearWakeCount", 0, 1000, 20, "Wake (wing) mote count cap — active count scales with bird speed up to this.");
+  sliderRow(sphere, wr, "wakeSpeedRef", 10, 70, 5, "Bird speed (m/s) at which the wake count reaches its cap.");
+  sliderRow(sphere, wr, "wakeMoteLen", 0.2, 4, 0.1, "Tail-length multiplier for wake motes vs the body comets (1 = same).");
+  sliderRow(sphere, wr, "nearOpacity", 0.1, 1, 0.05, "Opacity multiplier for the local sphere (body) motes.");
+  sliderRow(sphere, wr, "wakeOpacity", 0.1, 1, 0.05, "Opacity multiplier for the wake (wing) motes.");
+  sliderRow(sphere, wr, "swirlGain", 0, 2, 0.1, "Tangential swirl strength in the wake (twin-vortex circulation).");
+  sliderRow(sphere, wr, "wingSpan", 0, 30, 1, "Half-span (m) lateral offset of each wingtip vortex core from the centerline.");
+  sliderRow(sphere, wr, "heatRef", 4, 50, 2, "Wake speed (m/s) mapped to full heat (red + max tail length).");
 
   document.body.appendChild(tunePanel);
   window.addEventListener("keydown", (e) => {
@@ -803,37 +809,61 @@ async function boot() {
   (window as any).__birdBooted = true;
 }
 
-// Build a floating slider panel bound directly to a live tuning object.
-// rows: [key, min, max, step][] — each slider writes tuning[key] on input.
-function buildTunePanel(
-  tuning: Record<string, number>,
-  rows: [string, number, number, number][],
-): HTMLDivElement {
+// Empty floating tuning-panel shell; collapsible sections (built via makeAccordion) are appended into
+// it. Scrolls when a tall section opens past the viewport so the stack never runs off the screen.
+function buildTunePanel(): HTMLDivElement {
   const panel = document.createElement("div");
   panel.id = "tune";
   panel.style.cssText =
-    "position:fixed;right:12px;top:12px;display:none;padding:10px 12px;" +
+    "position:fixed;right:12px;top:12px;display:none;padding:10px 12px;max-height:92vh;overflow-y:auto;" +
     "background:rgba(8,6,20,0.85);border:1px solid #3a3360;border-radius:6px;" +
     "font:12px/1.6 monospace;color:#9fe8ff;z-index:10;min-width:240px;";
-  for (const [key, min, max, step] of rows) sliderRow(panel, tuning, key, min, max, step);
   return panel;
 }
 
-// a labelled separator heading inside the tuning panel.
-function panelSep(panel: HTMLElement, text: string): void {
-  const sep = document.createElement("div");
-  sep.style.cssText = "border-top:1px solid #3a3360;margin:8px 0 6px;padding-top:6px;color:#c9a8ff;";
-  sep.textContent = text;
-  panel.appendChild(sep);
+// Accordion controller over the tuning panel. Each section gets a clickable header (▸ collapsed /
+// ▾ open) and a body; opening one section collapses the others (at most one open) so the panel stays
+// short. The first section added starts open. section(title) returns the body for the caller to fill.
+type Accordion = { section: (title: string) => HTMLDivElement };
+function makeAccordion(panel: HTMLElement): Accordion {
+  const setters: ((open: boolean) => void)[] = [];
+  const section = (title: string): HTMLDivElement => {
+    const header = document.createElement("div");
+    const arrow = document.createElement("span");
+    const label = document.createElement("span");
+    const body = document.createElement("div");
+    arrow.style.cssText = "display:inline-block;width:14px;";
+    label.textContent = title;
+    header.append(arrow, label);
+    header.style.cssText =
+      "color:#c9a8ff;font-weight:bold;margin:6px 0 4px;padding:4px 2px;border-top:1px solid #3a3360;" +
+      "cursor:pointer;user-select:none;";
+    body.style.cssText = "padding:2px 0 6px;";
+    const setOpen = (open: boolean) => {
+      body.style.display = open ? "block" : "none";
+      arrow.textContent = open ? "▾ " : "▸ ";
+    };
+    header.addEventListener("click", () => {
+      const willOpen = body.style.display === "none";
+      for (const s of setters) s(false); // accordion: collapse all, then open the clicked one
+      setOpen(willOpen);
+    });
+    setOpen(setters.length === 0); // first section open by default
+    setters.push(setOpen);
+    panel.append(header, body);
+    return body;
+  };
+  return { section };
 }
 
-// a toggle button bound to a boolean setter; reused for the wind layer toggles.
-function toggleBtn(panel: HTMLElement, label: string, initial: boolean, onSet: (v: boolean) => void): void {
+// a toggle button bound to a boolean setter; reused for the wind layer toggles. tip → hover tooltip.
+function toggleBtn(panel: HTMLElement, label: string, initial: boolean, onSet: (v: boolean) => void, tip?: string): void {
   let on = initial;
   const btn = document.createElement("button");
   btn.style.cssText =
     "width:100%;margin:0 0 6px;padding:4px;background:#241d40;color:#9fe8ff;" +
     "border:1px solid #4a4070;border-radius:4px;font:12px monospace;cursor:pointer;";
+  if (tip) btn.title = tip;
   const render = () => { btn.textContent = `${label}: ${on ? "ON" : "OFF"}`; };
   render();
   btn.onclick = () => { on = !on; onSet(on); render(); };
@@ -841,26 +871,29 @@ function toggleBtn(panel: HTMLElement, label: string, initial: boolean, onSet: (
 }
 
 // a cycle button that advances through a list of string options on each click (wraps), then fires
-// onSet with the new value; reused for the per-tier wind render modes (FAR/NEAR/WAKE).
+// onSet with the new value; reused for the per-tier wind render modes (FAR/NEAR/WAKE). tip → tooltip.
 function cycleBtn<T extends string>(
   panel: HTMLElement,
   label: string,
   opts: readonly T[],
   initial: T,
   onSet: (v: T) => void,
+  tip?: string,
 ): void {
   let i = Math.max(0, opts.indexOf(initial));
   const btn = document.createElement("button");
   btn.style.cssText =
     "width:100%;margin:0 0 6px;padding:4px;background:#241d40;color:#9fe8ff;" +
     "border:1px solid #4a4070;border-radius:4px;font:12px monospace;cursor:pointer;";
+  if (tip) btn.title = tip;
   const render = () => { btn.textContent = `${label}: ${opts[i]} ▸`; };
   render();
   btn.onclick = () => { i = (i + 1) % opts.length; onSet(opts[i]!); render(); };
   panel.appendChild(btn);
 }
 
-// one slider row bound to obj[key]; reused for bird.tuning and the terrain render controls.
+// one slider row bound to obj[key]; reused for bird.tuning and the terrain render controls. tip, when
+// present, shows on hover (native title attr).
 function sliderRow(
   panel: HTMLElement,
   obj: Record<string, number>,
@@ -868,6 +901,7 @@ function sliderRow(
   min: number,
   max: number,
   step: number,
+  tip?: string,
 ): void {
   const row = document.createElement("div");
   const label = document.createElement("span");
@@ -881,6 +915,7 @@ function sliderRow(
   slider.style.cssText = "width:110px;vertical-align:middle;margin:0 6px;";
   label.textContent = key.padEnd(11);
   val.textContent = String(obj[key]);
+  if (tip) row.title = tip; // hover the row → native tooltip
   slider.addEventListener("input", () => {
     obj[key] = Number(slider.value);
     val.textContent = slider.value;
