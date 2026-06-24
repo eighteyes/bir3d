@@ -35,3 +35,6 @@ playwright-report/
 .ai/canopy/
 .ai/tmp/
 .ai/work-orders/
+
+# === Claude Code local worktrees / settings ===
+.claude/

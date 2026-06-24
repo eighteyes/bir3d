@@ -392,6 +392,18 @@ async function boot() {
   sliderRow(terrainSec, gt, "peakGain", 0.5, 3, 0.1, "Elevation colour scale for peaks (higher = brighter warm tint).");
   sliderRow(terrainSec, gt, "lineWidth", 0.5, 3, 0.1, "Neon line stroke width (px).");
 
+  // trees: forest density / size / draw-distance / look. Trees are baked, so the rebuild-affecting
+  // sliders (all but fog) trigger a rebuild on change — applied near-instantly but not mid-drag-smooth.
+  const treesSec = acc.section("trees");
+  toggleBtn(treesSec, "show trees", trees.enabled, (v) => { trees.enabled = v; }, "Show/hide the forest.");
+  sliderRow(treesSec, trees.tuning, "maxTrees", 1000, 14000, 250, "Cap on generated trees — density + perf. Rebuilds on change.");
+  sliderRow(treesSec, trees.tuning, "coverLo", 0.3, 0.6, 0.01, "Density threshold: below = clearings. LOWER = more trees. Rebuilds.");
+  sliderRow(treesSec, trees.tuning, "coverHi", 0.4, 0.7, 0.01, "Density threshold: at/above = full coverage. Rebuilds.");
+  sliderRow(treesSec, trees.tuning, "sizeScale", 0.3, 3, 0.1, "Global tree height + width multiplier. Rebuilds on change.");
+  sliderRow(treesSec, trees.tuning, "radius", 300, 1200, 20, "How far out trees stream + fade (m). Rebuilds on change.");
+  sliderRow(treesSec, trees.tuning, "glow", 0.2, 3, 0.1, "HDR brightness baked into tree colours (bloom glow). Rebuilds.");
+  sliderRow(treesSec, trees.tuning, "fogDensity", 0.0002, 0.0014, 0.00005, "Distance haze over the trees — LIVE (no rebuild).");
+
   // bird buffet: wind-scaled VISUAL judder of the drawn bird (rock + render-only tremor). Writes
   // straight into bird.tuning; camera is untouched (the tremor never enters bird.pos).
   const bt = bird.tuning as unknown as Record<string, number>;
@@ -678,7 +690,7 @@ async function boot() {
       camGround,
       eye,
       bird.simTime,
-      0.5 / 1100, // fog density == terrain's → trees haze identically with distance
+      trees.tuning.fogDensity, // live tree fog (panel slider); defaults to the terrain's 0.5/1100
     );
     // target beam: always-on-top amber waypoint, drawn after the bird so it composites over the scene.
     target.draw(enc, colorView, depthView, viewProj, eye, bird.simTime);

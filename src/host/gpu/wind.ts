@@ -747,7 +747,7 @@ export class Wind {
     // push+trail only; raise it for more tumble; all three to 0 disables. windAt / flight physics are frozen.
     this.bowGain = p.bowGain ?? 0.45; // softened (was 0.9): the strong outward push carved a "split" void directly ahead of the bird
     this.wakeGain = p.wakeGain ?? 0.75;
-    this.swirlGain = p.swirlGain ?? 1.0;
+    this.swirlGain = p.swirlGain ?? 0.5;
     // SLIPSTREAM: two wingtip vortices at ±wingSpan, Rankine core vortexCore; half the motes are born at the
     // tips (wingEmitFrac) to make the streams legible; ambientNearFloor attenuates terrain-wind at the bird so
     // the near sphere rides the bird's own wake (sticks) instead of blowing downwind.

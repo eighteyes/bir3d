@@ -12,7 +12,7 @@ struct U {
   fogDensity: f32,
   fadeStart: f32,
   fadeEnd: f32,
-  pad0: f32,
+  depthBias: f32, // metres each vertex is pulled toward the eye before projecting (draw-on-top)
   time: f32,
 };
 @group(0) @binding(0) var<uniform> u: U;
@@ -29,7 +29,11 @@ fn vs(@location(0) wxyz: vec3<f32>, @location(1) treeId: f32, @location(2) col: 
   var o: VSOut;
   let ground = grounds[u32(treeId)];
   let pos = vec3<f32>(wxyz.x, ground + wxyz.z, wxyz.y);
-  o.clip = u.viewProj * vec4<f32>(pos, 1.0);
+  // DRAW-ON-TOP: pull the vertex toward the eye by depthBias metres before projecting so the tree sits ON
+  // TOP of the ridge it stands on (kills the coincident-depth z-fight ripple); a ridge genuinely closer
+  // than depthBias still occludes it. Fog/fade below use the TRUE position so distance shading is unchanged.
+  let toEye = normalize(u.eye - pos);
+  o.clip = u.viewProj * vec4<f32>(pos + toEye * u.depthBias, 1.0);
   let dist = distance(pos, u.eye);
   let fog = exp(-dist * u.fogDensity);
   let fade = clamp((u.fadeEnd - dist) / max(u.fadeEnd - u.fadeStart, 1.0), 0.0, 1.0);

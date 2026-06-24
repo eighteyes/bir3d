@@ -19,7 +19,8 @@ const UNIFORM_BYTES = 96; // mat4(64) + eye+fogDensity(16) + fadeStart+fadeEnd+p
 // --- placement window ---
 const CELL = 14; // m — grid spacing of candidate tree slots
 const RADIUS = 680; // m — how far out trees stream around the camera
-const MAX_TREES = 9000; // hard cap (bounds the vertex buffer + CPU rebuild cost)
+const MAX_TREES = 14000; // ALLOCATION ceiling (vertex buffer + CPU rebuild cost). The live tuning.maxTrees
+// (default 9000) caps how many trees actually generate, up to this ceiling.
 const PEAK_RELIEF = 600; // m — terrain RELIEF constant (max height); mirror of terrain.ts
 const ROOT_SINK = 4; // m — plant the trunk base this far BELOW the sampled surface so it never floats
 
@@ -103,6 +104,19 @@ export class Trees {
   treeCount = 0;
   landmarks: [number, number][] = []; // world XZ of the landmark giants placed this rebuild (debug/waypoints)
 
+  // LIVE-TUNABLE — the host panel writes straight into this. The rebuild-affecting fields (maxTrees,
+  // coverLo, coverHi, sizeScale, radius, glow) trigger a buffer rebuild on the next draw() via the tuning
+  // signature; fogDensity is read per-frame by the caller (live, no rebuild). Defaults mirror the originals.
+  tuning = {
+    maxTrees: 9000,         // live cap on generated trees (density + perf); ≤ MAX_TREES allocation
+    coverLo: COVER_LO,      // density-field threshold: below = clearings (LOWER → more trees)
+    coverHi: COVER_HI,      // density-field threshold: at/above = full coverage
+    sizeScale: 1,           // global multiplier on regular-tree height + width
+    radius: RADIUS,         // stream + fade radius (m) around the camera
+    glow: 1,                // HDR colour multiplier baked into every tree vertex (bloom brightness)
+    fogDensity: 0.5 / 1100, // distance haze (matches the terrain's); higher = shorter view
+  };
+
   private vbuf: GPUBuffer;
   private maxVerts: number;
   private vertexCount = 0;
@@ -125,6 +139,7 @@ export class Trees {
 
   private lastCellX = Number.NaN;
   private lastCellZ = Number.NaN;
+  private rebuildSig = ""; // signature of the rebuild-affecting tuning values at the last rebuild
   private cbx = 0; // current tree base world X
   private cbz = 0; // current tree base world Z
   private ctid = 0; // current tree index (written per vertex → indexes the ground buffer)
@@ -217,9 +232,9 @@ export class Trees {
     const h = this.host;
     let i = out.i;
     if (i + FLOATS_PER_VERT * 2 > h.length) return;
-    const bx = this.cbx, bz = this.cbz, id = this.ctid;
-    h[i++] = bx + a[0]; h[i++] = bz + a[2]; h[i++] = a[1]; h[i++] = id; h[i++] = ca[0]; h[i++] = ca[1]; h[i++] = ca[2];
-    h[i++] = bx + b[0]; h[i++] = bz + b[2]; h[i++] = b[1]; h[i++] = id; h[i++] = cb[0]; h[i++] = cb[1]; h[i++] = cb[2];
+    const bx = this.cbx, bz = this.cbz, id = this.ctid, g = this.tuning.glow;
+    h[i++] = bx + a[0]; h[i++] = bz + a[2]; h[i++] = a[1]; h[i++] = id; h[i++] = ca[0] * g; h[i++] = ca[1] * g; h[i++] = ca[2] * g;
+    h[i++] = bx + b[0]; h[i++] = bz + b[2]; h[i++] = b[1]; h[i++] = id; h[i++] = cb[0] * g; h[i++] = cb[1] * g; h[i++] = cb[2] * g;
     out.i = i;
   }
 
@@ -297,10 +312,14 @@ export class Trees {
     const out = { i: 0 };
     let trees = 0;
     this.landmarks.length = 0;
+    const cap = Math.min(this.tuning.maxTrees | 0, MAX_TREES); // live count cap (≤ allocation)
+    const radius = this.tuning.radius;                          // live stream radius
+    const sizeScale = this.tuning.sizeScale;
+    const coverLo = this.tuning.coverLo, coverHi = this.tuning.coverHi;
 
     // LANDMARK pass FIRST (reserve the giants before the forest fills the cap): a coarse grid drops a
     // rare big recursive tree near the local high point of qualifying cells → waypoints on the peaks.
-    const lcells = Math.floor(RADIUS / LANDMARK_CELL);
+    const lcells = Math.floor(radius / LANDMARK_CELL);
     const l0x = Math.round(camX / LANDMARK_CELL), l0z = Math.round(camZ / LANDMARK_CELL);
     for (let dz = -lcells; dz <= lcells; dz++) {
       for (let dx = -lcells; dx <= lcells; dx++) {
@@ -314,9 +333,9 @@ export class Trees {
           const hh = this.sampleHeight(sx, sz);
           if (hh > bh) { bh = hh; bx = sx; bz = sz; }
         }
-        if (Math.hypot(bx - camX, bz - camZ) > RADIUS) continue;
+        if (Math.hypot(bx - camX, bz - camZ) > radius) continue;
         if (bh / PEAK_RELIEF < LANDMARK_MIN_E) continue; // peaks only
-        if (trees >= MAX_TREES) break;
+        if (trees >= cap) break;
         this.cbx = bx; this.cbz = bz; this.ctid = trees;
         this.baseHost[trees * 2] = bx; this.baseHost[trees * 2 + 1] = bz;
         this.landmark(out, [0, -ROOT_SINK, 0], LANDMARK_H, LANDMARK_FOLIAGE, LANDMARK_TRUNK, lr);
@@ -325,21 +344,21 @@ export class Trees {
       }
     }
 
-    const cells = Math.floor(RADIUS / CELL);
+    const cells = Math.floor(radius / CELL);
     const c0x = Math.round(camX / CELL);
     const c0z = Math.round(camZ / CELL);
 
-    for (let dz = -cells; dz <= cells && trees < MAX_TREES; dz++) {
-      for (let dx = -cells; dx <= cells && trees < MAX_TREES; dx++) {
+    for (let dz = -cells; dz <= cells && trees < cap; dz++) {
+      for (let dx = -cells; dx <= cells && trees < cap; dx++) {
         const ix = c0x + dx;
         const iz = c0z + dz;
         const r = rng(hash2(ix, iz));
         const wx = ix * CELL + (r() - 0.5) * CELL * 0.85;
         const wz = iz * CELL + (r() - 0.5) * CELL * 0.85;
-        if (Math.hypot(wx - camX, wz - camZ) > RADIUS) continue;
+        if (Math.hypot(wx - camX, wz - camZ) > radius) continue;
 
         // clustering: low-freq density field carves clumps and clearings.
-        const cover = (vnoise(wx * CLUMP_FREQ, wz * CLUMP_FREQ) - COVER_LO) / (COVER_HI - COVER_LO);
+        const cover = (vnoise(wx * CLUMP_FREQ, wz * CLUMP_FREQ) - coverLo) / (coverHi - coverLo);
         if (r() > Math.max(0, Math.min(1, cover))) continue;
 
         const gy = this.sampleHeight(wx, wz);
@@ -352,7 +371,7 @@ export class Trees {
         const isConifer = r() < coniferP;
 
         const ancient = r() < ANCIENT_FRAC;
-        const scale = (ancient ? ANCIENT_SCALE : 1) * (0.8 + 0.45 * r());
+        const scale = (ancient ? ANCIENT_SCALE : 1) * (0.8 + 0.45 * r()) * sizeScale;
         // base is LOCAL (origin at the trunk foot, sunk ROOT_SINK); the prepass adds fbm(wx,wz) as ground.
         this.cbx = wx; this.cbz = wz; this.ctid = trees;
         this.baseHost[trees * 2] = wx; this.baseHost[trees * 2 + 1] = wz;
@@ -388,10 +407,14 @@ export class Trees {
 
     const cx = Math.round(camGround[0] / CELL);
     const cz = Math.round(camGround[1] / CELL);
-    if (cx !== this.lastCellX || cz !== this.lastCellZ) {
+    // rebuild on a cell-cross OR when a rebuild-affecting tuning value changed (panel sliders).
+    const t = this.tuning;
+    const sig = `${Math.min(t.maxTrees | 0, MAX_TREES)}|${t.coverLo}|${t.coverHi}|${t.sizeScale}|${t.radius}|${t.glow}`;
+    if (cx !== this.lastCellX || cz !== this.lastCellZ || sig !== this.rebuildSig) {
       this.rebuild(camGround[0], camGround[1]);
       this.lastCellX = cx;
       this.lastCellZ = cz;
+      this.rebuildSig = sig;
     }
     if (this.vertexCount === 0) return;
 
@@ -409,8 +432,8 @@ export class Trees {
     u.set(viewProj, 0);
     u[16] = eye[0]; u[17] = eye[1]; u[18] = eye[2];
     u[19] = fogDensity;
-    u[20] = RADIUS * 0.78; // fadeStart
-    u[21] = RADIUS * 0.98; // fadeEnd — trees fade fully out before the window rim → no pop
+    u[20] = this.tuning.radius * 0.78; // fadeStart (tracks the live stream radius)
+    u[21] = this.tuning.radius * 0.98; // fadeEnd — trees fade fully out before the window rim → no pop
     u[22] = 0;
     u[23] = time;
     this.device.queue.writeBuffer(this.ubuf, 0, this.uniformHost);

@@ -8,7 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:gpu": "playwright test"
+    "test:gpu": "playwright test",
+    "deploy": "bash scripts/deploy-pages.sh"
   },
   "devDependencies": {
     "@playwright/test": "^1.48.0",
