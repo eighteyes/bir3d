@@ -14,7 +14,7 @@ type HeightFn = (x: number, z: number) => number;
 const FLOATS_PER_VERT = 3;  // corner.xy + pad
 const UNIFORM_BYTES = 112;  // mat4(64) + base+height(16) + right+halfWidth(16) + color+time(16)
 
-const BEAM_HEIGHT = 260;          // m — tall enough to read at distance
+const BEAM_HEIGHT = 800;          // m — tall sky-beacon: clears the ~600 m terrain relief so the top shines above hills even when the base is occluded
 const BEAM_HALF_WIDTH = 14;       // m — beam thickness
 const SPAWN_MIN = 700;            // m — nearest a fresh target spawns ahead
 const SPAWN_MAX = 1000;           // m — farthest
@@ -86,9 +86,10 @@ export class Target {
         ],
       },
       primitive: { topology: "triangle-list", cullMode: "none" },
-      // ALWAYS-on-top: depthCompare "always" + write off → the waypoint stays visible behind ridges so
-      // navigation is reliable (a target you can't see is a target you can't fly to).
-      depthStencil: { depthWriteEnabled: false, depthCompare: "always", format: "depth24plus" },
+      // BEACON: depth-TESTED (compare "less") + write off → hills OCCLUDE the beam where it sits behind
+      // them (no more bleed-through), but the tall BEAM_HEIGHT column rises above the terrain so the target
+      // still shines down from the sky like a beacon even when its base is hidden.
+      depthStencil: { depthWriteEnabled: false, depthCompare: "less", format: "depth24plus" },
       multisample: { count: sampleCount },
     });
     this.bindGroup = device.createBindGroup({

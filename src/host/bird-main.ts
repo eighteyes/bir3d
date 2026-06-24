@@ -508,6 +508,10 @@ async function boot() {
   // so buffet/gust jitter and stall thrashing don't shake the view.
   let momX = bird.vel[0],
     momZ = bird.vel[2];
+  // ANTI-DIZZY: cap how fast the camera azimuth can SWING. The view eases toward the bird's momentum
+  // heading but never faster than MAX_CAM_YAW_RATE, so high wind buffeting the bird can't whip the view.
+  let camYaw = Math.atan2(bird.vel[0], bird.vel[2]); // current camera aim azimuth (rad)
+  const MAX_CAM_YAW_RATE = (75 * Math.PI) / 180;     // rad/s ceiling on the camera yaw swing
   const loop = new FrameLoop((dt) => {
     fps = fps * 0.9 + (1 / Math.max(dt, 1e-3)) * 0.1;
 
@@ -583,8 +587,12 @@ async function boot() {
     const kMom = Math.min(1, dt * 2.5);
     momX += (bird.vel[0] - momX) * kMom;
     momZ += (bird.vel[2] - momZ) * kMom;
-    const ml = Math.hypot(momX, momZ) || 1;
-    cam.forward = [momX / ml, 0, momZ / ml];
+    // rate-capped yaw: ease camYaw toward the momentum heading, clamped to MAX_CAM_YAW_RATE (anti-dizzy).
+    const targetYaw = Math.atan2(momX, momZ);
+    let dYaw = ((((targetYaw - camYaw) + Math.PI) % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+    const maxStep = MAX_CAM_YAW_RATE * dt;
+    camYaw += Math.max(-maxStep, Math.min(maxStep, dYaw));
+    cam.forward = [Math.sin(camYaw), 0, Math.cos(camYaw)];
     cam.update();
 
     // speed FOV kick: diving widens the view (eases, never snaps).
