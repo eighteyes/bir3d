@@ -303,6 +303,7 @@ interface DotParams {
   nearWakeCount?: number; // live count of WAKE (wingtip slipstream) motes shown when wake is on — drawn from the buffer ON TOP of the body
   wakeMoteLen?: number;   // tail-length multiplier for the wake (wing) motes vs the body comets (1 = same)
   wakeSpeedRef?: number;  // bird speed (m/s) at which the speed-scaled wake count reaches its cap (nearWakeCount)
+  bodyWindRef?: number;   // GLOBAL wind speed (m/s) at which the wind-scaled body count reaches its cap (nearBodyCount)
   nearOpacity?: number;   // opacity multiplier for the LOCAL sphere (body) motes
   wakeOpacity?: number;   // opacity multiplier for the WAKE (wing) motes — separate from the body
   nearRadius?: number;   // radius (m) of the sphere around the bird
@@ -411,9 +412,11 @@ export class Wind {
   private nearWakeCount: number;
   private wakeMoteLen: number;
   private wakeSpeedRef: number;
+  private bodyWindRef: number;
   private nearOpacity: number;
   private wakeOpacity: number;
   private _wakeCountNow = 0; // per-frame speed-scaled active wake count (≤ nearWakeCount)
+  private _bodyCountNow = 0; // per-frame global-wind-scaled active body count (≤ nearBodyCount)
   private _curOp = 0;        // per-mote opacity set by the loop (body=nearOpacity, wake=wakeOpacity)
   private nearRadius: number;
   private nearSegments: number;
@@ -711,10 +714,11 @@ export class Wind {
     // tip terrain clamp to stay cheap (no per-segment flowAt/sampleHeight).
     this.nearCount = p.nearCount ?? 1600; // NOTE: bird-main overrides this to 800 (the live near-sphere count);
                                           // this default is the fallback only. Tune the sphere size there, not here.
-    this.nearBodyCount = Math.min(p.nearBodyCount ?? 60, this.nearCount); // BALL body budget; wake adds wing motes ON TOP (never steals)
+    this.nearBodyCount = Math.min(p.nearBodyCount ?? 400, this.nearCount); // BALL body budget CAP (scales with vicinity global wind); wake adds wing motes ON TOP
     this.nearWakeCount = p.nearWakeCount ?? 1000; // WAKE motes CAP — the active count scales with bird speed up to this (≤ buffer)
     this.wakeMoteLen = p.wakeMoteLen ?? 0.5;     // wake-mote tail length vs the body comets (1 = same)
     this.wakeSpeedRef = p.wakeSpeedRef ?? 45;    // bird speed (m/s) at which the wake count reaches its cap
+    this.bodyWindRef = p.bodyWindRef ?? 15;      // global wind speed (m/s) at which the body count reaches its cap
     this.nearOpacity = p.nearOpacity ?? 0.5;     // LOCAL sphere (body) mote opacity
     this.wakeOpacity = p.wakeOpacity ?? 0.25;    // WAKE (wing) mote opacity — separate from the body
     this.nearRadius = p.nearRadius ?? 65;
@@ -739,7 +743,7 @@ export class Wind {
     // push+trail only; raise it for more tumble; all three to 0 disables. windAt / flight physics are frozen.
     this.bowGain = p.bowGain ?? 0.45; // softened (was 0.9): the strong outward push carved a "split" void directly ahead of the bird
     this.wakeGain = p.wakeGain ?? 0.75;
-    this.swirlGain = p.swirlGain ?? 0.7;
+    this.swirlGain = p.swirlGain ?? 1.0;
     // SLIPSTREAM: two wingtip vortices at ±wingSpan, Rankine core vortexCore; half the motes are born at the
     // tips (wingEmitFrac) to make the streams legible; ambientNearFloor attenuates terrain-wind at the bird so
     // the near sphere rides the bird's own wake (sticks) instead of blowing downwind.
@@ -1781,12 +1785,22 @@ export class Wind {
 
     // WAKE COUNT scales with bird speed (more slipstream when faster), capped at nearWakeCount.
     this._wakeCountNow = Math.round(this.nearWakeCount * Math.min(1, bs / this.wakeSpeedRef));
+    // BODY COUNT scales with the GLOBAL WIND speed IN THE VICINITY of the bird (windier air → denser sphere), capped at
+    // nearBodyCount. Average a few samples around the bird (not a single point) so it reads the local airmass.
+    const vr = this.nearRadius;
+    const f0 = this.flowAt(birdPos[0], birdPos[2], t);
+    const f1 = this.flowAt(birdPos[0] + vr, birdPos[2], t);
+    const f2 = this.flowAt(birdPos[0] - vr, birdPos[2], t);
+    const f3 = this.flowAt(birdPos[0], birdPos[2] + vr, t);
+    const f4 = this.flowAt(birdPos[0], birdPos[2] - vr, t);
+    const bwMag = ((Math.hypot(f0[0], f0[1]) + Math.hypot(f1[0], f1[1]) + Math.hypot(f2[0], f2[1]) + Math.hypot(f3[0], f3[1]) + Math.hypot(f4[0], f4[1])) / 5) * windProfile(birdPos[1]);
+    this._bodyCountNow = Math.round(this.nearBodyCount * Math.min(1, bwMag / this.bodyWindRef));
 
     for (let i = 0; i < this.nearCount; i++) {
       // LIVE BUDGET: body slots [0,nearBodyCount) always render; wing slots [nearBodyCount, +nearWakeCount) render
       // only while wake is on (modulate) or in filaments; anything beyond is a PARKED spare → degenerate. This makes
       // nearBodyCount / nearWakeCount LIVE-adjustable up to the buffer (nearCount) with no resize.
-      const isBodySlot = i < this.nearBodyCount;
+      const isBodySlot = i < this._bodyCountNow;
       const isWingSlot = i >= this.nearBodyCount && i < this.nearBodyCount + this._wakeCountNow;
       const wingActive = this._wakeOn && (this.wakeMode === "modulate" || this.nearMode === "filaments");
       if (!(isBodySlot || (isWingSlot && wingActive))) {

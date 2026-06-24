@@ -195,7 +195,7 @@ async function boot() {
     {},
     // FEWER, BETTER motes (user): cut counts ~2× and make each bigger so they read as distinct wind streaks
     // instead of a faint noisy cloud. dotPx is live-tunable (__wind.dotPx); counts need a reload.
-    { nearCount: 1200, numMotes: 4000, dotPx: 3.6 }, // near buffer MAX; live counts = nearBodyCount (sphere) + nearWakeCount (wake), rest parked
+    { nearCount: 1500, numMotes: 4000, dotPx: 3.6 }, // near buffer MAX; live counts = nearBodyCount (sphere) + nearWakeCount (wake), rest parked
     SAMPLES,
   );
 
@@ -421,7 +421,8 @@ async function boot() {
   sliderRow(tunePanel, wr, "ambientNearFloor", 0, 1, 0.05);         // sphere stick (1 = full global wind)
   sliderRow(tunePanel, wr, "nearJitter", 0, 0.6, 0.02);            // per-mote direction randomness (rad; 0 = uniform)
   sliderRow(tunePanel, wr, "foreStretch", 1, 5, 0.1);              // sphere forward reach (overlap with the global-wind fade)
-  sliderRow(tunePanel, wr, "nearBodyCount", 0, 600, 20);          // SPHERE (body) mote count — live
+  sliderRow(tunePanel, wr, "nearBodyCount", 0, 600, 20);          // SPHERE (body) mote count CAP — scales with global wind speed up to this
+  sliderRow(tunePanel, wr, "bodyWindRef", 4, 30, 1);             // global wind speed (m/s) at which the body count hits the cap
   sliderRow(tunePanel, wr, "nearWakeCount", 0, 1000, 20);        // WAKE mote count CAP — active count scales with bird speed up to this
   sliderRow(tunePanel, wr, "wakeSpeedRef", 10, 70, 5);           // bird speed (m/s) at which the wake count hits the cap
   sliderRow(tunePanel, wr, "wakeMoteLen", 0.2, 4, 0.1);           // WAKE mote tail length vs the body comets (1 = same)
