@@ -1,5 +1,32 @@
 # Human Review Steps
 
+## GitHub Pages deploy + production shader-load fix
+**Date:** 2026-06-24
+**Commits:** 53f1d10 (Pages config + deploy script), 4301ad6 (shader ?raw glob fix)
+**Session:** serve-and-deploy (886a0a78-f8b6-4ccc-ac5f-f4ec43ece1fb)
+**Live:** https://eighteyes.github.io/bir3d/ · **Repo:** https://github.com/eighteyes/bir3d
+
+### What changed
+- Vite: `base` via `VITE_BASE` env, multi-page build inputs (main/bird/fluid).
+- `scripts/deploy-pages.sh`: build under Pages base, promote index-bird.html to root index.html, preserve vector demo at /vector.html, force-push dist/ to gh-pages branch (idempotent `-B`).
+- bird-main.ts: shaders loaded via `import.meta.glob('./shaders/**/*.wgsl', {query:'?raw', eager})` instead of runtime `fetch('/src/host/shaders/*.wgsl')`. Runtime fetch only resolves under the dev server; in a production build the source files aren't emitted -> 404 -> WebGPU compiled the HTML error page -> uncaptured error.
+
+### Review steps
+- [ ] Open the live site in Chrome/Edge with a GPU; confirm the glider renders (not a blank/black canvas):
+```
+open "https://eighteyes.github.io/bir3d/"
+```
+- [ ] Hard-reload (Cmd+Shift+R) to bypass any cached old bundle, open DevTools console, confirm NO "uncaptured error" and no 404s on *.wgsl
+- [ ] Confirm the live bundle has shaders inlined (expect a non-zero count):
+```
+curl -s "https://eighteyes.github.io/bir3d/$(curl -s https://eighteyes.github.io/bir3d/ | grep -o 'assets/bird-[A-Za-z0-9_-]*\.js')" | grep -c '@vertex'
+```
+- [ ] Sub-pages reachable (expect 200):
+```
+curl -s -o /dev/null -w "%{http_code}\n" https://eighteyes.github.io/bir3d/index-fluid.html
+curl -s -o /dev/null -w "%{http_code}\n" https://eighteyes.github.io/bir3d/vector.html
+```
+
 ## wind render modes — phase 2 (6 divergent geometries) + phase 3 (wind-scaled buffet)
 **Date:** 2026-06-23
 **Commits:** 8d3b851 (FAR stipple+chevron), eb4484a (NEAR flecks+filaments), 0abafa1 (WAKE helix+rings), 00bf885 (buffet), d5c4fdb (per-mode T-panel dials)
