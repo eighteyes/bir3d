@@ -303,7 +303,8 @@ interface DotParams {
   nearWakeCount?: number; // live count of WAKE (wingtip slipstream) motes shown when wake is on — drawn from the buffer ON TOP of the body
   wakeMoteLen?: number;   // tail-length multiplier for the wake (wing) motes vs the body comets (1 = same)
   wakeSpeedRef?: number;  // bird speed (m/s) at which the speed-scaled wake count reaches its cap (nearWakeCount)
-  nearOpacity?: number;   // opacity multiplier for the LOCAL sphere + wake motes (1 = same as far; <1 = dimmer)
+  nearOpacity?: number;   // opacity multiplier for the LOCAL sphere (body) motes
+  wakeOpacity?: number;   // opacity multiplier for the WAKE (wing) motes — separate from the body
   nearRadius?: number;   // radius (m) of the sphere around the bird
   nearSegments?: number; // tail segment count for the LITTLE comets (short → distinct from far lines)
   nearSegStep?: number;  // seconds of flow integrated per near-comet tail segment (short tail)
@@ -411,7 +412,9 @@ export class Wind {
   private wakeMoteLen: number;
   private wakeSpeedRef: number;
   private nearOpacity: number;
+  private wakeOpacity: number;
   private _wakeCountNow = 0; // per-frame speed-scaled active wake count (≤ nearWakeCount)
+  private _curOp = 0;        // per-mote opacity set by the loop (body=nearOpacity, wake=wakeOpacity)
   private nearRadius: number;
   private nearSegments: number;
   private nearSegStep: number;
@@ -708,11 +711,12 @@ export class Wind {
     // tip terrain clamp to stay cheap (no per-segment flowAt/sampleHeight).
     this.nearCount = p.nearCount ?? 1600; // NOTE: bird-main overrides this to 800 (the live near-sphere count);
                                           // this default is the fallback only. Tune the sphere size there, not here.
-    this.nearBodyCount = Math.min(p.nearBodyCount ?? 200, this.nearCount); // BALL body budget; wake adds wing motes ON TOP (never steals)
-    this.nearWakeCount = p.nearWakeCount ?? 400; // WAKE motes CAP — the active count scales with bird speed up to this (≤ buffer)
-    this.wakeMoteLen = p.wakeMoteLen ?? 1.0;     // wake-mote tail length vs the body comets (1 = same)
+    this.nearBodyCount = Math.min(p.nearBodyCount ?? 60, this.nearCount); // BALL body budget; wake adds wing motes ON TOP (never steals)
+    this.nearWakeCount = p.nearWakeCount ?? 1000; // WAKE motes CAP — the active count scales with bird speed up to this (≤ buffer)
+    this.wakeMoteLen = p.wakeMoteLen ?? 0.5;     // wake-mote tail length vs the body comets (1 = same)
     this.wakeSpeedRef = p.wakeSpeedRef ?? 45;    // bird speed (m/s) at which the wake count reaches its cap
-    this.nearOpacity = p.nearOpacity ?? 0.8;     // LOCAL sphere + wake opacity — 0.8 = 20% dimmer than the far tier
+    this.nearOpacity = p.nearOpacity ?? 0.5;     // LOCAL sphere (body) mote opacity
+    this.wakeOpacity = p.wakeOpacity ?? 0.25;    // WAKE (wing) mote opacity — separate from the body
     this.nearRadius = p.nearRadius ?? 65;
     this.nearSegments = p.nearSegments ?? 4; // a 4th segment → smoother CURLING tail arcs
     this.nearSegStep = p.nearSegStep ?? 0.12;
@@ -1790,6 +1794,7 @@ export class Wind {
         while (vi < e) vi = this.emitDegenerateNearVert(vi);
         continue;
       }
+      this._curOp = isWingSlot ? this.wakeOpacity : this.nearOpacity; // body vs wake opacity for this mote
       // NEAR render-MODE branch (Phase 2). Each mode fills the SAME fixed per-mote stride
       // (NEAR_VERTS_PER_MOTE = nearSegments·6 verts): flecks emit ONE 2-segment dash (12 verts) then PAD the
       // remainder with degenerate (vis=0) verts; filaments + comet integrate the full nearSegments-segment
@@ -1892,7 +1897,7 @@ export class Wind {
       const ndx = x - birdPos[0], ndy = y - birdPos[1], ndz = z - birdPos[2];
       const distFrac = this.bubbleFrac(ndx, ndy, ndz); // 0 center → 1 at the (forward-stretched) bubble edge
       const fadeOut = 1 - smoothstep(this.fadeNearEdge, 1, distFrac); // 1 inside → 0 at the ball edge
-      const nearVis = fadeIn * fadeOut * this.nearOpacity; // local/wake opacity (dimmer than the far tier)
+      const nearVis = fadeIn * fadeOut * this._curOp; // body/wake opacity (set per-mote by the loop)
 
       // speed tint (same calibration as the far tier) — little comets brighten in fast air; using the
       // DISTURBED horizontal speed so the bird's stir lights up the air it churns around itself.
@@ -2049,7 +2054,7 @@ export class Wind {
     const ndx = x - birdPos[0], ndy = y - birdPos[1], ndz = z - birdPos[2];
     const distFrac = this.bubbleFrac(ndx, ndy, ndz);
     const fadeOut = 1 - smoothstep(this.fadeNearEdge, 1, distFrac);
-    const nearVis = fadeIn * fadeOut * this.nearOpacity; // local/wake opacity (dimmer than the far tier)
+    const nearVis = fadeIn * fadeOut * this._curOp; // body/wake opacity (set per-mote by the loop)
 
     // UNIT dash dir = the disturbed-velocity dir in world XZ at the head. Fallback to the motion axis / +X.
     let ux = fwx, uz = fwz;
@@ -2193,7 +2198,7 @@ export class Wind {
     const ndx = x - birdPos[0], ndy = y - birdPos[1], ndz = z - birdPos[2];
     const distFrac = this.bubbleFrac(ndx, ndy, ndz);
     const fadeOut = 1 - smoothstep(this.fadeNearEdge, 1, distFrac);
-    const nearVis = fadeIn * fadeOut * this.nearOpacity; // local/wake opacity (dimmer than the far tier)
+    const nearVis = fadeIn * fadeOut * this._curOp; // body/wake opacity (set per-mote by the loop)
 
     // speed tint (same calibration as the comet) — uses the DISTURBED horizontal speed.
     const wspeed = Math.hypot(fwx, fwz);
