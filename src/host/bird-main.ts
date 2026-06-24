@@ -422,8 +422,10 @@ async function boot() {
   sliderRow(tunePanel, wr, "nearJitter", 0, 0.6, 0.02);            // per-mote direction randomness (rad; 0 = uniform)
   sliderRow(tunePanel, wr, "foreStretch", 1, 5, 0.1);              // sphere forward reach (overlap with the global-wind fade)
   sliderRow(tunePanel, wr, "nearBodyCount", 0, 600, 20);          // SPHERE (body) mote count — live
-  sliderRow(tunePanel, wr, "nearWakeCount", 0, 400, 20);          // WAKE (wingtip slipstream) mote count — live, on top of the body
+  sliderRow(tunePanel, wr, "nearWakeCount", 0, 400, 20);          // WAKE mote count CAP — active count scales with bird speed up to this
+  sliderRow(tunePanel, wr, "wakeSpeedRef", 10, 70, 5);           // bird speed (m/s) at which the wake count hits the cap
   sliderRow(tunePanel, wr, "wakeMoteLen", 0.2, 4, 0.1);           // WAKE mote tail length vs the body comets (1 = same)
+  sliderRow(tunePanel, wr, "nearOpacity", 0.2, 1, 0.05);         // LOCAL sphere + wake opacity (0.8 = 20% dimmer than far)
   sliderRow(tunePanel, wr, "swirlGain", 0, 2, 0.1);                // wake vortex strength
   sliderRow(tunePanel, wr, "wingSpan", 0, 30, 1);                  // wake vortex tip spacing
   sliderRow(tunePanel, wr, "heatRef", 4, 50, 2);                   // touched-air selectivity (higher = less warm)
